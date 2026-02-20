@@ -11,13 +11,13 @@ GO
 
 
 
---remove those 
-SELECT * FROM silver.nexudus_product_offices;
-SELECT * FROM silver.nexudus_product_desks;
-
 
 SELECT TOP(10) * FROM silver.nexudus_products
-WHERE id = 1415475208
+WHERE product_type_label = 'Other'
 
-SELECT * FROM silver.nexudus_product_rooms
-WHERE source_id = 1420976575
+SELECT * FROM silver.nexudus_products
+
+-- delete all the 
+SELECT COUNT(1), location_name FROM silver.nexudus_products
+GROUP BY location_name
+ORDER BY COUNT(1) DESC
