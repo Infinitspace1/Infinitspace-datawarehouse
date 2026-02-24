@@ -3,3 +3,5 @@ requests
 aiohttp
 tenacity
 pyodbc
+openpyxl
+python-dateutil
