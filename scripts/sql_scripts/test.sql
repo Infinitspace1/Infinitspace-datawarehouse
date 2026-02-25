@@ -186,4 +186,27 @@ WHERE coworker_id IN (
 )
 
 SELECT * FROM silver.nexudus_contracts
-WHERE coworker_id='1420517850';
+WHERE contract_term is null and cancellation_date is null 
+and next_tariff_name like '%Private Office%' 
+and floor_plan_desk_ids is not null;
+
+SELECT * FROM silver.nexudus_resources;
+
+SELECT 
+    res.location_name,
+    extra.name,
+    extra.only_for_members,
+    extra.price,
+    extra.fixed_cost_price,
+    extra.fixed_cost_length_minutes,
+    extra.currency_code,
+    res.group_name,
+    res.allocation
+ FROM silver.nexudus_extra_services extra
+INNER JOIN silver.nexudus_resources res
+ON extra.resource_type_names = res.resource_type_name
+-- WHERE res.resource_type_name = '12 person meeting room (REP)'
+
+
+SELECT * FROM silver.nexudus_extra_services
+WHERE resource_type_names LIKE 'Hot desk%'

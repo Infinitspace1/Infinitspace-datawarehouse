@@ -271,6 +271,40 @@ def fetch_future_contracts(sql) -> list[dict]:
     """)
 
 
+def fetch_open_ended_coworkers(sql) -> list[dict]:
+    """
+    Sheet 4 data: coworkers whose most recent Private Office contract
+    (by start_date) has BOTH contract_term IS NULL AND cancellation_date IS NULL.
+    One row per coworker.
+    """
+    return sql.execute_query("""
+        WITH valid_po AS (
+            SELECT *
+            FROM silver.nexudus_contracts
+            WHERE tariff_name LIKE '%Private Office%'
+              AND (cancellation_date IS NULL
+                   OR CAST(start_date AS DATE) <> CAST(cancellation_date AS DATE))
+        ),
+        ranked AS (
+            SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY coworker_id ORDER BY start_date DESC) AS rn
+            FROM valid_po
+        )
+        SELECT
+            coworker_id,
+            coworker_name,
+            coworker_company,
+            location_name,
+            start_date,
+            tariff_name
+        FROM ranked
+        WHERE rn = 1
+          AND contract_term IS NULL
+          AND cancellation_date IS NULL
+        ORDER BY coworker_id
+    """)
+
+
 def fetch_cancelled_coworkers(sql) -> list[dict]:
     """
     Sheet 2 data: coworkers whose most recent Private Office contract
@@ -385,6 +419,25 @@ KEYS_SHEET3 = [
 ]
 
 
+HEADERS_SHEET4 = [
+    "Coworker ID",
+    "Coworker Name",
+    "Coworker Company",
+    "Location Name",
+    "Last Contract Start Date",
+    "Tariff Name",
+]
+
+KEYS_SHEET4 = [
+    "coworker_id",
+    "coworker_name",
+    "coworker_company",
+    "location_name",
+    "start_date",
+    "tariff_name",
+]
+
+
 def _write_sheet(ws, headers: list[str], keys: list[str], rows: list[dict]):
     hdr_font = Font(bold=True, color="FFFFFF", size=11)
     hdr_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
@@ -422,6 +475,7 @@ def write_excel(
     active_rows: list[dict],
     cancelled_rows: list[dict],
     future_rows: list[dict],
+    open_ended_rows: list[dict],
     path: Path,
 ):
     wb = openpyxl.Workbook()
@@ -435,6 +489,9 @@ def write_excel(
 
     ws3 = wb.create_sheet("Future – Tenure")
     _write_sheet(ws3, HEADERS_SHEET3, KEYS_SHEET3, future_rows)
+
+    ws4 = wb.create_sheet("Open-Ended – No Term")
+    _write_sheet(ws4, HEADERS_SHEET4, KEYS_SHEET4, open_ended_rows)
 
     wb.save(path)
 
@@ -576,12 +633,22 @@ def main():
         except Exception as exc:
             logger.warning(f"Failed to fetch future contracts: {exc}")
 
+    # Sheet 4: coworkers whose last contract has no contract_term and no cancellation_date
+    open_ended: list[dict] = []
+    if sql:
+        try:
+            open_ended = fetch_open_ended_coworkers(sql)
+            logger.info(f"Fetched {len(open_ended)} open-ended coworkers from DB")
+        except Exception as exc:
+            logger.warning(f"Failed to fetch open-ended coworkers: {exc}")
+
     out = EXTRACTED_DIR / f"notice_periods_{TODAY.strftime('%Y%m%d')}.xlsx"
-    write_excel(results, cancelled, future, out)
+    write_excel(results, cancelled, future, open_ended, out)
     logger.info(
         f"\nDone — Sheet 1: {len(results)} active rows, "
         f"Sheet 2: {len(cancelled)} cancelled rows, "
-        f"Sheet 3: {len(future)} future rows → {out}"
+        f"Sheet 3: {len(future)} future rows, "
+        f"Sheet 4: {len(open_ended)} open-ended rows → {out}"
     )
     if db_errors:
         logger.warning(f"  {db_errors} records had DB errors (capacity defaulted to 0)")
