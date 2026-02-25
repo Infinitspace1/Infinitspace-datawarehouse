@@ -1,0 +1,16 @@
+.git
+.github
+.vscode
+.env
+venv/
+.python_packages/
+__pycache__
+*.pyc
+.pytest_cache
+tests/
+docs/
+scripts/
+deploy/
+membership_agreement_test/
+*.md
+.gitignore

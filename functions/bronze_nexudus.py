@@ -1,15 +1,15 @@
 """
-functions/nexudus_to_bronze/function_app.py
+functions/bronze_nexudus.py
 
-Azure Function: Timer trigger (daily) that pulls all Nexudus entities
+Blueprint: Timer trigger (daily) that pulls all Nexudus entities
 and writes raw JSON to the bronze layer.
 
 Entities pulled (in order):
-  1. locations        — GET /sys/floorplandesks/businesses (or subdomain endpoint)
-  2. products         — GET /sys/floorplandesks (all item types)
-  3. contracts        — GET /billing/coworkercontracts (per product with CoworkerContractIds)
-  4. resources        — GET /spaces/resources/{id} (for products that have a ResourceId)
-  5. extra_services   — GET /billing/extraservices
+  1. locations        -- GET /sys/businesses
+  2. products         -- GET /sys/floorplandesks (all item types)
+  3. contracts        -- GET /billing/coworkercontracts
+  4. resources        -- GET /spaces/resources/{id}
+  5. extra_services   -- GET /billing/extraservices
 
 Each entity gets its own RunTracker entry in meta.sync_runs.
 """
@@ -17,9 +17,6 @@ import asyncio
 import logging
 import os
 import uuid
-from dotenv import load_dotenv
-
-load_dotenv()
 
 import azure.functions as func
 
@@ -28,18 +25,16 @@ from shared.nexudus.client import NexudusClient
 from shared.azure_clients.bronze_writer import BronzeWriter
 from shared.azure_clients.run_tracker import RunTracker
 
-
 logger = logging.getLogger(__name__)
 
-app = func.FunctionApp()
+bp = func.Blueprint()
 
-# Daily at 02:00 UTC — adjust in CRON_SCHEDULE env var or here
 SCHEDULE = os.getenv("NEXUDUS_SYNC_SCHEDULE", "0 0 2 * * *")
 
 
-@app.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
+@bp.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
 async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
-    logger.info("Nexudus → Bronze sync started")
+    logger.info("Nexudus -> Bronze sync started")
 
     try:
         bearer_token = get_bearer_token()
@@ -57,33 +52,17 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
         await _sync_resources(client, writer, run_id, resource_ids_by_location)
         await _sync_extra_services(client, writer, run_id)
 
-    logger.info(f"Nexudus → Bronze sync complete [run_id={run_id}]")
+    logger.info(f"Nexudus -> Bronze sync complete [run_id={run_id}]")
 
-
-# ──────────────────────────────────────────────────────────────
-# 1. Locations
-# Source: GET /{subdomain}.spaces.nexudus.com/en/business/all
-#   or:   GET /sys/businesses (depends on your Nexudus setup)
-# ──────────────────────────────────────────────────────────────
 
 async def _sync_locations(client: NexudusClient, writer: BronzeWriter, run_id: uuid.UUID) -> list[dict]:
     async with RunTracker("nexudus", "locations", "bronze", metadata=str(run_id)) as run:
-        # Try the standard multi-business endpoint first.
-        # If your account uses subdomain-per-location, swap to the subdomain endpoint.
         records = await client.get_all("sys/businesses")
-
         run.rows_read = len(records)
         run.rows_written = writer.write_locations(records)
-
         logger.info(f"Locations: {run.rows_read} fetched, {run.rows_written} written to bronze")
         return records
 
-
-# ──────────────────────────────────────────────────────────────
-# 2. Products (FloorPlanDesks — all item types)
-# Source: GET /sys/floorplandesks
-# Returns all workspaces: offices, desks, meeting rooms, day pass desks
-# ──────────────────────────────────────────────────────────────
 
 async def _sync_products(
     client: NexudusClient,
@@ -91,18 +70,11 @@ async def _sync_products(
     run_id: uuid.UUID,
     locations: list[dict],
 ) -> tuple[list[dict], dict[int, list[int]]]:
-    """
-    Returns:
-      - all product records
-      - dict of {location_id: [resource_id, ...]} for the next step
-    """
     async with RunTracker("nexudus", "products", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("sys/floorplandesks")
-
         run.rows_read = len(records)
         run.rows_written = writer.write_products(records)
 
-        # Collect ResourceIds grouped by location for the resource step
         resource_ids_by_location: dict[int, list[int]] = {}
         for r in records:
             resource_id = r.get("ResourceId")
@@ -119,13 +91,6 @@ async def _sync_products(
         return records, resource_ids_by_location
 
 
-# ──────────────────────────────────────────────────────────────
-# 3. Contracts
-# Source: GET /billing/coworkercontracts
-# We pull ALL contracts in one paginated call (no per-product loop).
-# Each contract record contains the linked resource/product ids.
-# ──────────────────────────────────────────────────────────────
-
 async def _sync_contracts(
     client: NexudusClient,
     writer: BronzeWriter,
@@ -133,23 +98,11 @@ async def _sync_contracts(
     products: list[dict],
 ) -> None:
     async with RunTracker("nexudus", "contracts", "bronze", metadata=str(run_id)) as run:
-        # Pull all contracts in one go — filter/join happens in silver
         records = await client.get_all("billing/coworkercontracts")
-
         run.rows_read = len(records)
-        # Note: no product_id/location_id passed here — they're in the raw JSON
-        # and will be extracted in the silver step
         run.rows_written = writer.write_contracts(records)
-
         logger.info(f"Contracts: {run.rows_read} fetched, {run.rows_written} written to bronze")
 
-
-# ──────────────────────────────────────────────────────────────
-# 4. Resources
-# Source: GET /spaces/resources/{id}
-# One API call per unique ResourceId found in products.
-# These give us ResourceTypeId and GroupName for extra service mapping.
-# ──────────────────────────────────────────────────────────────
 
 async def _sync_resources(
     client: NexudusClient,
@@ -170,7 +123,6 @@ async def _sync_resources(
     async with RunTracker("nexudus", "resources", "bronze", metadata=str(run_id)) as run:
         run.rows_read = len(all_resource_ids)
 
-        # Fetch concurrently (semaphore in client limits concurrency)
         tasks = [
             client.get_one(f"spaces/resources/{resource_id}")
             for _, resource_id in all_resource_ids
@@ -197,13 +149,6 @@ async def _sync_resources(
         )
 
 
-# ──────────────────────────────────────────────────────────────
-# 5. Extra Services
-# Source: GET /billing/extraservices
-# All extra services in one paginated call.
-# Mapping to resources/products happens in silver.
-# ──────────────────────────────────────────────────────────────
-
 async def _sync_extra_services(
     client: NexudusClient,
     writer: BronzeWriter,
@@ -211,8 +156,6 @@ async def _sync_extra_services(
 ) -> None:
     async with RunTracker("nexudus", "extra_services", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("billing/extraservices")
-
         run.rows_read = len(records)
         run.rows_written = writer.write_extra_services(records)
-
         logger.info(f"Extra services: {run.rows_read} fetched, {run.rows_written} written to bronze")
