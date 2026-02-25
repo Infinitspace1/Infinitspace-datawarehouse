@@ -13,6 +13,8 @@ import pyodbc
 from typing import List, Dict, Any, Optional
 from contextlib import contextmanager
 import logging
+import struct
+from azure.identity import DefaultAzureCredential
 
 from dotenv import load_dotenv
 
@@ -78,10 +80,18 @@ class SQLClient:
 
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections."""
         conn = None
         try:
-            conn = pyodbc.connect(self.connection_string)
+            # Check if connection string has UID/PWD (SQL auth)
+            if "UID=" in self.connection_string or "Uid=" in self.connection_string:
+                conn = pyodbc.connect(self.connection_string)
+            else:
+                # Managed Identity token auth
+                credential = DefaultAzureCredential()
+                token = credential.get_token("https://database.windows.net/.default")
+                token_bytes = token.token.encode("utf-16-le")
+                token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
+                conn = pyodbc.connect(self.connection_string, attrs_before={1256: token_struct})
             yield conn
             conn.commit()
         except Exception as e:
