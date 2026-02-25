@@ -29,6 +29,8 @@ class SilverProductsWriter:
             raw = json.loads(row["raw_json"])
             try:
                 p = transform_product(raw, row["id"], self.sync_run_id)
+                if p["location_source_id"] in {1376491116, 1376491117}:
+                    continue    # skip beyond Global products
                 self._upsert(p)
                 ok += 1
             except Exception as e:

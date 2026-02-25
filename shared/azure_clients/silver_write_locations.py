@@ -22,10 +22,10 @@ class SilverLocationsWriter:
         self.sync_run_id = str(sync_run_id)
         self.sql = get_sql_client()
 
-    def run(self) -> tuple[int, int]:
+    def run(self) -> dict[str, int]:
         """
         Read latest bronze records, transform, upsert to silver.
-        Returns (locations_upserted, hours_rows_upserted).
+        Returns {"locations": count, "location_hours": count}.
         """
         bronze_rows = self._load_latest_bronze()
         logger.info(f"Loaded {len(bronze_rows)} bronze location records")
@@ -58,7 +58,7 @@ class SilverLocationsWriter:
                 logger.warning(f"Hours transform failed for source_id={raw.get('Id')}: {e}")
 
         logger.info(f"Silver upserted: {loc_count} locations, {hours_count} hours rows")
-        return loc_count, hours_count
+        return {"locations": loc_count, "location_hours": hours_count}
 
     # ── Bronze loader ─────────────────────────────────────────
 
