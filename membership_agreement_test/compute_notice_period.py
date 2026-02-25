@@ -222,6 +222,55 @@ def total_capacity(sql, floor_plan_desk_ids: str) -> int:
     return sum(r.get("capacity") or 0 for r in rows)
 
 
+def fetch_future_contracts(sql) -> list[dict]:
+    """
+    Sheet 3 data: active/future contracts with a known contract_term.
+    Query taken verbatim from the brief, then aggregated per coworker_id:
+      - first_start_date  : earliest start_date across all matching contracts
+      - last_contract_term: contract_term of the most recent contract
+      - total_tenure_months: DATEDIFF(MONTH, first_start_date, last_contract_term)
+    """
+    return sql.execute_query("""
+        WITH future AS (
+            SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY coworker_id ORDER BY start_date DESC) AS rn
+            FROM silver.nexudus_contracts
+            WHERE (
+                      start_date >= GETDATE()
+                   OR (start_date < GETDATE() AND ISNULL(contract_term, GETDATE()) >= GETDATE())
+                  )
+              AND cancellation_date IS NULL
+              AND next_tariff_name LIKE '%Private Office%'
+              AND ISNULL(contract_term, DATEADD(MONTH, 6, GETDATE())) >= DATEADD(MONTH, 6, GETDATE())
+              AND floor_plan_desk_ids IS NOT NULL
+        ),
+        latest AS (
+            SELECT * FROM future WHERE rn = 1
+        ),
+        first_po AS (
+            SELECT
+                coworker_id,
+                MIN(start_date) AS first_start_date
+            FROM silver.nexudus_contracts
+            WHERE tariff_name LIKE '%Private Office%'
+              AND (cancellation_date IS NULL
+                   OR CAST(start_date AS DATE) <> CAST(cancellation_date AS DATE))
+            GROUP BY coworker_id
+        )
+        SELECT
+            l.coworker_id,
+            l.coworker_name,
+            l.coworker_company,
+            l.location_name,
+            f.first_start_date,
+            l.contract_term AS last_contract_term,
+            DATEDIFF(MONTH, f.first_start_date, l.contract_term) AS total_tenure_months
+        FROM latest l
+        JOIN first_po f ON l.coworker_id = f.coworker_id
+        ORDER BY total_tenure_months DESC
+    """)
+
+
 def fetch_cancelled_coworkers(sql) -> list[dict]:
     """
     Sheet 2 data: coworkers whose most recent Private Office contract
@@ -246,6 +295,7 @@ def fetch_cancelled_coworkers(sql) -> list[dict]:
             l.coworker_id,
             l.coworker_name,
             l.coworker_company,
+            l.location_name,
             f.start_date        AS first_start_date,
             l.cancellation_date AS last_cancellation_date,
             DATEDIFF(MONTH, f.start_date, l.cancellation_date) AS total_tenure_months
@@ -264,6 +314,7 @@ HEADERS_SHEET1 = [
     "Membership Agreement ID",
     "Coworker ID",
     "Coworker Name",
+    "Location Name",
     "Contract Floor Plan Desk IDs",
     "Capacity",
     "Renewal System",
@@ -280,6 +331,7 @@ KEYS_SHEET1 = [
     "membership_agreement_id",
     "coworker_id",
     "coworker_name",
+    "location_name",
     "contract_floor_plan_desk_ids",
     "capacity",
     "renewal_system",
@@ -296,6 +348,7 @@ HEADERS_SHEET2 = [
     "Coworker ID",
     "Coworker Name",
     "Coworker Company",
+    "Location Name",
     "First Start Date",
     "Last Cancellation Date",
     "Total Tenure (Months)",
@@ -305,8 +358,29 @@ KEYS_SHEET2 = [
     "coworker_id",
     "coworker_name",
     "coworker_company",
+    "location_name",
     "first_start_date",
     "last_cancellation_date",
+    "total_tenure_months",
+]
+
+HEADERS_SHEET3 = [
+    "Coworker ID",
+    "Coworker Name",
+    "Coworker Company",
+    "Location Name",
+    "First Start Date",
+    "Last Contract Term",
+    "Total Tenure (Months)",
+]
+
+KEYS_SHEET3 = [
+    "coworker_id",
+    "coworker_name",
+    "coworker_company",
+    "location_name",
+    "first_start_date",
+    "last_contract_term",
     "total_tenure_months",
 ]
 
@@ -347,6 +421,7 @@ def _write_sheet(ws, headers: list[str], keys: list[str], rows: list[dict]):
 def write_excel(
     active_rows: list[dict],
     cancelled_rows: list[dict],
+    future_rows: list[dict],
     path: Path,
 ):
     wb = openpyxl.Workbook()
@@ -357,6 +432,9 @@ def write_excel(
 
     ws2 = wb.create_sheet("Cancelled – Tenure")
     _write_sheet(ws2, HEADERS_SHEET2, KEYS_SHEET2, cancelled_rows)
+
+    ws3 = wb.create_sheet("Future – Tenure")
+    _write_sheet(ws3, HEADERS_SHEET3, KEYS_SHEET3, future_rows)
 
     wb.save(path)
 
@@ -430,10 +508,13 @@ def main():
 
         desk_ids = ""
         cap = 0
+        loc_name = ""
         if sql:
             try:
                 contract = most_recent_contract(sql, cw_id)
-                desk_ids = (contract.get("floor_plan_desk_ids") or "") if contract else ""
+                if contract:
+                    desk_ids = contract.get("floor_plan_desk_ids") or ""
+                    loc_name = contract.get("location_name") or ""
                 cap = total_capacity(sql, desk_ids) if desk_ids else 0
             except Exception as exc:
                 logger.warning(f"  DB error for {cw_name}: {exc}")
@@ -459,6 +540,7 @@ def main():
             "membership_agreement_id": file_id,
             "coworker_id": cw_id,
             "coworker_name": cw_name,
+            "location_name": loc_name,
             "contract_floor_plan_desk_ids": desk_ids,
             "capacity": cap,
             "renewal_system": renewal_system_display(rs),
@@ -485,11 +567,21 @@ def main():
         except Exception as exc:
             logger.warning(f"Failed to fetch cancelled coworkers: {exc}")
 
-    out = EXTRACTED_DIR / "notice_periods.xlsx"
-    write_excel(results, cancelled, out)
+    # Sheet 3: future/active contracts with known contract_term
+    future: list[dict] = []
+    if sql:
+        try:
+            future = fetch_future_contracts(sql)
+            logger.info(f"Fetched {len(future)} future-contract coworkers from DB")
+        except Exception as exc:
+            logger.warning(f"Failed to fetch future contracts: {exc}")
+
+    out = EXTRACTED_DIR / f"notice_periods_{TODAY.strftime('%Y%m%d')}.xlsx"
+    write_excel(results, cancelled, future, out)
     logger.info(
         f"\nDone — Sheet 1: {len(results)} active rows, "
-        f"Sheet 2: {len(cancelled)} cancelled rows → {out}"
+        f"Sheet 2: {len(cancelled)} cancelled rows, "
+        f"Sheet 3: {len(future)} future rows → {out}"
     )
     if db_errors:
         logger.warning(f"  {db_errors} records had DB errors (capacity defaulted to 0)")
