@@ -14,14 +14,12 @@ Design:
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Any
 
 from shared.azure_clients.sql_client import get_sql_client
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 100  # rows per INSERT batch
+BATCH_SIZE = 100  # rows per upsert batch
 
 
 class BronzeWriter:
@@ -45,24 +43,51 @@ class BronzeWriter:
     def _to_json(self, record: dict) -> str:
         return json.dumps(record, default=str, ensure_ascii=False)
 
-    def _batch_insert(self, table: str, columns: list[str], rows: list[tuple]) -> int:
-        """Insert rows in batches. Returns total rows inserted."""
+    def _build_merge_sql(self, table: str, columns: list[str], update_columns: list[str]) -> str:
+        source_projection = ", ".join([f"? AS {c}" for c in columns])
+        insert_columns = ", ".join(columns)
+        insert_values = ", ".join([f"source.{c}" for c in columns])
+        update_set = ", ".join([f"target.{c} = source.{c}" for c in update_columns])
+
+        return f"""
+            MERGE {table} AS target
+            USING (SELECT {source_projection}) AS source
+                ON target.id = (
+                    SELECT TOP 1 t.id
+                    FROM {table} t
+                    WHERE t.source_id = source.source_id
+                    ORDER BY t.synced_at DESC, t.id DESC
+                )
+            WHEN MATCHED THEN UPDATE SET
+                {update_set},
+                target.synced_at = GETUTCDATE()
+            WHEN NOT MATCHED THEN
+                INSERT ({insert_columns})
+                VALUES ({insert_values});
+        """
+
+    def _batch_upsert(
+        self,
+        table: str,
+        columns: list[str],
+        update_columns: list[str],
+        rows: list[tuple],
+    ) -> int:
+        """Upsert rows in batches. Returns total rows processed."""
         if not rows:
             return 0
 
-        placeholders = ", ".join(["?" for _ in columns])
-        col_list = ", ".join(columns)
-        sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})"
+        sql = self._build_merge_sql(table, columns, update_columns)
 
-        inserted = 0
+        processed = 0
         for i in range(0, len(rows), BATCH_SIZE):
             batch = rows[i : i + BATCH_SIZE]
             for row in batch:
                 self.sql.execute_non_query(sql, row)
-            inserted += len(batch)
-            logger.debug(f"{table}: inserted batch of {len(batch)}")
+            processed += len(batch)
+            logger.debug(f"{table}: upserted batch of {len(batch)}")
 
-        return inserted
+        return processed
 
     # ── Entity writers ───────────────────────────────────────
 
@@ -78,9 +103,10 @@ class BronzeWriter:
                 r.get("Id"),
                 self._to_json(r),
             ))
-        return self._batch_insert(
+        return self._batch_upsert(
             "bronze.nexudus_locations",
             ["sync_run_id", "source_id", "raw_json"],
+            ["sync_run_id", "raw_json"],
             rows,
         )
 
@@ -100,9 +126,10 @@ class BronzeWriter:
                 r.get("ItemType"),
                 self._to_json(r),
             ))
-        return self._batch_insert(
+        return self._batch_upsert(
             "bronze.nexudus_products",
             ["sync_run_id", "source_id", "location_id", "item_type", "raw_json"],
+            ["sync_run_id", "location_id", "item_type", "raw_json"],
             rows,
         )
 
@@ -122,9 +149,10 @@ class BronzeWriter:
                 location_id,
                 self._to_json(r),
             ))
-        return self._batch_insert(
+        return self._batch_upsert(
             "bronze.nexudus_contracts",
             ["sync_run_id", "source_id", "product_id", "location_id", "raw_json"],
+            ["sync_run_id", "product_id", "location_id", "raw_json"],
             rows,
         )
 
@@ -142,9 +170,10 @@ class BronzeWriter:
                 location_id,
                 self._to_json(r),
             ))
-        return self._batch_insert(
+        return self._batch_upsert(
             "bronze.nexudus_resources",
             ["sync_run_id", "source_id", "location_id", "raw_json"],
+            ["sync_run_id", "location_id", "raw_json"],
             rows,
         )
 
@@ -162,8 +191,9 @@ class BronzeWriter:
                 r.get("BusinessId"),
                 self._to_json(r),
             ))
-        return self._batch_insert(
+        return self._batch_upsert(
             "bronze.nexudus_extra_services",
             ["sync_run_id", "source_id", "location_id", "raw_json"],
+            ["sync_run_id", "location_id", "raw_json"],
             rows,
         )

@@ -9,10 +9,13 @@ Supports three connection modes (checked in order):
 """
 import os
 import re
+import time
 import pyodbc
 from typing import List, Dict, Any, Optional
 from contextlib import contextmanager
 import logging
+import struct
+from azure.identity import DefaultAzureCredential
 
 from dotenv import load_dotenv
 
@@ -76,12 +79,44 @@ class SQLClient:
             )
             logger.info("Using Microsoft Entra integrated authentication for database connection")
 
+        self._credential = None
+
+    def _open_connection(self) -> pyodbc.Connection:
+        """Open a single pyodbc connection (no retry). Uses SQL auth or Managed Identity."""
+        if "UID=" in self.connection_string or "Uid=" in self.connection_string:
+            return pyodbc.connect(self.connection_string)
+        if self._credential is None:
+            self._credential = DefaultAzureCredential()
+        token = self._credential.get_token("https://database.windows.net/.default")
+        token_bytes = token.token.encode("utf-16-le")
+        token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
+        return pyodbc.connect(self.connection_string, attrs_before={1256: token_struct})
+
     @contextmanager
-    def get_connection(self):
-        """Context manager for database connections."""
+    def get_connection(self, retries: int = 3, retry_delay: float = 5.0):
+        """Open a connection with retry logic for transient login timeouts (HYT00).
+
+        Serverless Azure SQL auto-pauses after inactivity — the first connection
+        attempt after a pause can fail with HYT00 while the database resumes.
+        Retrying after a short wait is the correct fix.
+        """
         conn = None
+        for attempt in range(1, retries + 1):
+            try:
+                conn = self._open_connection()
+                break
+            except pyodbc.OperationalError as e:
+                sqlstate = e.args[0] if e.args else ""
+                if sqlstate == "HYT00" and attempt < retries:
+                    logger.warning(
+                        f"SQL login timeout on attempt {attempt}/{retries} "
+                        f"(DB may be resuming from auto-pause). "
+                        f"Retrying in {retry_delay}s..."
+                    )
+                    time.sleep(retry_delay)
+                else:
+                    raise
         try:
-            conn = pyodbc.connect(self.connection_string)
             yield conn
             conn.commit()
         except Exception as e:

@@ -6,3 +6,5 @@ pyodbc
 openpyxl
 python-dateutil
 azure-functions>=1.18.0
+azure-identity
+azure-storage-blob
