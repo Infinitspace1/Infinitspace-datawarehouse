@@ -79,15 +79,14 @@ class SQLClient:
             )
             logger.info("Using Microsoft Entra integrated authentication for database connection")
 
-        # Cache credential once — avoids re-initialising DefaultAzureCredential
-        # on every connection attempt (used only for Managed Identity path)
-        self._credential = DefaultAzureCredential()
+        self._credential = None
 
     def _open_connection(self) -> pyodbc.Connection:
         """Open a single pyodbc connection (no retry). Uses SQL auth or Managed Identity."""
         if "UID=" in self.connection_string or "Uid=" in self.connection_string:
             return pyodbc.connect(self.connection_string)
-        # Managed Identity token auth — reuse cached credential
+        if self._credential is None:
+            self._credential = DefaultAzureCredential()
         token = self._credential.get_token("https://database.windows.net/.default")
         token_bytes = token.token.encode("utf-16-le")
         token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
