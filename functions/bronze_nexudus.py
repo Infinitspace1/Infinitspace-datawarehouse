@@ -22,6 +22,7 @@ import azure.functions as func
 
 from shared.nexudus.auth import get_bearer_token
 from shared.nexudus.client import NexudusClient
+from shared.azure_clients.blob_writer import BlobWriter
 from shared.azure_clients.bronze_writer import BronzeWriter
 from shared.azure_clients.run_tracker import RunTracker
 
@@ -44,28 +45,39 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
 
     async with NexudusClient(bearer_token) as client:
         run_id = uuid.uuid4()
+        blob_writer = BlobWriter()
         writer = BronzeWriter(run_id)
 
-        locations = await _sync_locations(client, writer, run_id)
-        products, resource_ids_by_location = await _sync_products(client, writer, run_id, locations)
-        await _sync_contracts(client, writer, run_id, products)
-        await _sync_resources(client, writer, run_id, resource_ids_by_location)
-        await _sync_extra_services(client, writer, run_id)
+        locations = await _sync_locations(client, blob_writer, writer, run_id)
+        products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
+        await _sync_contracts(client, blob_writer, writer, run_id, products)
+        await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
+        await _sync_extra_services(client, blob_writer, writer, run_id)
 
     logger.info(f"Nexudus -> Bronze sync complete [run_id={run_id}]")
 
 
-async def _sync_locations(client: NexudusClient, writer: BronzeWriter, run_id: uuid.UUID) -> list[dict]:
+async def _sync_locations(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> list[dict]:
     async with RunTracker("nexudus", "locations", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("sys/businesses")
         run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("locations", records, run_id)
         run.rows_written = writer.write_locations(records)
-        logger.info(f"Locations: {run.rows_read} fetched, {run.rows_written} written to bronze")
+        logger.info(
+            f"Locations: {run.rows_read} fetched, {run.rows_written} written to bronze "
+            f"[blob={blob_path}]"
+        )
         return records
 
 
 async def _sync_products(
     client: NexudusClient,
+    blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
     locations: list[dict],
@@ -73,6 +85,7 @@ async def _sync_products(
     async with RunTracker("nexudus", "products", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("sys/floorplandesks")
         run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("products", records, run_id)
         run.rows_written = writer.write_products(records)
 
         resource_ids_by_location: dict[int, list[int]] = {}
@@ -86,13 +99,15 @@ async def _sync_products(
 
         logger.info(
             f"Products: {run.rows_read} fetched, {run.rows_written} written to bronze. "
-            f"ResourceIds found: {sum(len(v) for v in resource_ids_by_location.values())}"
+            f"ResourceIds found: {sum(len(v) for v in resource_ids_by_location.values())} "
+            f"[blob={blob_path}]"
         )
         return records, resource_ids_by_location
 
 
 async def _sync_contracts(
     client: NexudusClient,
+    blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
     products: list[dict],
@@ -100,12 +115,17 @@ async def _sync_contracts(
     async with RunTracker("nexudus", "contracts", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("billing/coworkercontracts")
         run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("contracts", records, run_id)
         run.rows_written = writer.write_contracts(records)
-        logger.info(f"Contracts: {run.rows_read} fetched, {run.rows_written} written to bronze")
+        logger.info(
+            f"Contracts: {run.rows_read} fetched, {run.rows_written} written to bronze "
+            f"[blob={blob_path}]"
+        )
 
 
 async def _sync_resources(
     client: NexudusClient,
+    blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
     resource_ids_by_location: dict[int, list[int]],
@@ -138,6 +158,12 @@ async def _sync_resources(
             if result:
                 records.append((result, location_id))
 
+        blob_records = [
+            {"location_id": location_id, "record": record}
+            for record, location_id in records
+        ]
+        blob_path = blob_writer.write_snapshot("resources", blob_records, run_id)
+
         total_written = 0
         for record, location_id in records:
             total_written += writer.write_resources([record], location_id=location_id)
@@ -145,17 +171,23 @@ async def _sync_resources(
         run.rows_written = total_written
         logger.info(
             f"Resources: {run.rows_read} attempted, "
-            f"{run.rows_written} written, {run.rows_skipped} skipped"
+            f"{run.rows_written} written, {run.rows_skipped} skipped "
+            f"[blob={blob_path}]"
         )
 
 
 async def _sync_extra_services(
     client: NexudusClient,
+    blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
 ) -> None:
     async with RunTracker("nexudus", "extra_services", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("billing/extraservices")
         run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("extra_services", records, run_id)
         run.rows_written = writer.write_extra_services(records)
-        logger.info(f"Extra services: {run.rows_read} fetched, {run.rows_written} written to bronze")
+        logger.info(
+            f"Extra services: {run.rows_read} fetched, {run.rows_written} written to bronze "
+            f"[blob={blob_path}]"
+        )
