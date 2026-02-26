@@ -28,6 +28,8 @@ class SQLClient:
     """Low-level Azure SQL client used by the dashboard APIs."""
 
     def __init__(self):
+        self._credential = None
+        
         # Option 1: Direct connection string
         direct_conn_str = os.getenv("AZURE_SQL_CONNECTION_STRING")
 
