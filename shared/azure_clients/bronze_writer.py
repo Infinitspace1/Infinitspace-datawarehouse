@@ -73,7 +73,14 @@ class BronzeWriter:
         update_columns: list[str],
         rows: list[tuple],
     ) -> int:
-        """Upsert rows in batches. Returns total rows processed."""
+        """Upsert rows in batches. Returns total rows processed.
+
+        Uses execute_many so that each batch of BATCH_SIZE rows is sent over a
+        single connection instead of opening a new connection per row.  For
+        1 000+ products this reduces ~1 000 TCP connect/auth round-trips to
+        ~10, eliminating the HYT00 login-timeout that occurs when Azure SQL
+        serverless is hit with rapid successive connections.
+        """
         if not rows:
             return 0
 
@@ -82,8 +89,7 @@ class BronzeWriter:
         processed = 0
         for i in range(0, len(rows), BATCH_SIZE):
             batch = rows[i : i + BATCH_SIZE]
-            for row in batch:
-                self.sql.execute_non_query(sql, row)
+            self.sql.execute_many(sql, batch)
             processed += len(batch)
             logger.debug(f"{table}: upserted batch of {len(batch)}")
 

@@ -103,75 +103,37 @@ CREATE INDEX ix_bronze_nexudus_extra_services_sync_run  ON bronze.nexudus_extra_
 CREATE INDEX ix_bronze_nexudus_extra_services_synced_at ON bronze.nexudus_extra_services (synced_at);
 GO
 
+-- Sync runs tracking
+CREATE TABLE meta.sync_runs (
+    id                  UNIQUEIDENTIFIER    PRIMARY KEY,
+    source_name         NVARCHAR(64)        NOT NULL,
+    entity              NVARCHAR(64)        NOT NULL,
+    layer               NVARCHAR(16)        NOT NULL,       -- 'bronze', 'silver', 'core'
+    status              NVARCHAR(16)        NOT NULL,       -- 'running', 'success', 'failed'
+    started_at          DATETIME2           NOT NULL,
+    finished_at         DATETIME2           NULL,
+    rows_read           INT                 NULL,
+    rows_written        INT                 NULL,
+    rows_skipped        INT                 NULL,
+    error_message       NVARCHAR(MAX)       NULL,
+    triggered_by        NVARCHAR(32)        NULL,           -- 'cron', 'manual', 'http'
+    metadata            NVARCHAR(MAX)       NULL
+);
 
--- ──────────────────────────────────────────────────────────────
--- HUBSPOT (placeholder — add columns as you discover the shape)
--- ──────────────────────────────────────────────────────────────
+CREATE INDEX ix_sync_runs_source ON meta.sync_runs (source_name, entity, layer);
+CREATE INDEX ix_sync_runs_status ON meta.sync_runs (status, started_at DESC);
+GO
 
--- CREATE TABLE bronze.hubspot_contacts (
---     id              BIGINT          IDENTITY(1,1) PRIMARY KEY,
---     sync_run_id     UNIQUEIDENTIFIER NOT NULL,
---     source_id       NVARCHAR(64)    NOT NULL,       -- HubSpot object id (string)
---     raw_json        NVARCHAR(MAX)   NOT NULL,
---     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
--- );
+-- Record-level errors
+CREATE TABLE meta.sync_errors (
+    id                  BIGINT              IDENTITY(1,1) PRIMARY KEY,
+    sync_run_id         UNIQUEIDENTIFIER    NOT NULL,
+    source_id           NVARCHAR(128)       NOT NULL,
+    entity              NVARCHAR(64)        NOT NULL,
+    error_message       NVARCHAR(MAX)       NOT NULL,
+    raw_payload         NVARCHAR(MAX)       NULL,
+    created_at          DATETIME2           NOT NULL DEFAULT GETUTCDATE()
+);
 
--- CREATE INDEX ix_bronze_hubspot_contacts_source_id ON bronze.hubspot_contacts (source_id);
--- CREATE INDEX ix_bronze_hubspot_contacts_sync_run  ON bronze.hubspot_contacts (sync_run_id);
--- GO
-
--- CREATE TABLE bronze.hubspot_companies (
---     id              BIGINT          IDENTITY(1,1) PRIMARY KEY,
---     sync_run_id     UNIQUEIDENTIFIER NOT NULL,
---     source_id       NVARCHAR(64)    NOT NULL,
---     raw_json        NVARCHAR(MAX)   NOT NULL,
---     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
--- );
-
--- CREATE INDEX ix_bronze_hubspot_companies_source_id ON bronze.hubspot_companies (source_id);
--- CREATE INDEX ix_bronze_hubspot_companies_sync_run  ON bronze.hubspot_companies (sync_run_id);
--- GO
-
--- CREATE TABLE bronze.hubspot_deals (
---     id              BIGINT          IDENTITY(1,1) PRIMARY KEY,
---     sync_run_id     UNIQUEIDENTIFIER NOT NULL,
---     source_id       NVARCHAR(64)    NOT NULL,
---     raw_json        NVARCHAR(MAX)   NOT NULL,
---     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
--- );
-
--- CREATE INDEX ix_bronze_hubspot_deals_source_id ON bronze.hubspot_deals (source_id);
--- CREATE INDEX ix_bronze_hubspot_deals_sync_run  ON bronze.hubspot_deals (sync_run_id);
--- GO
-
-
--- ──────────────────────────────────────────────────────────────
--- GOOGLE DRIVE / ONEDRIVE (placeholder)
--- File metadata only — actual file content stays in Blob Storage
--- ──────────────────────────────────────────────────────────────
-
--- CREATE TABLE bronze.gdrive_files (
---     id              BIGINT          IDENTITY(1,1) PRIMARY KEY,
---     sync_run_id     UNIQUEIDENTIFIER NOT NULL,
---     source_id       NVARCHAR(256)   NOT NULL,       -- Google file id
---     raw_json        NVARCHAR(MAX)   NOT NULL,
---     blob_path       NVARCHAR(1024)  NULL,           -- path in Azure Blob if content stored
---     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
--- );
-
--- CREATE INDEX ix_bronze_gdrive_files_source_id ON bronze.gdrive_files (source_id);
--- CREATE INDEX ix_bronze_gdrive_files_sync_run  ON bronze.gdrive_files (sync_run_id);
--- GO
-
--- CREATE TABLE bronze.onedrive_files (
---     id              BIGINT          IDENTITY(1,1) PRIMARY KEY,
---     sync_run_id     UNIQUEIDENTIFIER NOT NULL,
---     source_id       NVARCHAR(256)   NOT NULL,       -- OneDrive item id
---     raw_json        NVARCHAR(MAX)   NOT NULL,
---     blob_path       NVARCHAR(1024)  NULL,
---     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
--- );
-
--- CREATE INDEX ix_bronze_onedrive_files_source_id ON bronze.onedrive_files (source_id);
--- CREATE INDEX ix_bronze_onedrive_files_sync_run  ON bronze.onedrive_files (sync_run_id);
+CREATE INDEX ix_sync_errors_run ON meta.sync_errors (sync_run_id);
 GO

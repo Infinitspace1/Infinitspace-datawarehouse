@@ -28,6 +28,8 @@ class SQLClient:
     """Low-level Azure SQL client used by the dashboard APIs."""
 
     def __init__(self):
+        self._credential = None
+        
         # Option 1: Direct connection string
         direct_conn_str = os.getenv("AZURE_SQL_CONNECTION_STRING")
 
@@ -151,6 +153,22 @@ class SQLClient:
                 cursor.execute(query, params)
             else:
                 cursor.execute(query)
+            return cursor.rowcount
+
+    def execute_many(self, query: str, params_list: List[tuple]) -> int:
+        """Execute the same parameterised query for multiple row tuples in a
+        single connection.  Much more efficient than calling execute_non_query
+        once per row when writing large batches (avoids a new TCP connection +
+        auth round-trip per row).
+
+        Returns the total number of rows affected (cursor.rowcount after the
+        final executemany call — -1 if the driver does not report row counts).
+        """
+        if not params_list:
+            return 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(query, params_list)
             return cursor.rowcount
 
     def execute_scalar(self, query: str, params: Optional[tuple] = None) -> Any:
