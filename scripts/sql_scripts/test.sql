@@ -210,3 +210,30 @@ ON extra.resource_type_names = res.resource_type_name
 
 SELECT * FROM silver.nexudus_extra_services
 WHERE resource_type_names LIKE 'Hot desk%'
+
+
+SELECT * FROM silver.location_nearby_pois
+WHERE location_source_id = 1420976575
+
+SELECT * FROM silver.location_neighborhoods;
+
+SELECT 
+    extra.name,
+    loc.name AS location_name, 
+    extra.price, 
+    extra.currency_code, 
+    res.allocation
+FROM silver.nexudus_extra_services extra
+LEFT JOIN silver.nexudus_resources res
+ON extra.resource_type_names = res.resource_type_name
+LEFT JOIN silver.nexudus_locations loc
+ON extra.location_source_id = loc.source_id;
+
+select * from silver.nexudus_products
+WHERE is_available = 1
+
+SELECT * FROM silver.nexudus_extra_services
+WHERE resource_type_names LIKE 'hot desk%'
+
+SELECT * FROM silver.nexudus_extra_services
+WHERE resource_type_names IS NULL
