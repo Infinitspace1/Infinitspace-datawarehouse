@@ -12,11 +12,13 @@ import azure.functions as func
 
 from functions.bronze_nexudus import bp as bronze_bp
 from functions.silver_nexudus import bp as silver_bp
+from functions.silver_worker import bp as silver_worker_bp
 from functions.ava_refresh import bp as ava_bp
 
 app = func.FunctionApp()
 app.register_functions(bronze_bp)
 app.register_functions(silver_bp)
+app.register_functions(silver_worker_bp)
 app.register_functions(ava_bp)
 
 @app.route(route="test-connections", auth_level=func.AuthLevel.ADMIN)

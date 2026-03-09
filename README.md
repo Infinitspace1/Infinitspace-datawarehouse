@@ -99,7 +99,7 @@ python scripts/python_scripts/test_local.py --step all --dry-run
 # bash deploy/setup_azure_resources.sh  # Linux/Mac
 
 # Deploy functions
-func azure functionapp publish infinitspace-dw-functions --build remote --python
+func azure functionapp publish func-infinitspace-datawarehouse --python
 ```
 
 **For detailed instructions, see:**
