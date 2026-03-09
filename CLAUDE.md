@@ -26,6 +26,15 @@ Nexudus API  ──[02:00 UTC]──▶  Bronze (raw, append-only)
                                       │
                               [02:30 UTC]
                                       ▼
+                    bronze_to_silver() timer trigger
+                    (enqueues 5 messages — one per entity)
+                                      │
+                     Azure Storage Queue "silver-sync-tasks"
+                      │          │          │         │         │
+                 [locations] [products] [contracts] [resources] [extra_services]
+                  silver_entity_worker() × 5  (parallel, isolated)
+                                      │
+                                      ▼
                              Silver (typed, upserted)
                                       │
                               [03:00 UTC]
@@ -62,7 +71,8 @@ Infinitspace-datawarehouse/
 │
 ├── functions/
 │   ├── bronze_nexudus.py              ← Timer trigger: Nexudus → Bronze (02:00 UTC)
-│   ├── silver_nexudus.py              ← Timer trigger: Bronze → Silver (02:30 UTC)
+│   ├── silver_nexudus.py              ← Timer trigger: enqueues 5 silver tasks (02:30 UTC)
+│   ├── silver_worker.py               ← Queue trigger: Bronze → Silver per entity (parallel)
 │   ├── ava_refresh.py                 ← Timer trigger: Silver → AVA layer (03:00 UTC)
 │   └── enrich_gmaps.py                ← HTTP trigger: Google Maps enrichment (on-demand)
 │
@@ -71,6 +81,7 @@ Infinitspace-datawarehouse/
 │   │   ├── sql_client.py              ← SQL connection manager + Database wrapper
 │   │   ├── bronze_writer.py           ← Batch upsert to bronze.nexudus_* tables
 │   │   ├── blob_writer.py             ← Store raw snapshots in Azure Blob Storage
+│   │   ├── queue_client.py            ← Enqueue silver tasks to Azure Storage Queue
 │   │   ├── run_tracker.py             ← Context manager: logs to meta.sync_runs
 │   │   ├── silver_write_locations.py  ← Bronze → silver.nexudus_locations + _hours
 │   │   ├── silver_writer_products.py  ← Bronze → silver.nexudus_products
@@ -359,6 +370,7 @@ SELECT TOP 20 * FROM meta.sync_errors ORDER BY created_at DESC;
 | `azure-functions` >=1.18.0 | Azure Functions SDK |
 | `azure-identity` | Managed Identity authentication |
 | `azure-storage-blob` | Blob Storage integration |
+| `azure-storage-queue` | Azure Storage Queue (silver task dispatch) |
 | `aiohttp` | Async HTTP (Nexudus API calls) |
 | `requests` | Sync HTTP (Google Maps API) |
 | `pyodbc` | SQL Server via ODBC |
@@ -464,6 +476,7 @@ The `ava` schema contains a single denormalized table consumed directly by the A
 | SQL retry logic | ✅ Complete | HYT00 serverless auto-pause handling |
 | Run tracking | ✅ Complete | `meta.sync_runs` + `meta.sync_errors` |
 | Google Maps enrichment | ✅ Complete | POIs, transit, neighborhoods (HTTP trigger) |
+| Silver queue-based fanout | ✅ Complete | Timer enqueues 5 tasks; workers run in parallel via `silver-sync-tasks` queue |
 | AVA layer table + SP | ✅ Complete | `ava.product_availability` rebuilt daily at 03:00 UTC |
 | Local test scripts | ✅ Complete | All entities covered |
 | Silver → Core population | 🚧 Planned | Q1 2026 |
@@ -475,6 +488,18 @@ The `ava` schema contains a single denormalized table consumed directly by the A
 
 ---
 
+## Silver Queue-Based Architecture
+
+`bronze_to_silver` (timer trigger) is the **orchestrator** — it only enqueues 5 messages and exits in under 1 second. `silver_entity_worker` (queue trigger) is the **worker** — one isolated invocation per entity, running in parallel.
+
+- **Queue name**: `silver-sync-tasks` on storage account `staccinfinitspaceprod001`
+- **Connection binding**: `AzureWebJobsStorage` (auto-configured in Azure; set in `local.settings.json` for local dev)
+- **Poison queue**: `silver-sync-tasks-poison` — messages failing 5 consecutive times land here for manual inspection
+- **Idempotency**: All `_upsert()` calls use SQL MERGE on `source_id` — queue retries are fully safe
+- **Failure isolation**: one entity failing raises an exception → message is retried; other entities are unaffected
+
+---
+
 ## Known Issues / Gotchas
 
 - The `.gitignore` contains `*.json` which is overly broad — it may accidentally exclude JSON config files. Be aware when adding new JSON files.
@@ -483,6 +508,7 @@ The `ava` schema contains a single denormalized table consumed directly by the A
 - `custom_size_sqm` is only populated for type 1 (Private Office) via `CustomFields` in the raw JSON. All other types use the standard `size_sqm`.
 - Nexudus API uses bearer token (OAuth2 password grant). Token is cached per function instance; a 60-second buffer avoids edge-case expiry.
 - `Database` wrapper (`get_db()`) uses named params (`:name`); `SQLClient` (`get_sql_client()`) uses positional `?` params.
+- Silver workers share `AzureWebJobsStorage` (queue trigger binding) with the same storage account used by `BlobWriter` (`AZURE_STORAGE_ACCOUNT_NAME`). Ensure the Function App's managed identity has `Storage Queue Data Contributor` + `Storage Queue Data Message Sender` roles on the storage account.
 
 ---
 
@@ -501,6 +527,6 @@ After ANY change to this project, update this file:
 
 ---
 
-**Last Updated**: 2026-03-02 (added ava layer; revised: removed size_sqm, added chain_occupied_until, fixed gap logic)
+**Last Updated**: 2026-03-09 (silver layer refactored to queue-based fanout; added silver_worker.py + queue_client.py; bronze_to_silver is now an orchestrator)
 **Current Branch**: `etl/silver-layer`
 **Maintainer**: InfinitSpace Data Engineering Team

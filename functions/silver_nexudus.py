@@ -1,10 +1,25 @@
 """
 functions/silver_nexudus.py
 
-Blueprint: Timer trigger (daily) that reads bronze.nexudus_* tables
-and upserts into silver.nexudus_* tables.
+Blueprint: Timer trigger (daily) that enqueues one processing task per
+Nexudus entity onto the "silver-sync-tasks" Azure Storage Queue.
 
 Runs 30 minutes after bronze sync completes (02:30 UTC by default).
+
+Previously this function ran all five entity transformations sequentially
+in a single invocation, which routinely exceeded the 10-minute Function
+timeout on larger datasets. The refactored design separates concerns:
+
+  1. This orchestrator — fires at 02:30 UTC, enqueues 5 messages, exits
+     in under 1 second.
+  2. silver_worker.py (queue trigger) — one invocation per message, runs
+     a single entity transformation in isolation (< 10 min each).
+
+Benefits:
+  - Five entities processed in parallel rather than serially.
+  - One entity failing does not block the others.
+  - Azure Queue auto-retries failed messages (up to 5 times by default).
+  - All MERGE upserts are idempotent, so retries are safe.
 """
 import logging
 import os
@@ -12,12 +27,7 @@ import uuid
 
 import azure.functions as func
 
-from shared.azure_clients.silver_write_locations import SilverLocationsWriter
-from shared.azure_clients.silver_writer_products import SilverProductsWriter
-from shared.azure_clients.silver_writer_contracts import SilverContractsWriter
-from shared.azure_clients.silver_writer_resources import SilverResourcesWriter
-from shared.azure_clients.silver_writer_extra_services import SilverExtraServicesWriter
-from shared.azure_clients.run_tracker import RunTracker
+from shared.azure_clients.queue_client import SilverTaskQueue
 
 logger = logging.getLogger(__name__)
 
@@ -25,49 +35,31 @@ bp = func.Blueprint()
 
 SCHEDULE = os.getenv("SILVER_SYNC_SCHEDULE", "0 30 2 * * *")
 
+ENTITIES = [
+    "locations",
+    "products",
+    "contracts",
+    "resources",
+    "extra_services",
+]
+
 
 @bp.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
 async def bronze_to_silver(timer: func.TimerRequest) -> None:
-    """Transform bronze layer data into typed silver layer tables."""
-    logger.info("Bronze -> Silver transformation started")
-
-    sync_run_id = uuid.uuid4()
+    """Enqueue one silver transformation task per Nexudus entity."""
+    sync_run_id = str(uuid.uuid4())
+    logger.info(f"Bronze -> Silver orchestrator started [sync_run_id={sync_run_id}]")
 
     try:
-        logger.info(f"Starting silver transformation [sync_run_id={sync_run_id}]")
+        task_queue = SilverTaskQueue()
+        for entity in ENTITIES:
+            task_queue.enqueue_entity(entity, sync_run_id)
 
-        async with RunTracker("nexudus", "locations", "silver", metadata=str(sync_run_id)) as run:
-            writer = SilverLocationsWriter(sync_run_id)
-            result = writer.run()
-            run.rows_written = result.get("locations", 0) + result.get("location_hours", 0)
-            logger.info(f"Silver locations: {result}")
-
-        async with RunTracker("nexudus", "products", "silver", metadata=str(sync_run_id)) as run:
-            writer = SilverProductsWriter(sync_run_id)
-            result = writer.run()
-            run.rows_written = result.get("products", 0)
-            logger.info(f"Silver products: {result}")
-
-        async with RunTracker("nexudus", "resources", "silver", metadata=str(sync_run_id)) as run:
-            writer = SilverResourcesWriter(sync_run_id)
-            result = writer.run()
-            run.rows_written = result.get("resources", 0)
-            logger.info(f"Silver resources: {result}")
-
-        async with RunTracker("nexudus", "contracts", "silver", metadata=str(sync_run_id)) as run:
-            writer = SilverContractsWriter(sync_run_id)
-            result = writer.run()
-            run.rows_written = result.get("contracts", 0)
-            logger.info(f"Silver contracts: {result}")
-
-        async with RunTracker("nexudus", "extra_services", "silver", metadata=str(sync_run_id)) as run:
-            writer = SilverExtraServicesWriter(sync_run_id)
-            result = writer.run()
-            run.rows_written = result.get("extra_services", 0)
-            logger.info(f"Silver extra_services: {result}")
-
-        logger.info(f"Bronze -> Silver transformation complete [sync_run_id={sync_run_id}]")
+        logger.info(
+            f"Bronze -> Silver: {len(ENTITIES)} tasks enqueued "
+            f"[sync_run_id={sync_run_id}]"
+        )
 
     except Exception as e:
-        logger.error(f"Bronze -> Silver transformation failed: {e}", exc_info=True)
+        logger.error(f"Bronze -> Silver orchestrator failed to enqueue tasks: {e}", exc_info=True)
         raise
