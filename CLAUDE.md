@@ -15,7 +15,7 @@
 - **Secondary enrichment**: Google Maps Places API
 - **Blob storage**: Azure Blob Storage (raw snapshots / audit trail)
 - **Resource group**: `infinitspace-datawarehouse-prod`
-- **Function App name**: `infinitspace-dw-functions`
+- **Function App name**: `func-infinitspace-datawarehouse`
 
 ---
 
@@ -325,17 +325,17 @@ python scripts/python_scripts/inspect_bronze.py
 
 ```bash
 # Deploy function app
-func azure functionapp publish infinitspace-dw-functions --build remote --python
+func azure functionapp publish func-infinitspace-datawarehouse --build remote --python
 
 # Manual trigger via CLI
 az functionapp function invoke \
-  --name infinitspace-dw-functions \
+  --name func-infinitspace-datawarehouse \
   --resource-group infinitspace-datawarehouse-prod \
   --function-name nexudus-to-bronze
 
 # Tail logs
 az functionapp log tail \
-  --name infinitspace-dw-functions \
+  --name func-infinitspace-datawarehouse \
   --resource-group infinitspace-datawarehouse-prod
 ```
 
@@ -527,6 +527,6 @@ After ANY change to this project, update this file:
 
 ---
 
-**Last Updated**: 2026-03-09 (silver layer refactored to queue-based fanout; added silver_worker.py + queue_client.py; bronze_to_silver is now an orchestrator)
+**Last Updated**: 2026-03-10 (corrected Function App name to func-infinitspace-datawarehouse)
 **Current Branch**: `etl/silver-layer`
 **Maintainer**: InfinitSpace Data Engineering Team
