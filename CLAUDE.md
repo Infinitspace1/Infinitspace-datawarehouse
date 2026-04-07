@@ -83,6 +83,8 @@ Xero API
   -> bronze.xero_invoices
   -> silver.xero_invoices
   -> silver.xero_invoice_line_items
+  -> silver.xero_tenants
+  -> xero.silver_tenants (view alias)
   -> optional bronze.xero_invoice_pdfs
 ```
 
@@ -167,6 +169,7 @@ Infinitspace-datawarehouse/
       store.py
       client.py
       invoice_sync.py
+      tenant_directory.py
     gmaps/
   scripts/
     python_scripts/
@@ -210,6 +213,7 @@ Infinitspace-datawarehouse/
   tests/
     test_nexudus_colleague_sync.py
     test_xero_integration.py
+    test_xero_tenant_directory.py
   docs/
     deploy.md
     silver_table_relationships.md
@@ -267,6 +271,7 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `silver.nexudus_colleague_location_access`
 - `silver.xero_invoices`
 - `silver.xero_invoice_line_items`
+- `silver.xero_tenants`
 - `silver.location_nearby_pois`
 - `silver.location_transit_stations`
 - `silver.location_neighborhoods`
@@ -286,6 +291,14 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `meta.xero_oauth_states`
 - `meta.xero_connections`
 - `meta.xero_tenants`
+
+### Xero Directory
+
+- canonical table: `silver.xero_tenants`
+- SQL view alias: `xero.silver_tenants`
+- one row per Xero tenant for a connection
+- location columns are copied from the best matched `silver.nexudus_locations` row
+- `community_manager_name` is intentionally a placeholder for now and is preserved on refresh
 
 ---
 
@@ -327,7 +340,11 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `shared/xero/invoice_sync.py`
   - incremental by tenant using `If-Modified-Since`
   - updates `meta.xero_tenants` watermarks
+  - refreshes `silver.xero_tenants` after invoice sync
   - does not use `RunTracker`
+- `shared/xero/tenant_directory.py`
+  - matches legal Xero tenant names to Nexudus locations
+  - preserves any manually maintained `community_manager_name`
 
 ---
 
@@ -380,6 +397,7 @@ Expected SQL status fields:
 - `Writing Xero invoices page`
 - `Xero invoice sync complete`
 - possible warning: `Some tenants failed during Xero sync`
+- final Xero sync stats include nested `tenant_directory` refresh results
 
 ---
 
@@ -456,6 +474,7 @@ Xero validation:
 .\venv\Scripts\python.exe scripts\python_scripts\xero_get_connections.py --owner-type workspace --owner-id default
 .\venv\Scripts\python.exe scripts\python_scripts\xero_sync_invoices.py --owner-type workspace --owner-id default
 .\venv\Scripts\python.exe scripts\python_scripts\xero_list_invoices.py --owner-type workspace --owner-id default --top 20
+.\venv\Scripts\python.exe -m unittest tests.test_xero_integration tests.test_xero_tenant_directory
 ```
 
 Explicit refresh verification:
@@ -489,6 +508,16 @@ SELECT
     last_invoice_sync_error,
     last_invoice_modified_utc
 FROM meta.xero_tenants
+ORDER BY tenant_name;
+
+SELECT
+    tenant_name,
+    location_name,
+    location_city,
+    location_country_name,
+    community_manager_name,
+    location_match_rule
+FROM xero.silver_tenants
 ORDER BY tenant_name;
 ```
 
@@ -534,6 +563,7 @@ az functionapp config appsettings set `
 | Xero OAuth + tenant storage | done | DB-backed |
 | Xero auto-refresh | done | disconnects on `invalid_grant` |
 | Xero invoice sync | done | incremental by tenant |
+| Xero tenant directory | done | refreshed after Xero sync and exposed as `xero.silver_tenants` |
 | Optional admin HTTP routes | done | separate deployment mode |
 | Google Maps scheduled pipeline | not wired | utilities exist, not registered in default app |
 | Core layer population | planned | not implemented |

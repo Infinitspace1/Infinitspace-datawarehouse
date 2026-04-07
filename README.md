@@ -45,6 +45,8 @@ This project runs scheduled Azure Functions that ingest operational data into Az
   - Writes raw invoices to `bronze.xero_invoices`
   - Writes typed invoices to `silver.xero_invoices`
   - Writes line items to `silver.xero_invoice_line_items`
+  - Refreshes the Xero tenant directory in `silver.xero_tenants`
+  - Exposes the same directory through `xero.silver_tenants`
   - Optionally caches PDFs in `bronze.xero_invoice_pdfs`
 
 ## Function App Model
@@ -86,11 +88,13 @@ Infinitspace-datawarehouse/
     azure_clients/
     nexudus/
     xero/
+      tenant_directory.py
     gmaps/
   scripts/
     python_scripts/
     sql_scripts/
   tests/
+    test_xero_tenant_directory.py
   docs/
   deploy/
 ```
@@ -152,7 +156,7 @@ For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settin
 ### Unit Tests
 
 ```powershell
-.\venv\Scripts\python.exe -m unittest tests.test_xero_integration
+.\venv\Scripts\python.exe -m unittest tests.test_xero_integration tests.test_xero_tenant_directory
 ```
 
 ## Xero Auth and Refresh
@@ -162,6 +166,8 @@ The supported production path is DB-backed, not `.env` refresh-token rotation:
 - OAuth state is stored in `meta.xero_oauth_states`
 - Encrypted tokens are stored in `meta.xero_connections`
 - Tenant metadata and sync watermarks are stored in `meta.xero_tenants`
+- Tenant-to-location directory rows are stored in `silver.xero_tenants`
+- `xero.silver_tenants` is a view alias for the same directory
 - Automatic refresh happens in `shared/xero/client.py`
 - If Xero returns `invalid_grant`, the connection is marked disconnected
 
@@ -246,6 +252,16 @@ SELECT
     last_invoice_modified_utc
 FROM meta.xero_tenants
 ORDER BY tenant_name;
+
+SELECT
+    tenant_name,
+    location_name,
+    location_city,
+    location_country_name,
+    community_manager_name,
+    location_match_rule
+FROM xero.silver_tenants
+ORDER BY tenant_name;
 ```
 
 ### Expected Nexudus Logs
@@ -276,6 +292,7 @@ ORDER BY tenant_name;
 - `Fetching Xero invoices page`
 - `Writing Xero invoices page`
 - `Xero invoice sync complete`
+- tenant directory refresh stats inside the final Xero sync payload
 
 ## Current Status
 
@@ -283,6 +300,7 @@ ORDER BY tenant_name;
 - Nexudus silver pipeline: done
 - AVA refresh pipeline: done
 - Xero OAuth, token refresh, tenant storage, and invoice sync: done
+- Xero tenant-to-location directory: done
 - Optional admin HTTP routes: done, but not part of the default ETL app
 - Google Maps enrichment utilities: present, not part of the scheduled ETL app
 - Core layer population: not implemented

@@ -23,6 +23,7 @@ from typing import Any, Optional
 from shared.xero.client import XeroApiClient
 from shared.xero.flow import DEFAULT_OWNER_ID, DEFAULT_OWNER_TYPE
 from shared.xero.store import XeroStore
+from shared.xero.tenant_directory import XeroTenantDirectoryService
 
 _XERO_DOTNET_DATE_RE = re.compile(r"^/Date\((?P<ms>-?\d+)(?P<offset>[+-]\d{4})?\)/$")
 logger = logging.getLogger(__name__)
@@ -167,7 +168,14 @@ class XeroInvoiceSyncService:
                     extra={"xero_connection_id": connection.id, "xero_tenant_id": current_tenant_id},
                 )
 
-        return stats.to_dict()
+        tenant_directory = XeroTenantDirectoryService(
+            sql_client=self.sql,
+            store=self.store,
+        ).refresh_tenants(connection_id=connection.id)
+
+        result = stats.to_dict()
+        result["tenant_directory"] = tenant_directory
+        return result
 
     def cache_invoice_pdf(
         self,

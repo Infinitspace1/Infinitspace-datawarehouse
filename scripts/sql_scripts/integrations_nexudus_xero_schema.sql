@@ -274,6 +274,123 @@ END
 GO
 
 -- -----------------------------------------------------------------------------
+-- silver.xero_tenants
+-- Refreshable tenant directory that combines Xero tenant metadata with the
+-- best matching silver.nexudus_locations row.
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('silver.xero_tenants', 'U') IS NULL
+BEGIN
+    CREATE TABLE silver.xero_tenants (
+        id                      BIGINT              IDENTITY(1,1) PRIMARY KEY,
+        xero_connection_id      BIGINT              NOT NULL,
+        xero_tenant_id          NVARCHAR(128)       NOT NULL,
+        xero_tenant_type        NVARCHAR(64)        NULL,
+        tenant_name             NVARCHAR(512)       NULL,
+        tenant_connection_id    NVARCHAR(128)       NULL,
+        auth_event_id           NVARCHAR(128)       NULL,
+        raw_tenant_payload      NVARCHAR(MAX)       NULL,
+        location_source_id      BIGINT              NULL,
+        location_nexudus_uuid   NVARCHAR(64)        NULL,
+        location_name           NVARCHAR(512)       NULL,
+        location_web_address    NVARCHAR(256)       NULL,
+        location_address        NVARCHAR(1024)      NULL,
+        location_postal_code    NVARCHAR(32)        NULL,
+        location_city           NVARCHAR(255)       NULL,
+        location_state          NVARCHAR(255)       NULL,
+        location_country_name   NVARCHAR(128)       NULL,
+        location_currency_code  NVARCHAR(8)         NULL,
+        location_email          NVARCHAR(512)       NULL,
+        location_web_contact    NVARCHAR(512)       NULL,
+        community_manager_name  NVARCHAR(255)       NULL,
+        location_match_rule     NVARCHAR(128)       NULL,
+        first_seen_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
+        last_synced_at          DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
+        CONSTRAINT uq_silver_xero_tenants_connection_tenant
+            UNIQUE (xero_connection_id, xero_tenant_id),
+        CONSTRAINT fk_silver_xero_tenants_connection
+            FOREIGN KEY (xero_connection_id) REFERENCES meta.xero_connections(id)
+    );
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = 'ix_silver_xero_tenants_location_source_id'
+      AND object_id = OBJECT_ID('silver.xero_tenants')
+)
+BEGIN
+    CREATE INDEX ix_silver_xero_tenants_location_source_id
+        ON silver.xero_tenants (location_source_id);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = 'ix_silver_xero_tenants_tenant_name'
+      AND object_id = OBJECT_ID('silver.xero_tenants')
+)
+BEGIN
+    CREATE INDEX ix_silver_xero_tenants_tenant_name
+        ON silver.xero_tenants (tenant_name);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = 'ix_silver_xero_tenants_location_city'
+      AND object_id = OBJECT_ID('silver.xero_tenants')
+)
+BEGIN
+    CREATE INDEX ix_silver_xero_tenants_location_city
+        ON silver.xero_tenants (location_city);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.schemas
+    WHERE name = 'xero'
+)
+BEGIN
+    EXEC sp_executesql N'CREATE SCHEMA xero';
+END
+GO
+
+EXEC sp_executesql N'
+CREATE OR ALTER VIEW xero.silver_tenants AS
+SELECT
+    id,
+    xero_connection_id,
+    xero_tenant_id,
+    xero_tenant_type,
+    tenant_name,
+    tenant_connection_id,
+    auth_event_id,
+    raw_tenant_payload,
+    location_source_id,
+    location_nexudus_uuid,
+    location_name,
+    location_web_address,
+    location_address,
+    location_postal_code,
+    location_city,
+    location_state,
+    location_country_name,
+    location_currency_code,
+    location_email,
+    location_web_contact,
+    community_manager_name,
+    location_match_rule,
+    first_seen_at,
+    last_synced_at
+FROM silver.xero_tenants;
+';
+GO
+
+-- -----------------------------------------------------------------------------
 -- meta.xero_oauth_states
 -- -----------------------------------------------------------------------------
 IF OBJECT_ID('meta.xero_oauth_states', 'U') IS NULL

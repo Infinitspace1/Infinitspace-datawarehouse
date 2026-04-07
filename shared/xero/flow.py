@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from shared.xero.oauth import XeroOAuthService
 from shared.xero.store import XeroStore
+from shared.xero.tenant_directory import XeroTenantDirectoryService
 
 DEFAULT_OWNER_TYPE = "workspace"
 DEFAULT_OWNER_ID = "default"
@@ -58,10 +59,21 @@ class XeroAuthFlowService:
         )
         self.store.save_tenants(connection_id, tenants)
 
+        tenant_directory = None
+        tenant_directory_error = None
+        try:
+            tenant_directory = XeroTenantDirectoryService(store=self.store).refresh_tenants(
+                connection_id=connection_id,
+            )
+        except Exception as exc:
+            tenant_directory_error = str(exc)
+
         return {
             "owner_type": owner_type,
             "owner_id": owner_id,
             "xero_connection_id": connection_id,
             "tenant_count": len(tenants),
             "selected_tenant_id": selected_tenant_id,
+            "tenant_directory": tenant_directory,
+            "tenant_directory_error": tenant_directory_error,
         }
