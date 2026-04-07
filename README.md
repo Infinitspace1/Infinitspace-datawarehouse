@@ -1,517 +1,297 @@
 # InfinitSpace Data Warehouse
 
-**Official ETL repository for the InfinitSpace data warehouse pipeline**
+Production ETL repository for the InfinitSpace data platform.
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Azure Functions](https://img.shields.io/badge/Azure-Functions-0078D4?logo=microsoft-azure)](https://azure.microsoft.com/en-us/services/functions/)
-[![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
+This project runs scheduled Azure Functions that ingest operational data into Azure SQL across a lakehouse-style flow:
 
----
+- `bronze`: raw source payloads
+- `silver`: typed and normalized entities
+- `ava`: denormalized product availability for downstream use
+- `core`: planned, not implemented yet
 
-## 🎯 Overview
+## Current Pipelines
 
-The InfinitSpace Data Warehouse is a production-grade ETL pipeline that:
+### Nexudus
 
-- **Extracts** data from multiple sources (Nexudus, Hubspot, OneDrive, etc.)
-- **Loads** raw data into a **Bronze layer** (append-only, immutable)
-- **Transforms** data into a **Silver layer** (cleaned, typed, normalized)
-- **Merges** data into a **Core layer** (source-agnostic, canonical entities)
+- `nexudus_to_bronze`
+  - Timer trigger
+  - Default schedule: `02:00 UTC`
+  - Fetches `locations`, `products`, `contracts`, `resources`, `extra_services`
+  - Writes raw rows to `bronze.nexudus_*`
+  - Writes JSON snapshots to blob storage
 
-The pipeline runs **daily on Azure Functions** with automatic scheduling, error tracking, and monitoring.
+- `bronze_to_silver`
+  - Timer trigger
+  - Default schedule: `02:30 UTC`
+  - Enqueues one queue message per entity
 
----
+- `silver_entity_worker`
+  - Queue trigger
+  - Processes one silver entity per message
+  - Writes to `silver.nexudus_*`
 
-## 📊 Current Status
+- `refresh_ava_availability`
+  - Timer trigger
+  - Default schedule: `03:00 UTC`
+  - Runs `ava.sp_refresh_product_availability`
+  - Rebuilds `ava.product_availability`
 
-### ✅ Implemented
+### Xero
 
-| Feature | Status | Details |
-|---------|--------|---------|
-| Nexudus → Bronze | ✅ Complete | All 5 entities (locations, products, contracts, resources, extra_services) |
-| Bronze → Silver | ✅ Complete | Transformation logic for all entities |
-| SQL Schema | ✅ Complete | Bronze, Silver, Core, Meta schemas |
-| Local Testing | ✅ Complete | Test scripts for all layers |
-| Azure Function (Bronze) | ✅ Complete | Timer trigger at 02:00 UTC daily |
-| Azure Function (Silver) | ✅ Complete | Timer trigger at 02:30 UTC daily |
-| Run Tracking | ✅ Complete | `meta.sync_runs` + `meta.sync_errors` |
-| Documentation | ✅ Complete | Deployment guide, quickstart, schema docs |
+- `xero_invoice_sync`
+  - Timer trigger
+  - Default schedule: `04:00 UTC`
+  - Reads all stored Xero tenants for the default connection
+  - Writes raw invoices to `bronze.xero_invoices`
+  - Writes typed invoices to `silver.xero_invoices`
+  - Writes line items to `silver.xero_invoice_line_items`
+  - Optionally caches PDFs in `bronze.xero_invoice_pdfs`
 
-### 🚧 Roadmap
+## Function App Model
 
-| Feature | Priority | Target |
-|---------|----------|--------|
-| Silver → Core population | High | Q1 2026 |
-| Hubspot integration | High | Q2 2026 |
-| Incremental loads | Medium | Q2 2026 |
-| dbt transformation layer | Medium | Q3 2026 |
-| Power BI dashboards | High | Q1 2026 |
-| Data quality checks | Medium | Q2 2026 |
+The repo now supports two deployment modes from the same codebase:
 
----
+- ETL app, default
+  - `ENABLE_ETL_FUNCTIONS=1`
+  - `ENABLE_ADMIN_FUNCTIONS=0`
+  - Exposes only the production ETL functions
 
-## 🚀 Quick Start
+- Admin app, optional
+  - `ENABLE_ETL_FUNCTIONS=0`
+  - `ENABLE_ADMIN_FUNCTIONS=1`
+  - Exposes manual HTTP routes for debugging, Xero OAuth callback, colleague sync, and smoke tests
 
-### 1. Clone & Setup
+`function_app.py` registers functions based on those flags.
 
-```bash
-git clone <repository-url>
-cd Infinitspace-datawarehouse
+## Repository Structure
 
-# Create virtual environment
-python -m venv .venv
-.venv\Scripts\activate  # Windows
-# source .venv/bin/activate  # Linux/Mac
+```text
+Infinitspace-datawarehouse/
+  function_app.py
+  host.json
+  requirements.txt
+  README.md
+  CLAUDE.md
+  SQL_datawarehouse.md
+  .env.example
+  functions/
+    bronze_nexudus.py
+    silver_nexudus.py
+    silver_worker.py
+    ava_refresh.py
+    xero_sync.py
+    integrations_admin.py
+    admin_health.py
+  shared/
+    azure_clients/
+    nexudus/
+    xero/
+    gmaps/
+  scripts/
+    python_scripts/
+    sql_scripts/
+  tests/
+  docs/
+  deploy/
+```
 
-# Install dependencies
+## Local Setup
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-### 2. Configure Environment
+Minimum local configuration:
 
-```bash
-# Copy template
-cp .env.example .env
+- `NEXUDUS_USERNAME`
+- `NEXUDUS_PASSWORD`
+- `AZURE_SQL_CONNECTION_STRING`
+- `AZURE_STORAGE_ACCOUNT_NAME`
+- `AZURE_STORAGE_CONTAINER_RAW_NEXUDUS`
+- `XERO_CLIENT_ID`
+- `XERO_CLIENT_SECRET`
+- `XERO_REDIRECT_URI`
+- `INTEGRATIONS_ENCRYPTION_KEY`
 
-# Edit .env with your credentials
-NEXUDUS_USERNAME=your_username
-NEXUDUS_PASSWORD=your_password
-AZURE_SQL_CONNECTION_STRING=Driver={ODBC Driver 18 for SQL Server};Server=...
+For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settings.json`.
+
+## Local Testing
+
+### Nexudus Bronze
+
+```powershell
+.\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step auth
+.\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step sql
+.\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step all --dry-run --limit 20
+.\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step all --limit 50
 ```
 
-### 3. Test Locally
+### Nexudus Silver
 
-```bash
-# Test authentication
-python scripts/python_scripts/test_local.py --step auth
-
-# Test SQL connection
-python scripts/python_scripts/test_local.py --step sql
-
-# Test full pipeline (dry run)
-python scripts/python_scripts/test_local.py --step all --dry-run
+```powershell
+.\venv\Scripts\python.exe scripts\python_scripts\test_locations_silver.py --write
+.\venv\Scripts\python.exe scripts\python_scripts\test_products_silver.py --write
+.\venv\Scripts\python.exe scripts\python_scripts\test_contracts_silver.py --write
+.\venv\Scripts\python.exe scripts\python_scripts\test_extra_services_silver.py --write
 ```
 
-### 4. Deploy to Azure
+### Xero
 
-```bash
-# Setup Azure resources (one-time)
-.\deploy\setup_azure_resources.ps1  # Windows
-# bash deploy/setup_azure_resources.sh  # Linux/Mac
+```powershell
+.\venv\Scripts\python.exe scripts\python_scripts\xero_start_oauth.py --owner-type workspace --owner-id default
+.\venv\Scripts\python.exe scripts\python_scripts\xero_complete_oauth.py --redirect-url "<full redirect url>"
+.\venv\Scripts\python.exe scripts\python_scripts\xero_list_tenants.py --owner-type workspace --owner-id default
+.\venv\Scripts\python.exe scripts\python_scripts\xero_get_connections.py --owner-type workspace --owner-id default
+.\venv\Scripts\python.exe scripts\python_scripts\xero_sync_invoices.py --owner-type workspace --owner-id default
+.\venv\Scripts\python.exe scripts\python_scripts\xero_list_invoices.py --owner-type workspace --owner-id default --top 20
+```
 
-# Deploy the ETL app
+### Unit Tests
+
+```powershell
+.\venv\Scripts\python.exe -m unittest tests.test_xero_integration
+```
+
+## Xero Auth and Refresh
+
+The supported production path is DB-backed, not `.env` refresh-token rotation:
+
+- OAuth state is stored in `meta.xero_oauth_states`
+- Encrypted tokens are stored in `meta.xero_connections`
+- Tenant metadata and sync watermarks are stored in `meta.xero_tenants`
+- Automatic refresh happens in `shared/xero/client.py`
+- If Xero returns `invalid_grant`, the connection is marked disconnected
+
+Recommended verification:
+
+1. Force `meta.xero_connections.expires_at` into the past
+2. Run `xero_get_connections.py`
+3. Confirm `expires_at` moved forward and `is_connected = 1`
+
+## Azure Deployment
+
+The current deployment docs target:
+
+- resource group: `infinitspace-prod-northeurope-data-rg`
+- ETL app: `func-infinitspace-datawarehouse`
+- optional admin app: `func-infinitspace-datawarehouse-admin`
+- storage account: `staccinfinitspaceprod001`
+
+Deploy the ETL app:
+
+```powershell
 func azure functionapp publish func-infinitspace-datawarehouse --python
 
-# Keep the ETL app surface clean
-az functionapp config appsettings set \
-  --resource-group infinitspace-prod-northeurope-data-rg \
-  --name func-infinitspace-datawarehouse \
-  --settings ENABLE_ETL_FUNCTIONS=1 ENABLE_ADMIN_FUNCTIONS=0
+az functionapp config appsettings set `
+  --resource-group infinitspace-prod-northeurope-data-rg `
+  --name func-infinitspace-datawarehouse `
+  --settings `
+    ENABLE_ETL_FUNCTIONS=1 `
+    ENABLE_ADMIN_FUNCTIONS=0 `
+    AZURE_STORAGE_ACCOUNT_NAME=staccinfinitspaceprod001 `
+    AZURE_STORAGE_CONTAINER_RAW_NEXUDUS=nexudus-raw-snapshots
 ```
 
-**For detailed instructions, see:**
-- 📘 [QUICKSTART.md](QUICKSTART.md) - Get up and running in 15 minutes
-- 📖 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) - Complete deployment documentation
+Optional admin app:
 
----
+```powershell
+func azure functionapp publish func-infinitspace-datawarehouse-admin --python
 
-## 📁 Repository Structure
-
-```
-Infinitspace-datawarehouse/
-│
-├── 📂 functions/                        Azure Functions (deployed to cloud)
-│   ├── bronze/nexudus_to_bronze/       ← Bronze ingestion (Timer: 02:00 UTC)
-│   │   ├── function_app.py
-│   │   └── host.json
-│   └── silver/bronze_to_silver/        ← Silver transformation (Timer: 02:30 UTC)
-│       ├── function_app.py
-│       └── host.json
-│
-├── 📂 shared/                           Shared Python modules
-│   ├── azure_clients/
-│   │   ├── bronze_writer.py            ← Write raw JSON to bronze
-│   │   ├── silver_writer_*.py          ← Transform & upsert to silver
-│   │   ├── sql_client.py               ← SQL connection manager
-│   │   └── run_tracker.py              ← Log to meta.sync_runs
-│   └── nexudus/
-│       ├── auth.py                     ← API authentication
-│       ├── client.py                   ← API client with rate limiting
-│       └── transformers/               ← Bronze → Silver transformations
-│           ├── contracts.py
-│           ├── products.py
-│           ├── locations.py
-│           └── extra_services.py
-│
-├── 📂 scripts/python_scripts/           Local testing & inspection scripts
-│   ├── test_local.py                   ← Test pipeline locally
-│   ├── test_*_silver.py                ← Test silver transformations
-│   └── inspect_*.py                    ← Inspect database content
-│
-├── 📂 docs/                             Documentation
-│   └── silver_table_relationships.md   ← Schema & relationship docs
-│
-├── 📂 deploy/                           Deployment automation
-│   ├── setup_azure_resources.sh        ← Bash deployment script
-│   └── setup_azure_resources.ps1       ← PowerShell deployment script
-│
-├── 📄 requirements.txt                  Python dependencies
-├── 📄 .env.example                      Environment variable template
-├── 📄 .funcignore                       Files to exclude from deployment
-├── 📄 DEPLOYMENT_GUIDE.md               Complete deployment documentation
-├── 📄 QUICKSTART.md                     Quick start guide
-├── 📄 README.md                         This file
-└── 📄 SQL_datawarehouse.md              SQL schema overview
+az functionapp config appsettings set `
+  --resource-group infinitspace-prod-northeurope-data-rg `
+  --name func-infinitspace-datawarehouse-admin `
+  --settings `
+    ENABLE_ETL_FUNCTIONS=0 `
+    ENABLE_ADMIN_FUNCTIONS=1
 ```
 
----
+More detail: [docs/deploy.md](docs/deploy.md)
 
-## 🏗️ Architecture
+## Daily Runtime Expectations
 
-### Data Flow
+Default UTC order:
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                      DATA SOURCES                                │
-├──────────────────────────────────────────────────────────────────┤
-│  Nexudus API  │  Hubspot API  │  OneDrive  │  Microsoft 365    │
-└────────┬──────┴───────┬───────┴──────┬─────┴─────────┬──────────┘
-         │              │              │               │
-         │ (Timer:      │  (Future)    │   (Future)   │  (Future)
-         │  02:00 UTC)  │              │               │
-         ▼              ▼              ▼               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   BRONZE LAYER (Azure SQL)                       │
-│  Raw, append-only, immutable storage                             │
-├──────────────────────────────────────────────────────────────────┤
-│  bronze.nexudus_locations      bronze.hubspot_contacts           │
-│  bronze.nexudus_products       bronze.onedrive_files             │
-│  bronze.nexudus_contracts      ...                               │
-│  bronze.nexudus_resources                                        │
-│  bronze.nexudus_extra_services                                   │
-└────────┬─────────────────────────────────────────────────────────┘
-         │
-         │ (Timer: 02:30 UTC)
-         │ Transform, clean, type
-         ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   SILVER LAYER (Azure SQL)                       │
-│  Cleaned, typed, normalized data (upserted)                      │
-├──────────────────────────────────────────────────────────────────┤
-│  silver.nexudus_locations + location_hours                       │
-│  silver.nexudus_products                                         │
-│  silver.nexudus_contracts                                        │
-│  silver.nexudus_resources                                        │
-│  silver.nexudus_extra_services                                   │
-└────────┬─────────────────────────────────────────────────────────┘
-         │
-         │ (Future: 03:00 UTC)
-         │ Merge, deduplicate
-         ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                    CORE LAYER (Azure SQL)                        │
-│  Source-agnostic, canonical business entities                    │
-├──────────────────────────────────────────────────────────────────┤
-│  core.locations (merged from all sources)                        │
-│  core.contracts                                                  │
-│  core.products                                                   │
-│  core.contacts (future: Nexudus coworkers + Hubspot contacts)    │
-└────────┬─────────────────────────────────────────────────────────┘
-         │
-         │ Consumed by:
-         ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  Power BI Dashboards  │  Ava Bot  │  Internal Tools  │  APIs     │
-└──────────────────────────────────────────────────────────────────┘
-```
+1. `02:00` `nexudus_to_bronze`
+2. `02:30` `bronze_to_silver`
+3. queue fanout via `silver_entity_worker`
+4. `03:00` `refresh_ava_availability`
+5. `04:00` `xero_invoice_sync`
 
-### Azure Resources
+Important:
 
-```
-Resource Group: infinitspace-datawarehouse-prod
-│
-├── 🗄️ Azure SQL Database
-│   └── infinitspace-prod-main-db
-│       ├── Schema: bronze (raw data)
-│       ├── Schema: silver (cleaned data)
-│       ├── Schema: core (canonical data)
-│       └── Schema: meta (tracking & logs)
-│
-├── ⚡ Azure Function App (Consumption Plan)
-│   └── infinitspace-dw-functions
-│       ├── nexudus-to-bronze (Timer: 02:00 UTC)
-│       └── bronze-to-silver (Timer: 02:30 UTC)
-│
-├── 📊 Application Insights
-│   └── infinitspace-dw-insights (monitoring & logs)
-│
-├── 🔐 Key Vault
-│   └── infinitspace-dw-kv
-│       ├── Secret: nexudus-username
-│       ├── Secret: nexudus-password
-│       └── Secret: sql-connection-string
-│
-└── 💾 Storage Account
-    └── infinitspacedwstorage (function app storage)
-```
+- `bronze_to_silver` is schedule-based, not dependency-aware
+- `refresh_ava_availability` is also schedule-based
+- operationally, bronze should finish before silver starts, and silver workers should finish before AVA starts
 
----
+## What To Monitor
 
-## 🧪 Testing
-
-### Local Testing
-
-```bash
-# Test individual steps
-python scripts/python_scripts/test_local.py --step auth
-python scripts/python_scripts/test_local.py --step locations --limit 10
-
-# Test silver transformations
-python scripts/python_scripts/test_locations_silver.py
-python scripts/python_scripts/test_products_silver.py
-python scripts/python_scripts/test_contracts_silver.py
-python scripts/python_scripts/test_extra_services_silver.py
-
-# Inspect database
-python scripts/python_scripts/inspect_bronze.py
-```
-
-### Xero Testing
-
-```bash
-# Start OAuth flow
-python scripts/python_scripts/xero_start_oauth.py --owner-type workspace --owner-id default
-
-# Complete OAuth from the copied redirect URL
-python scripts/python_scripts/xero_complete_oauth.py --redirect-url "<full redirect url>"
-
-# Inspect persisted tenants
-python scripts/python_scripts/xero_list_tenants.py --owner-type workspace --owner-id default
-
-# Sync invoices for every stored tenant into bronze/silver
-python scripts/python_scripts/xero_sync_invoices.py --owner-type workspace --owner-id default
-
-# Inspect synced invoice rows
-python scripts/python_scripts/xero_list_invoices.py --owner-type workspace --owner-id default --top 20
-
-# Cache one invoice PDF in bronze.xero_invoice_pdfs
-python scripts/python_scripts/xero_download_invoice_pdf.py --invoice-id <invoice_uuid> --tenant-id <tenant_uuid>
-```
-
-For newer Xero apps, make sure `XERO_SCOPES` includes an invoice scope before authorising, for example:
-
-```env
-XERO_SCOPES="offline_access accounting.contacts accounting.invoices"
-```
-
-The production token refresh path is automatic and DB-backed:
-- Tokens are stored encrypted in `meta.xero_connections`
-- `shared/xero/client.py` refreshes access tokens when expiry is near
-- On `invalid_grant`, the connection is marked disconnected for manual re-auth
-
-### Azure Testing
-
-```bash
-# Manual function trigger
-az functionapp function invoke \
-  --name infinitspace-dw-functions \
-  --resource-group infinitspace-datawarehouse-prod \
-  --function-name nexudus-to-bronze
-
-# Monitor logs
-az functionapp log tail \
-  --name infinitspace-dw-functions \
-  --resource-group infinitspace-datawarehouse-prod
-```
-
-### SQL Validation
+### SQL
 
 ```sql
--- Check latest sync runs
-SELECT TOP 10 * FROM meta.sync_runs ORDER BY started_at DESC;
+SELECT TOP 20
+    source_name, entity, layer, status,
+    started_at, finished_at,
+    rows_read, rows_written, rows_skipped, error_message
+FROM meta.sync_runs
+ORDER BY started_at DESC;
 
--- Verify data counts
-SELECT 'bronze.locations' AS table_name, COUNT(*) AS row_count FROM bronze.nexudus_locations
-UNION ALL
-SELECT 'silver.locations', COUNT(*) FROM silver.nexudus_locations
-UNION ALL
-SELECT 'silver.products', COUNT(*) FROM silver.nexudus_products
-UNION ALL
-SELECT 'silver.contracts', COUNT(*) FROM silver.nexudus_contracts;
-
--- Check for errors
-SELECT * FROM meta.sync_runs WHERE status = 'failed' ORDER BY started_at DESC;
+SELECT
+    tenant_name,
+    last_invoice_sync_started_at,
+    last_invoice_sync_completed_at,
+    last_invoice_sync_error,
+    last_invoice_modified_utc
+FROM meta.xero_tenants
+ORDER BY tenant_name;
 ```
 
-## Nexudus Colleague Sync + Xero Integration
+### Expected Nexudus Logs
 
-### 1. Apply SQL schema
+- `Nexudus -> Bronze sync started`
+- `Locations: X fetched, Y written to bronze`
+- `Products: X fetched, Y written to bronze`
+- `Contracts: X fetched, Y written to bronze`
+- `Resources: X attempted, Y written, Z skipped`
+- `Extra services: X fetched, Y written to bronze`
+- `Nexudus -> Bronze sync complete`
 
-Run:
+### Expected Silver Logs
 
-```sql
-:r scripts/sql_scripts/integrations_nexudus_xero_schema.sql
-```
+- `Bronze -> Silver orchestrator started`
+- `Bronze -> Silver: 5 tasks enqueued`
+- `Silver worker received: entity=...`
+- `Silver worker complete: entity=...`
 
-### 2. Nexudus colleague-location sync
+### Expected AVA Logs
 
-- HTTP (optional admin app): `GET/POST /api/integrations/nexudus/sync-colleagues`
-  - Query: `?coworker_ids=123,456`
-  - Body: `{"coworker_ids":[123,456]}`
-- HTTP raw payload debug (optional admin app):
-  - `GET /api/integrations/nexudus/coworker-debug?coworker_id=123`
-- CLI:
+- `AVA refresh started`
+- `AVA refresh complete: before -> after rows`
 
-```bash
-python scripts/python_scripts/nexudus_debug_coworker.py --coworker-id 123
-python scripts/python_scripts/nexudus_sync_colleague_access.py --coworker-ids 123,456
-```
+### Expected Xero Logs
 
-### 3. Xero OAuth flow
+- `Xero invoice sync started`
+- `Fetching Xero invoices page`
+- `Writing Xero invoices page`
+- `Xero invoice sync complete`
 
-- Default path: CLI
-  - `python scripts/python_scripts/xero_start_oauth.py --owner-type workspace --owner-id default`
-  - `python scripts/python_scripts/xero_complete_oauth.py --redirect-url "<full redirect url>"`
-- Optional admin app HTTP endpoints:
-  - `GET /api/integrations/xero/connect?owner_type=workspace&owner_id=default`
-  - `GET /api/integrations/xero/callback`
-  - `GET /api/integrations/xero/tenants`
-  - `GET /api/integrations/xero/connections`
-  - `GET /api/integrations/xero/test-contacts`
+## Current Status
 
-CLI helpers:
+- Nexudus bronze pipeline: done
+- Nexudus silver pipeline: done
+- AVA refresh pipeline: done
+- Xero OAuth, token refresh, tenant storage, and invoice sync: done
+- Optional admin HTTP routes: done, but not part of the default ETL app
+- Google Maps enrichment utilities: present, not part of the scheduled ETL app
+- Core layer population: not implemented
 
-```bash
-python scripts/python_scripts/xero_start_oauth.py --owner-type workspace --owner-id default
-python scripts/python_scripts/xero_complete_oauth.py --redirect-url "<full redirect url>"
-python scripts/python_scripts/xero_get_connections.py --owner-type workspace --owner-id default
-python scripts/python_scripts/xero_list_tenants.py --owner-type workspace --owner-id default
-python scripts/python_scripts/xero_test_contacts.py --owner-type workspace --owner-id default --summary-only
-```
+## Key Docs
 
----
+- [CLAUDE.md](CLAUDE.md)
+- [SQL_datawarehouse.md](SQL_datawarehouse.md)
+- [docs/silver_table_relationships.md](docs/silver_table_relationships.md)
+- [docs/deploy.md](docs/deploy.md)
 
-## 📊 Monitoring
-
-### Key Metrics
-
-- **Function Execution:** Track runs, duration, success rate in Application Insights
-- **Data Freshness:** Monitor `meta.sync_runs.finished_at` for each entity
-- **Error Rate:** Alert on `status='failed'` in `meta.sync_runs`
-- **Data Volume:** Track row counts in bronze/silver tables
-
-### Application Insights Queries
-
-```kusto
-// Function success rate (last 7 days)
-requests
-| where cloud_RoleName == "infinitspace-dw-functions"
-| where timestamp > ago(7d)
-| summarize runs=count(), success_rate=countif(success==true)*100.0/count() by name
-
-// Recent errors
-exceptions
-| where cloud_RoleName == "infinitspace-dw-functions"
-| where timestamp > ago(24h)
-| project timestamp, operation_Name, outerMessage
-```
-
-### Alerts (Recommended)
-
-1. **Function Failure:** Any failed execution → Email to data team
-2. **No Data:** No successful run in 25 hours → Email + SMS
-3. **Long Duration:** Function runs > 10 minutes → Email notification
-
----
-
-## 🔒 Security & Best Practices
-
-### ✅ Implemented
-
-- Secrets stored in Azure Key Vault (not in code or environment)
-- Managed Identity for Key Vault access
-- SQL connection uses encrypted connections
-- SQL firewall allows only Azure services
-- `.env` file excluded from git (`.gitignore`)
-
-### 🔐 Best Practices
-
-- **Never commit secrets:** Always use `.env` locally and Key Vault in Azure
-- **Use Managed Identity:** Avoid storing credentials when possible
-- **Rotate credentials:** Update Nexudus password quarterly
-- **Monitor access:** Review Key Vault access logs monthly
-- **Least privilege:** Grant minimum required SQL permissions
-
----
-
-## 🛠️ Maintenance
-
-### Daily Tasks
-
-- [ ] Check `meta.sync_runs` for failed executions
-- [ ] Verify data freshness (last successful run < 25 hours ago)
-
-### Weekly Tasks
-
-- [ ] Review Application Insights for performance trends
-- [ ] Check error logs for recurring issues
-- [ ] Validate data quality (spot checks on key tables)
-
-### Monthly Tasks
-
-- [ ] Analyze bronze table growth (consider archiving old data)
-- [ ] Review Azure costs (function executions, storage)
-- [ ] Update dependencies (`pip list --outdated`)
-
-### Quarterly Tasks
-
-- [ ] Rotate Nexudus API credentials
-- [ ] Review and optimize SQL indexes
-- [ ] Update documentation
-- [ ] Disaster recovery drill (restore from backup)
-
----
-
-## 📚 Documentation
-
-| Document | Purpose |
-|----------|---------|
-| [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) | Complete deployment instructions (50+ pages) |
-| [QUICKSTART.md](QUICKSTART.md) | Get started in 15 minutes |
-| [SQL_datawarehouse.md](SQL_datawarehouse.md) | SQL schema overview |
-| [docs/silver_table_relationships.md](docs/silver_table_relationships.md) | Detailed schema documentation |
-
----
-
-## 🤝 Contributing
-
-This is an internal repository. For questions or contributions:
-
-1. Create a feature branch: `git checkout -b feature/your-feature-name`
-2. Make changes and test locally
-3. Update documentation if needed
-4. Submit for review
-
----
-
-## 📞 Support
-
-**Questions?** Contact the InfinitSpace Data Engineering Team
-
-**Issues?** Check:
-1. `meta.sync_runs` for execution logs
-2. `meta.sync_errors` for record-level errors
-3. Application Insights for function logs
-4. [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) troubleshooting section
-
----
-
-## 📜 License
-
-Proprietary - InfinitSpace  
-All rights reserved.
-
----
-
-**Last Updated:** February 25, 2026  
-**Maintainer:** InfinitSpace Data Engineering Team  
-**Version:** 1.0.0
+Last updated: 2026-04-07
