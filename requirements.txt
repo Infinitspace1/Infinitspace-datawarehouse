@@ -9,3 +9,4 @@ azure-functions>=1.18.0
 azure-identity
 azure-storage-blob
 azure-storage-queue
+cryptography

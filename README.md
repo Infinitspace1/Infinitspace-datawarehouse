@@ -269,6 +269,31 @@ python scripts/python_scripts/test_extra_services_silver.py
 python scripts/python_scripts/inspect_bronze.py
 ```
 
+### Xero Testing
+
+```bash
+# Start OAuth flow (or use /api/integrations/xero/connect locally)
+python scripts/python_scripts/xero_start_oauth.py --owner-type workspace --owner-id default
+
+# After callback succeeds, inspect tenants
+python scripts/python_scripts/xero_list_tenants.py --owner-type workspace --owner-id default
+
+# Sync invoices for every stored tenant into bronze/silver
+python scripts/python_scripts/xero_sync_invoices.py --owner-type workspace --owner-id default
+
+# Inspect synced invoice rows
+python scripts/python_scripts/xero_list_invoices.py --owner-type workspace --owner-id default --top 20
+
+# Cache one invoice PDF in bronze.xero_invoice_pdfs
+python scripts/python_scripts/xero_download_invoice_pdf.py --invoice-id <invoice_uuid> --tenant-id <tenant_uuid>
+```
+
+For newer Xero apps, make sure `XERO_SCOPES` includes an invoice scope before authorising, for example:
+
+```env
+XERO_SCOPES="offline_access accounting.contacts accounting.invoices"
+```
+
 ### Azure Testing
 
 ```bash
@@ -301,6 +326,52 @@ SELECT 'silver.contracts', COUNT(*) FROM silver.nexudus_contracts;
 
 -- Check for errors
 SELECT * FROM meta.sync_runs WHERE status = 'failed' ORDER BY started_at DESC;
+```
+
+## Nexudus Colleague Sync + Xero Integration
+
+### 1. Apply SQL schema
+
+Run:
+
+```sql
+:r scripts/sql_scripts/integrations_nexudus_xero_schema.sql
+```
+
+### 2. Nexudus colleague-location sync
+
+- HTTP (Admin): `GET/POST /api/integrations/nexudus/sync-colleagues`
+  - Query: `?coworker_ids=123,456`
+  - Body: `{"coworker_ids":[123,456]}`
+- HTTP raw payload debug:
+  - `GET /api/integrations/nexudus/coworker-debug?coworker_id=123`
+- CLI:
+
+```bash
+python scripts/python_scripts/nexudus_debug_coworker.py --coworker-id 123
+python scripts/python_scripts/nexudus_sync_colleague_access.py --coworker-ids 123,456
+```
+
+### 3. Xero OAuth flow
+
+- Start connect (redirect to Xero):
+  - `GET /api/integrations/xero/connect?owner_type=workspace&owner_id=default`
+- Callback (registered in Xero app):
+  - `GET /api/integrations/xero/callback`
+- List persisted tenants:
+  - `GET /api/integrations/xero/tenants`
+- Live `/connections` output:
+  - `GET /api/integrations/xero/connections`
+- Contacts smoke test:
+  - `GET /api/integrations/xero/test-contacts`
+
+CLI helpers:
+
+```bash
+python scripts/python_scripts/xero_start_oauth.py --owner-type workspace --owner-id default
+python scripts/python_scripts/xero_get_connections.py --owner-type workspace --owner-id default
+python scripts/python_scripts/xero_list_tenants.py --owner-type workspace --owner-id default
+python scripts/python_scripts/xero_test_contacts.py --owner-type workspace --owner-id default --summary-only
 ```
 
 ---

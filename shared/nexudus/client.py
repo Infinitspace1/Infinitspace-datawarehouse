@@ -125,3 +125,12 @@ class NexudusClient:
                 logger.warning(f"Not found: {path}")
                 return None
             raise
+
+    async def get_coworker(self, coworker_id: int) -> Optional[dict]:
+        """
+        Fetch a single coworker record.
+
+        Endpoint:
+            GET /api/spaces/coworkers/{id}
+        """
+        return await self.get_one(f"spaces/coworkers/{coworker_id}")

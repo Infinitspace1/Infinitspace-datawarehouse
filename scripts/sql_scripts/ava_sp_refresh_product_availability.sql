@@ -587,3 +587,15 @@ OR location_id = 6
 --9 Foxcourt: location_id 1420976575
 
 
+SELECT t.tenant_name, COUNT(1)  FROM silver.xero_invoices inv
+INNER JOIN meta.xero_tenants t ON inv.xero_tenant_id = t.xero_tenant_id
+GROUP BY t.tenant_name
+ORDER BY COUNT(1) DESC;
+
+SELECT * FROM meta.xero_tenants
+
+SELECT TOP(3) * FROM silver.xero_invoices
+ORDER BY last_synced_at DESC
+
+"fa8c0a20-a6bb-4591-933c-97e9cfc26d34"
+"17687821-9e30-44e3-b215-731e5ef4b1f5"

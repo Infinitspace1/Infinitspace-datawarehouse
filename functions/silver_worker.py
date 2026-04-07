@@ -22,7 +22,8 @@ Design properties:
     (configurable via maxDequeueCount in host.json).
 
 Connection binding:
-  - Uses AzureWebJobsStorage — the Function App's default storage account.
+  - Uses the "Storage" connection name, which the Functions host resolves
+    to the AzureWebJobsStorage setting.
   - This is automatically set by the Azure Functions runtime and must match
     the storage account used by SilverTaskQueue (AZURE_STORAGE_ACCOUNT_NAME).
   - For local development, set AzureWebJobsStorage in local.settings.json
@@ -76,7 +77,7 @@ _ENTITY_MAP = {
 @bp.queue_trigger(
     arg_name="msg",
     queue_name=QUEUE_NAME,
-    connection="AzureWebJobsStorage",
+    connection="Storage",
 )
 async def silver_entity_worker(msg: func.QueueMessage) -> None:
     """
