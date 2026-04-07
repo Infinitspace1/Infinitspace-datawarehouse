@@ -98,8 +98,14 @@ python scripts/python_scripts/test_local.py --step all --dry-run
 .\deploy\setup_azure_resources.ps1  # Windows
 # bash deploy/setup_azure_resources.sh  # Linux/Mac
 
-# Deploy functions
+# Deploy the ETL app
 func azure functionapp publish func-infinitspace-datawarehouse --python
+
+# Keep the ETL app surface clean
+az functionapp config appsettings set \
+  --resource-group infinitspace-prod-northeurope-data-rg \
+  --name func-infinitspace-datawarehouse \
+  --settings ENABLE_ETL_FUNCTIONS=1 ENABLE_ADMIN_FUNCTIONS=0
 ```
 
 **For detailed instructions, see:**
@@ -272,10 +278,13 @@ python scripts/python_scripts/inspect_bronze.py
 ### Xero Testing
 
 ```bash
-# Start OAuth flow (or use /api/integrations/xero/connect locally)
+# Start OAuth flow
 python scripts/python_scripts/xero_start_oauth.py --owner-type workspace --owner-id default
 
-# After callback succeeds, inspect tenants
+# Complete OAuth from the copied redirect URL
+python scripts/python_scripts/xero_complete_oauth.py --redirect-url "<full redirect url>"
+
+# Inspect persisted tenants
 python scripts/python_scripts/xero_list_tenants.py --owner-type workspace --owner-id default
 
 # Sync invoices for every stored tenant into bronze/silver
@@ -293,6 +302,11 @@ For newer Xero apps, make sure `XERO_SCOPES` includes an invoice scope before au
 ```env
 XERO_SCOPES="offline_access accounting.contacts accounting.invoices"
 ```
+
+The production token refresh path is automatic and DB-backed:
+- Tokens are stored encrypted in `meta.xero_connections`
+- `shared/xero/client.py` refreshes access tokens when expiry is near
+- On `invalid_grant`, the connection is marked disconnected for manual re-auth
 
 ### Azure Testing
 
@@ -340,10 +354,10 @@ Run:
 
 ### 2. Nexudus colleague-location sync
 
-- HTTP (Admin): `GET/POST /api/integrations/nexudus/sync-colleagues`
+- HTTP (optional admin app): `GET/POST /api/integrations/nexudus/sync-colleagues`
   - Query: `?coworker_ids=123,456`
   - Body: `{"coworker_ids":[123,456]}`
-- HTTP raw payload debug:
+- HTTP raw payload debug (optional admin app):
   - `GET /api/integrations/nexudus/coworker-debug?coworker_id=123`
 - CLI:
 
@@ -354,21 +368,21 @@ python scripts/python_scripts/nexudus_sync_colleague_access.py --coworker-ids 12
 
 ### 3. Xero OAuth flow
 
-- Start connect (redirect to Xero):
+- Default path: CLI
+  - `python scripts/python_scripts/xero_start_oauth.py --owner-type workspace --owner-id default`
+  - `python scripts/python_scripts/xero_complete_oauth.py --redirect-url "<full redirect url>"`
+- Optional admin app HTTP endpoints:
   - `GET /api/integrations/xero/connect?owner_type=workspace&owner_id=default`
-- Callback (registered in Xero app):
   - `GET /api/integrations/xero/callback`
-- List persisted tenants:
   - `GET /api/integrations/xero/tenants`
-- Live `/connections` output:
   - `GET /api/integrations/xero/connections`
-- Contacts smoke test:
   - `GET /api/integrations/xero/test-contacts`
 
 CLI helpers:
 
 ```bash
 python scripts/python_scripts/xero_start_oauth.py --owner-type workspace --owner-id default
+python scripts/python_scripts/xero_complete_oauth.py --redirect-url "<full redirect url>"
 python scripts/python_scripts/xero_get_connections.py --owner-type workspace --owner-id default
 python scripts/python_scripts/xero_list_tenants.py --owner-type workspace --owner-id default
 python scripts/python_scripts/xero_test_contacts.py --owner-type workspace --owner-id default --summary-only

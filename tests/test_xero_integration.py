@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import requests
+
 from shared.xero.client import XeroApiClient
 from shared.xero.flow import XeroAuthFlowService
 from shared.xero.oauth import TokenSet, XeroOAuthService
@@ -156,6 +158,18 @@ class FakeResponse:
         return self.payload if self.payload is not None else {"Contacts": []}
 
 
+@dataclass
+class FakeErrorResponse:
+    status_code: int
+    text: str
+
+
+class InvalidGrantOAuth(FakeOAuth):
+    def refresh_tokens(self, refresh_token: str) -> TokenSet:
+        response = FakeErrorResponse(status_code=400, text='{"error":"invalid_grant"}')
+        raise requests.HTTPError("invalid_grant", response=response)
+
+
 class TestXeroIntegration(unittest.TestCase):
     def test_authorization_url_contains_scope_and_redirect(self):
         oauth = XeroOAuthService(
@@ -200,6 +214,18 @@ class TestXeroIntegration(unittest.TestCase):
         self.assertIsNotNone(store.updated_tokens)
         self.assertEqual(store.updated_tokens.access_token, "access-2")
         self.assertEqual(store.updated_tokens.refresh_token, "refresh-2")
+
+    def test_refresh_invalid_grant_marks_connection_disconnected(self):
+        oauth = InvalidGrantOAuth()
+        store = FakeStore()
+        client = XeroApiClient(store=store, oauth_service=oauth)
+
+        with patch("shared.xero.client.requests.request"):
+            with self.assertRaises(requests.HTTPError):
+                client.get_contacts(summary_only=True)
+
+        self.assertEqual(store.marked_disconnected, (1, "invalid_grant during token refresh"))
+        self.assertIsNone(store.updated_tokens)
 
     def test_api_client_includes_xero_tenant_header(self):
         oauth = FakeOAuth()

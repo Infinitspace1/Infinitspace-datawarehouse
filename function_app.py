@@ -1,56 +1,53 @@
 """
 function_app.py
 
-Main entry point for the Azure Function App.
-Registers all function blueprints.
+Azure Functions entry point.
+
+Deployment model:
+  - Default publish: ETL-only surface (timers + queue worker).
+  - Optional admin publish: enable admin/debug HTTP routes with app settings.
+
+App settings:
+  - ENABLE_ETL_FUNCTIONS=1     default
+  - ENABLE_ADMIN_FUNCTIONS=0   default
 """
+from __future__ import annotations
+
+import os
+
+import azure.functions as func
 from dotenv import load_dotenv
 
 load_dotenv()
 
-import azure.functions as func
 
-from functions.bronze_nexudus import bp as bronze_bp
-from functions.silver_nexudus import bp as silver_bp
-from functions.silver_worker import bp as silver_worker_bp
-from functions.ava_refresh import bp as ava_bp
-from functions.integrations_admin import bp as integrations_bp
-from functions.xero_sync import bp as xero_sync_bp
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 
 app = func.FunctionApp()
-app.register_functions(bronze_bp)
-app.register_functions(silver_bp)
-app.register_functions(silver_worker_bp)
-app.register_functions(ava_bp)
-app.register_functions(integrations_bp)
-app.register_functions(xero_sync_bp)
 
-@app.route(route="test-connections", auth_level=func.AuthLevel.ADMIN)
-async def test_connections(req: func.HttpRequest) -> func.HttpResponse:
-    import os
-    results = []
 
-    # Test Nexudus
-    try:
-        from shared.nexudus.auth import get_bearer_token
-        token = get_bearer_token()
-        results.append(f"✅ Nexudus: token obtained ({token[:10]}...)")
-    except Exception as e:
-        results.append(f"❌ Nexudus: {e}")
+if _env_flag("ENABLE_ETL_FUNCTIONS", True):
+    from functions.ava_refresh import bp as ava_bp
+    from functions.bronze_nexudus import bp as bronze_bp
+    from functions.silver_nexudus import bp as silver_bp
+    from functions.silver_worker import bp as silver_worker_bp
+    from functions.xero_sync import bp as xero_sync_bp
 
-    # Test SQL
-    try:
-        from shared.azure_clients.sql_client import get_sql_client
-        sql = get_sql_client()
-        version = sql.execute_scalar("SELECT @@VERSION")
-        results.append(f"✅ SQL: {str(version)[:80]}")
-    except Exception as e:
-        results.append(f"❌ SQL: {e}")
+    app.register_functions(bronze_bp)
+    app.register_functions(silver_bp)
+    app.register_functions(silver_worker_bp)
+    app.register_functions(ava_bp)
+    app.register_functions(xero_sync_bp)
 
-    # Show env vars (existence only, not values)
-    env_vars = ["NEXUDUS_USERNAME", "NEXUDUS_PASSWORD", "AZURE_SQL_CONNECTION_STRING"]
-    for var in env_vars:
-        status = "✅ SET" if os.getenv(var) else "❌ MISSING"
-        results.append(f"  {var}: {status}")
 
-    return func.HttpResponse("\n".join(results), mimetype="text/plain")
+if _env_flag("ENABLE_ADMIN_FUNCTIONS", False):
+    from functions.admin_health import bp as admin_health_bp
+    from functions.integrations_admin import bp as integrations_bp
+
+    app.register_functions(admin_health_bp)
+    app.register_functions(integrations_bp)

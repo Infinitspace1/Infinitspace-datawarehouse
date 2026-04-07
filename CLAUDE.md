@@ -137,6 +137,7 @@ neighborhoods
 |   |   |-- nexudus_debug_coworker.py  <-- Debug single coworker payload
 |   |   |-- nexudus_sync_colleague_access.py <-- CLI: sync specific coworker IDs
 |   |   |-- xero_start_oauth.py        <-- Initiate Xero OAuth flow
+|   |   |-- xero_complete_oauth.py     <-- Complete OAuth from copied redirect URL
 |   |   |-- xero_get_connections.py    <-- List Xero connections
 |   |   |-- xero_list_tenants.py       <-- List Xero tenants per connection
 |   |   |-- xero_sync_invoices.py      <-- Trigger invoice sync manually
@@ -144,7 +145,7 @@ neighborhoods
 |   |   |-- xero_download_invoice_pdf.py <-- Download & cache invoice PDF
 |   |   |-- xero_test_contacts.py      <-- Fetch & count Xero contacts (smoke test)
 |   |   |-- xero_test_invoices.py      <-- Fetch & validate invoices (smoke test)
-|   |   |-- xero_open_auth.py          <-- DEAD: dev helper, superseded by integrations_admin
+|   |   |-- xero_open_auth.py          <-- DEAD: dev helper, superseded by xero_start_oauth.py
 |   |   |-- xero_exchange_code.py      <-- DEAD: manual OAuth code exchange, superseded
 |   |   |-- xero_refresh_token.py      <-- DEAD: manual token refresh, superseded by auto-refresh
 |   |   +-- xero_register_connection.py <-- DEAD: manual connection registration, superseded
@@ -187,7 +188,9 @@ neighborhoods
 
 ## Azure Functions Registry
 
-All functions are registered in `function_app.py` via blueprints.
+Functions are registered in `function_app.py` via blueprints and gated by app settings:
+- `ENABLE_ETL_FUNCTIONS=1` registers the production ETL timers/queue worker
+- `ENABLE_ADMIN_FUNCTIONS=1` registers the optional admin/debug HTTP routes
 
 | Function | File | Trigger | Schedule / Binding | Registered |
 |----------|------|---------|-------------------|------------|
@@ -196,8 +199,8 @@ All functions are registered in `function_app.py` via blueprints.
 | `silver_entity_worker` | `functions/silver_worker.py` | Queue | `silver-sync-tasks` | YES |
 | `refresh_ava_availability` | `functions/ava_refresh.py` | Timer | `0 0 3 * * *` (03:00 UTC) | YES |
 | `xero_invoice_sync` | `functions/xero_sync.py` | Timer | `0 0 4 * * *` (04:00 UTC) | YES |
-| 10+ HTTP endpoints | `functions/integrations_admin.py` | HTTP (ADMIN) | On-demand | YES |
-| `test_connections` | `function_app.py` (inline) | HTTP (ADMIN) | On-demand | YES |
+| 10+ HTTP endpoints | `functions/integrations_admin.py` | HTTP (ADMIN) | On-demand | OPTIONAL |
+| `test_connections` | `functions/admin_health.py` | HTTP (ADMIN) | On-demand | OPTIONAL |
 
 ---
 
@@ -363,6 +366,7 @@ All follow the same pattern:
 ## HTTP Endpoints (integrations_admin.py)
 
 All endpoints require ADMIN auth level (function key or master key).
+These routes are optional and are only registered when `ENABLE_ADMIN_FUNCTIONS=1`.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
@@ -378,6 +382,10 @@ All endpoints require ADMIN auth level (function key or master key).
 | GET | `/api/integrations/xero/invoices` | List cached invoices |
 | GET | `/api/integrations/xero/invoice-pdf?invoice_id=X` | Download/cache invoice PDF |
 | GET | `/api/test-connections` | Smoke test: Nexudus auth + SQL connection |
+
+Default Xero auth path is now CLI-based:
+- `python scripts/python_scripts/xero_start_oauth.py`
+- `python scripts/python_scripts/xero_complete_oauth.py --redirect-url "<full redirect url>"`
 
 ---
 
@@ -416,10 +424,11 @@ GOOGLE_MAPS_API_KEY=...
 # --- Xero OAuth ---
 XERO_CLIENT_ID=...
 XERO_CLIENT_SECRET=...
-XERO_REDIRECT_URI=https://...         # OAuth callback URL
+XERO_REDIRECT_URI=https://...         # Redirect copied into xero_complete_oauth.py
 XERO_POST_AUTH_REDIRECT_URI=...       # Optional: user-facing redirect after auth
 XERO_SCOPES="offline_access accounting.invoices accounting.payments ..."  # default: see .env.example
-XERO_REFRESH_TOKEN=...                # Rotates on each refresh -- update after every use
+ENABLE_ETL_FUNCTIONS=1                # default: ETL triggers enabled
+ENABLE_ADMIN_FUNCTIONS=0              # default: admin HTTP routes disabled
 
 # --- Token encryption ---
 INTEGRATIONS_ENCRYPTION_KEY=...       # Fernet key for Xero token encryption at rest

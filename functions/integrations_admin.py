@@ -1,10 +1,12 @@
 """
 functions/integrations_admin.py
 
-Admin/debug HTTP routes for:
+Optional admin/debug HTTP routes for:
   - Nexudus colleague-location sync
   - Xero OAuth connect/callback
   - Xero tenant listing, invoice sync, and API smoke tests
+
+Registered only when ENABLE_ADMIN_FUNCTIONS=1.
 """
 import json
 import logging
