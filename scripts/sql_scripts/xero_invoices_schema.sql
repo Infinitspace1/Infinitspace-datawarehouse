@@ -92,6 +92,7 @@ BEGIN
         pdf_cached_at           DATETIME2           NULL,
         pdf_content_type        NVARCHAR(128)       NULL,
         pdf_file_name           NVARCHAR(512)       NULL,
+        pdf_blob_path           NVARCHAR(512)       NULL,
         first_seen_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
         last_synced_at          DATETIME2           NOT NULL DEFAULT GETUTCDATE()
     );

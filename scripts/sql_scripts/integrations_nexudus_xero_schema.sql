@@ -295,3 +295,15 @@ BEGIN
         ON meta.xero_oauth_states (expires_at);
 END
 GO
+
+SELECT * FROM silver.xero_tenants
+
+SELECT count(*) FROM silver.xero_invoices;
+
+SELECT COUNT(*) FROM silver.xero_invoice_line_items;
+
+SELECT TOP 10 * FROM silver.xero_invoice_line_items
+
+
+SELECT * FROM silver.xero_invoices
+WHERE invoice_number = 'C29-INV-2025.07-0001'

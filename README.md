@@ -16,7 +16,7 @@ This project runs scheduled Azure Functions that ingest operational data into Az
 - `nexudus_to_bronze`
   - Timer trigger
   - Default schedule: `02:00 UTC`
-  - Fetches `locations`, `products`, `contracts`, `resources`, `extra_services`
+  - Fetches `locations`, `products`, `contracts`, `coworker_invoices`, `coworkers`, `resources`, `extra_services`
   - Writes raw rows to `bronze.nexudus_*`
   - Writes JSON snapshots to blob storage
 
@@ -131,6 +131,9 @@ For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settin
 .\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step sql
 .\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step all --dry-run --limit 20
 .\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step all --limit 50
+.\venv\Scripts\python.exe scripts\python_scripts\sync_nexudus_billing.py --dry-run --limit 50
+.\venv\Scripts\python.exe scripts\python_scripts\sync_nexudus_billing.py
+.\venv\Scripts\python.exe scripts\python_scripts\xero_nexudus_link_audit.py --limit 100 --show-unmatched
 ```
 
 ### Nexudus Silver
@@ -156,7 +159,7 @@ For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settin
 ### Unit Tests
 
 ```powershell
-.\venv\Scripts\python.exe -m unittest tests.test_xero_integration tests.test_xero_tenant_directory
+.\venv\Scripts\python.exe -m unittest tests.test_xero_integration tests.test_xero_tenant_directory tests.test_xero_nexudus_invoice_linking
 ```
 
 ## Xero Auth and Refresh
@@ -225,6 +228,12 @@ Default UTC order:
 3. queue fanout via `silver_entity_worker`
 4. `03:00` `refresh_ava_availability`
 5. `04:00` `xero_invoice_sync`
+
+Suggested reminder flow after this extension:
+
+1. Nexudus bronze/silver lands `coworker_invoices` and `coworkers`
+2. Xero sync refreshes `silver.xero_invoices`
+3. Query `silver.xero_overdue_invoice_contacts` for reminder-ready rows
 
 Important:
 

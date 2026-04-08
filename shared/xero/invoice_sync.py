@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
+from shared.azure_clients.blob_writer import BlobWriter
 from shared.xero.client import XeroApiClient
 from shared.xero.flow import DEFAULT_OWNER_ID, DEFAULT_OWNER_TYPE
 from shared.xero.store import XeroStore
@@ -108,13 +109,14 @@ def _invoice_contact(invoice: dict[str, Any]) -> tuple[Optional[str], Optional[s
 
 
 class XeroInvoiceSyncService:
-    def __init__(self, sql_client=None, store: Optional[XeroStore] = None):
+    def __init__(self, sql_client=None, store: Optional[XeroStore] = None, blob_writer: Optional[BlobWriter] = None):
         if sql_client is None:
             from shared.azure_clients.sql_client import get_sql_client
 
             sql_client = get_sql_client()
         self.sql = sql_client
         self.store = store or XeroStore(sql_client=sql_client)
+        self._blob_writer = blob_writer  # lazily instantiated on first PDF upload
 
     def sync_invoices(
         self,
@@ -209,6 +211,12 @@ class XeroInvoiceSyncService:
             invoice_id=invoice_id,
             tenant_id=resolved_tenant_id,
         )
+        blob_path = self._upload_pdf(
+            tenant_id=resolved_tenant_id,
+            invoice_source_id=invoice_id,
+            pdf_bytes=pdf_bytes,
+            content_type=content_type,
+        )
 
         sync_run_id = str(uuid.uuid4())
         with self.sql.get_connection() as conn:
@@ -219,7 +227,7 @@ class XeroInvoiceSyncService:
                 connection_id=connection.id,
                 tenant_id=resolved_tenant_id,
                 invoice_id=invoice_id,
-                pdf_bytes=pdf_bytes,
+                blob_path=blob_path,
                 content_type=content_type,
                 file_name=file_name,
             )
@@ -232,6 +240,7 @@ class XeroInvoiceSyncService:
             "content_type": content_type,
             "file_name": file_name,
             "byte_count": len(pdf_bytes),
+            "blob_path": blob_path,
         }
 
     def get_cached_invoice_pdf(
@@ -239,9 +248,13 @@ class XeroInvoiceSyncService:
         invoice_id: str,
         tenant_id: str,
     ) -> Optional[dict[str, Any]]:
+        """
+        Returns the cached PDF record (with blob_path) if it exists.
+        To get the actual bytes, call blob_writer.read_pdf(row['blob_path']).
+        """
         rows = self.sql.execute_query(
             """
-            SELECT TOP 1 invoice_source_id, xero_tenant_id, content_type, file_name, pdf_bytes, synced_at
+            SELECT TOP 1 invoice_source_id, xero_tenant_id, content_type, file_name, blob_path, synced_at
             FROM bronze.xero_invoice_pdfs
             WHERE xero_tenant_id = ? AND invoice_source_id = ?
             ORDER BY synced_at DESC, id DESC
@@ -251,6 +264,89 @@ class XeroInvoiceSyncService:
         if not rows:
             return None
         return rows[0]
+
+    def cache_overdue_pdfs(self) -> dict[str, Any]:
+        """
+        Fetch and cache PDFs for all overdue invoices that don't have a blob_path yet.
+        Called after the main invoice sync so new overdue invoices get a PDF immediately.
+        """
+        rows = self.sql.execute_query(
+            """
+            SELECT
+                xi.source_id,
+                xi.xero_tenant_id,
+                xi.xero_connection_id,
+                xi.invoice_number
+            FROM silver.xero_invoices xi
+            WHERE xi.invoice_status = 'AUTHORISED'
+              AND xi.amount_due > 0
+              AND xi.due_date < CAST(GETUTCDATE() AS DATE)
+              AND xi.pdf_blob_path IS NULL
+            """
+        )
+        ok = errors = 0
+        sync_run_id = str(uuid.uuid4())
+        connections: dict[int, XeroApiClient] = {}
+
+        for row in rows:
+            conn_id = int(row["xero_connection_id"])
+            if conn_id not in connections:
+                connections[conn_id] = XeroApiClient(connection_id=conn_id, store=self.store)
+            client = connections[conn_id]
+
+            try:
+                pdf_bytes, content_type, file_name = client.get_invoice_pdf(
+                    invoice_id=str(row["source_id"]),
+                    tenant_id=str(row["xero_tenant_id"]),
+                )
+                blob_path = self._upload_pdf(
+                    tenant_id=str(row["xero_tenant_id"]),
+                    invoice_source_id=str(row["source_id"]),
+                    pdf_bytes=pdf_bytes,
+                    content_type=content_type,
+                )
+                with self.sql.get_connection() as conn:
+                    cursor = conn.cursor()
+                    self._upsert_invoice_pdf(
+                        cursor=cursor,
+                        sync_run_id=sync_run_id,
+                        connection_id=conn_id,
+                        tenant_id=str(row["xero_tenant_id"]),
+                        invoice_id=str(row["source_id"]),
+                        blob_path=blob_path,
+                        content_type=content_type,
+                        file_name=file_name,
+                    )
+                ok += 1
+                logger.info(
+                    "PDF cached for overdue invoice",
+                    extra={"invoice_number": row["invoice_number"], "blob_path": blob_path},
+                )
+            except Exception:
+                errors += 1
+                logger.exception(
+                    "Failed to cache PDF for overdue invoice",
+                    extra={"invoice_number": row["invoice_number"]},
+                )
+
+        return {"pdfs_cached": ok, "pdfs_failed": errors, "pdfs_total": len(rows)}
+
+    def _upload_pdf(
+        self,
+        tenant_id: str,
+        invoice_source_id: str,
+        pdf_bytes: bytes,
+        content_type: str,
+    ) -> str:
+        """Upload PDF bytes to blob storage and return the blob path."""
+        if self._blob_writer is None:
+            self._blob_writer = BlobWriter()
+        return self._blob_writer.write_pdf(
+            tenant_id=tenant_id,
+            invoice_source_id=invoice_source_id,
+            pdf_bytes=pdf_bytes,
+            content_type=content_type,
+        )
 
     def list_invoices(
         self,
@@ -403,13 +499,19 @@ class XeroInvoiceSyncService:
                             invoice_id=invoice_id,
                             tenant_id=tenant_id,
                         )
+                        blob_path = self._upload_pdf(
+                            tenant_id=tenant_id,
+                            invoice_source_id=invoice_id,
+                            pdf_bytes=pdf_bytes,
+                            content_type=content_type,
+                        )
                         self._upsert_invoice_pdf(
                             cursor=cursor,
                             sync_run_id=sync_run_id,
                             connection_id=connection_id,
                             tenant_id=tenant_id,
                             invoice_id=invoice_id,
-                            pdf_bytes=pdf_bytes,
+                            blob_path=blob_path,
                             content_type=content_type,
                             file_name=file_name,
                         )
@@ -731,7 +833,7 @@ class XeroInvoiceSyncService:
         connection_id: int,
         tenant_id: str,
         invoice_id: str,
-        pdf_bytes: bytes,
+        blob_path: str,
         content_type: str,
         file_name: Optional[str],
     ) -> None:
@@ -747,7 +849,7 @@ class XeroInvoiceSyncService:
                 xero_connection_id = ?,
                 content_type = ?,
                 file_name = ?,
-                pdf_bytes = ?,
+                blob_path = ?,
                 synced_at = GETUTCDATE()
             WHEN NOT MATCHED THEN INSERT (
                 sync_run_id,
@@ -756,7 +858,7 @@ class XeroInvoiceSyncService:
                 invoice_source_id,
                 content_type,
                 file_name,
-                pdf_bytes
+                blob_path
             ) VALUES (?, ?, ?, ?, ?, ?, ?);
             """,
             (
@@ -766,14 +868,14 @@ class XeroInvoiceSyncService:
                 connection_id,
                 content_type,
                 file_name,
-                pdf_bytes,
+                blob_path,
                 sync_run_id,
                 connection_id,
                 tenant_id,
                 invoice_id,
                 content_type,
                 file_name,
-                pdf_bytes,
+                blob_path,
             ),
         )
 
@@ -783,6 +885,7 @@ class XeroInvoiceSyncService:
             SET pdf_cached_at = ?,
                 pdf_content_type = ?,
                 pdf_file_name = ?,
+                pdf_blob_path = ?,
                 last_synced_at = GETUTCDATE()
             WHERE xero_tenant_id = ? AND source_id = ?
             """,
@@ -790,6 +893,7 @@ class XeroInvoiceSyncService:
                 cached_at,
                 content_type,
                 file_name,
+                blob_path,
                 tenant_id,
                 invoice_id,
             ),
