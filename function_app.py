@@ -6,10 +6,12 @@ Azure Functions entry point.
 Deployment model:
   - Default publish: ETL-only surface (timers + queue worker).
   - Optional admin publish: enable admin/debug HTTP routes with app settings.
+  - Optional real-estate publish: enable Real Estate HTTP API routes.
 
 App settings:
-  - ENABLE_ETL_FUNCTIONS=1     default
-  - ENABLE_ADMIN_FUNCTIONS=0   default
+  - ENABLE_ETL_FUNCTIONS=1          default
+  - ENABLE_ADMIN_FUNCTIONS=0        default
+  - ENABLE_REAL_ESTATE_FUNCTIONS=0  default
 """
 from __future__ import annotations
 
@@ -51,3 +53,11 @@ if _env_flag("ENABLE_ADMIN_FUNCTIONS", False):
 
     app.register_functions(admin_health_bp)
     app.register_functions(integrations_bp)
+
+
+if _env_flag("ENABLE_REAL_ESTATE_FUNCTIONS", False):
+    from functions.real_estate_costar import bp as real_estate_costar_bp
+    from functions.real_estate_costar_worker import bp as real_estate_costar_worker_bp
+
+    app.register_functions(real_estate_costar_bp)
+    app.register_functions(real_estate_costar_worker_bp)

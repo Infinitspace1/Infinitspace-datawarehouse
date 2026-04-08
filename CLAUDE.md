@@ -17,6 +17,7 @@ Primary sources today:
 
 - Nexudus API
 - Xero API
+- CoStar PDF extractor (Real Estate HTTP function)
 - Google Maps enrichment utilities exist but are not part of the scheduled Function App
 
 Platform:
@@ -86,6 +87,15 @@ Xero API
   -> silver.xero_tenants
   -> xero.silver_tenants (view alias)
   -> optional bronze.xero_invoice_pdfs
+
+Real Estate (HTTP trigger, optional)
+  -> run_costar_extractor (HTTP POST /api/real-estate/costar/run)
+  -> costar-extraction-tasks queue
+  -> costar_extraction_worker
+  -> downloads PDF from Blob (pdf-uploads/<blob_name>)
+  -> BuildingContactExtractor (Anthropic API)
+  -> uploads XLSX to Blob (excel-outputs/<job_id>_contacts.xlsx)
+  -> updates bronze.costar_pdf_extractor_logs (Real Estate DB)
 ```
 
 ---
@@ -103,11 +113,18 @@ Default ETL deployment:
 
 - `ENABLE_ETL_FUNCTIONS=1`
 - `ENABLE_ADMIN_FUNCTIONS=0`
+- `ENABLE_REAL_ESTATE_FUNCTIONS=0`
 
 Optional admin deployment:
 
 - `ENABLE_ETL_FUNCTIONS=0`
 - `ENABLE_ADMIN_FUNCTIONS=1`
+
+Optional Real Estate deployment (can be combined with ETL):
+
+- `ENABLE_ETL_FUNCTIONS=1`
+- `ENABLE_REAL_ESTATE_FUNCTIONS=1`
+- `ENABLE_ADMIN_FUNCTIONS=0`
 
 This means the default Azure Function App should show only:
 
@@ -139,6 +156,8 @@ Infinitspace-datawarehouse/
     xero_sync.py
     integrations_admin.py
     admin_health.py
+    real_estate_costar.py
+    real_estate_costar_worker.py
   shared/
     azure_clients/
       sql_client.py
@@ -169,6 +188,12 @@ Infinitspace-datawarehouse/
       invoice_sync.py
       tenant_directory.py
     gmaps/
+    real_estate/
+      __init__.py
+      building_contact_extractor.py   (copy from AI-REAL-ESTATE/extract_building_contacts_improved.py)
+    azure_clients/
+      ...
+      costar_queue_client.py
   scripts/
     python_scripts/
       test_local.py
@@ -236,10 +261,19 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `xero_invoice_sync` | `functions/xero_sync.py` | timer | `0 0 4 * * *` | syncs all linked Xero tenants |
 | admin HTTP routes | `functions/integrations_admin.py` | HTTP | on-demand | only when `ENABLE_ADMIN_FUNCTIONS=1` |
 | `test_connections` | `functions/admin_health.py` | HTTP | on-demand | only when `ENABLE_ADMIN_FUNCTIONS=1` |
+| `run_costar_extractor` | `functions/real_estate_costar.py` | HTTP POST | `real-estate/costar/run` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — enqueues only, returns 202 |
+| `costar_extraction_worker` | `functions/real_estate_costar_worker.py` | queue | `costar-extraction-tasks` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — does the actual extraction |
 
 ---
 
 ## Data Model Summary
+
+### Real Estate (CoStar extractor)
+
+- uses `bronze.costar_pdf_extractor_logs` (in Real Estate DB, not datawarehouse DB)
+- connection string: `AZURE_SQL_PDF_JOBS_CONNECTION_STRING`
+- extractor module: `shared/real_estate/building_contact_extractor.py`
+  (copy of `extract_building_contacts_improved.py` from AI-REAL-ESTATE repo)
 
 ### Bronze
 
@@ -559,6 +593,7 @@ az functionapp config appsettings set `
 | Optional admin HTTP routes | done | separate deployment mode |
 | Google Maps scheduled pipeline | not wired | utilities exist, not registered in default app |
 | Core layer population | planned | not implemented |
+| Real Estate CoStar extractor HTTP function | done | `ENABLE_REAL_ESTATE_FUNCTIONS=1` to activate |
 
 ---
 
@@ -576,6 +611,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-07
+Last updated: 2026-04-07 (added Real Estate CoStar extractor function)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team
