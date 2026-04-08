@@ -19,7 +19,7 @@ import os
 from datetime import datetime, timezone
 
 from azure.identity import DefaultAzureCredential
-from azure.storage.queue import QueueServiceClient
+from azure.storage.queue import QueueClient, QueueServiceClient
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +36,15 @@ class CostarTaskQueue:
 
         account_url = f"https://{account_name}.queue.core.windows.net"
         credential = DefaultAzureCredential()
-        service = QueueServiceClient(account_url=account_url, credential=credential)
-        self._queue = service.get_queue_client(COSTAR_TASK_QUEUE)
+        service = QueueServiceClient(
+            account_url=account_url,
+            credential=credential,
+        )
+        self._queue = service.get_queue_client(
+            COSTAR_TASK_QUEUE,
+            message_encode_policy=None,
+            message_decode_policy=None,
+        )
 
         try:
             self._queue.create_queue()
