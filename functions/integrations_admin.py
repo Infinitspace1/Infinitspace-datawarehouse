@@ -2,7 +2,6 @@
 functions/integrations_admin.py
 
 Optional admin/debug HTTP routes for:
-  - Nexudus colleague-location sync
   - Xero OAuth connect/callback
   - Xero tenant listing, invoice sync, and API smoke tests
 
@@ -16,10 +15,6 @@ from typing import Any
 import azure.functions as func
 import requests
 
-from shared.nexudus.auth import get_bearer_token
-from shared.nexudus.client import NexudusClient
-from shared.nexudus.colleague_sync import parse_coworker_payload
-from shared.nexudus.colleague_sync import sync_coworker_access
 from shared.xero.client import XeroApiClient
 from shared.xero.flow import XeroAuthFlowService
 from shared.xero.invoice_sync import XeroInvoiceSyncService
@@ -38,55 +33,6 @@ def _json_response(payload: dict[str, Any], status_code: int = 200) -> func.Http
     )
 
 
-def _parse_coworker_ids(req: func.HttpRequest) -> list[int]:
-    ids: list[int] = []
-
-    body_ids = None
-    try:
-        body = req.get_json()
-        body_ids = body.get("coworker_ids")
-    except ValueError:
-        body_ids = None
-
-    if isinstance(body_ids, list):
-        for value in body_ids:
-            try:
-                ids.append(int(value))
-            except (TypeError, ValueError):
-                continue
-
-    query_ids = req.params.get("coworker_ids")
-    if query_ids:
-        for part in query_ids.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                ids.append(int(part))
-            except ValueError:
-                continue
-
-    # De-duplicate while preserving order.
-    deduped = []
-    seen = set()
-    for cid in ids:
-        if cid in seen:
-            continue
-        seen.add(cid)
-        deduped.append(cid)
-    return deduped
-
-
-def _parse_single_coworker_id(req: func.HttpRequest) -> int | None:
-    raw = req.params.get("coworker_id")
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
 def _parse_connection_id(req: func.HttpRequest) -> int | None:
     raw = req.params.get("connection_id")
     if not raw:
@@ -95,82 +41,6 @@ def _parse_connection_id(req: func.HttpRequest) -> int | None:
         return int(raw)
     except ValueError:
         return None
-
-
-@bp.route(
-    route="integrations/nexudus/coworker-debug",
-    methods=["GET"],
-    auth_level=func.AuthLevel.ADMIN,
-)
-async def nexudus_coworker_debug(req: func.HttpRequest) -> func.HttpResponse:
-    coworker_id = _parse_single_coworker_id(req)
-    if coworker_id is None:
-        return _json_response(
-            {"error": "Provide ?coworker_id=<nexudus_id>"},
-            status_code=400,
-        )
-
-    token = get_bearer_token()
-    async with NexudusClient(token) as client:
-        payload = await client.get_coworker(coworker_id)
-
-    if payload is None:
-        return _json_response(
-            {"error": f"Coworker {coworker_id} not found"},
-            status_code=404,
-        )
-
-    parsed = parse_coworker_payload(payload)
-    return _json_response(
-        {
-            "status": "ok",
-            "coworker_id": coworker_id,
-            "parsed": {
-                "nexudus_coworker_id": parsed.nexudus_coworker_id,
-                "team_business_id": parsed.team_business_id,
-                "full_name": parsed.full_name,
-                "first_name": parsed.first_name,
-                "last_name": parsed.last_name,
-                "email": parsed.email,
-                "status": parsed.status,
-                "accessible_businesses": [
-                    {
-                        "business_id": business.business_id,
-                        "name": business.name,
-                        "slug": business.slug,
-                    }
-                    for business in parsed.accessible_businesses
-                ],
-            },
-            "raw_payload": payload,
-        }
-    )
-
-
-@bp.route(
-    route="integrations/nexudus/sync-colleagues",
-    methods=["GET", "POST"],
-    auth_level=func.AuthLevel.ADMIN,
-)
-async def sync_nexudus_colleague_access(req: func.HttpRequest) -> func.HttpResponse:
-    coworker_ids = _parse_coworker_ids(req)
-    if not coworker_ids:
-        return _json_response(
-            {
-                "error": "Provide coworker IDs in JSON body {\"coworker_ids\": [...]} "
-                         "or query string ?coworker_ids=1,2,3"
-            },
-            status_code=400,
-        )
-
-    stats = await sync_coworker_access(coworker_ids)
-    return _json_response(
-        {
-            "status": "ok",
-            "team_business_id": 1376491118,
-            "stats": stats,
-        }
-    )
 
 
 @bp.route(

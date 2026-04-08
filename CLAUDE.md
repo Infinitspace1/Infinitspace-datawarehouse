@@ -154,8 +154,6 @@ Infinitspace-datawarehouse/
     nexudus/
       auth.py
       client.py
-      colleague_sync.py
-      schemas.py
       transformers/
         locations.py
         products.py
@@ -181,8 +179,6 @@ Infinitspace-datawarehouse/
       inspect_bronze.py
       inspect_product_per_type.py
       enrich_location_gmaps.py
-      nexudus_debug_coworker.py
-      nexudus_sync_colleague_access.py
       xero_start_oauth.py
       xero_complete_oauth.py
       xero_get_connections.py
@@ -211,7 +207,6 @@ Infinitspace-datawarehouse/
       xero_invoices_schema.sql
       test.sql
   tests/
-    test_nexudus_colleague_sync.py
     test_xero_integration.py
     test_xero_tenant_directory.py
   docs/
@@ -253,7 +248,6 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - `bronze.nexudus_contracts`
 - `bronze.nexudus_resources`
 - `bronze.nexudus_extra_services`
-- `bronze.nexudus_coworkers`
 - `bronze.xero_invoices`
 - `bronze.xero_invoice_pdfs`
 
@@ -267,8 +261,6 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `silver.nexudus_contracts`
 - `silver.nexudus_resources`
 - `silver.nexudus_extra_services`
-- `silver.nexudus_colleagues`
-- `silver.nexudus_colleague_location_access`
 - `silver.xero_invoices`
 - `silver.xero_invoice_line_items`
 - `silver.xero_tenants`

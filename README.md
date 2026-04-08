@@ -61,7 +61,7 @@ The repo now supports two deployment modes from the same codebase:
 - Admin app, optional
   - `ENABLE_ETL_FUNCTIONS=0`
   - `ENABLE_ADMIN_FUNCTIONS=1`
-  - Exposes manual HTTP routes for debugging, Xero OAuth callback, colleague sync, and smoke tests
+  - Exposes manual HTTP routes for Xero OAuth callback, debugging, and smoke tests
 
 `function_app.py` registers functions based on those flags.
 

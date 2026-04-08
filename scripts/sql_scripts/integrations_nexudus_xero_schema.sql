@@ -11,149 +11,25 @@
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
--- bronze.nexudus_coworkers
--- Raw coworker payloads fetched from GET /api/spaces/coworkers/{id}
+-- Legacy Nexudus coworker sync cleanup
+-- These tables are no longer used by the Function App and should be removed.
+-- Drop dependent tables first.
 -- -----------------------------------------------------------------------------
-IF OBJECT_ID('bronze.nexudus_coworkers', 'U') IS NULL
+IF OBJECT_ID('silver.nexudus_colleague_location_access', 'U') IS NOT NULL
 BEGIN
-    CREATE TABLE bronze.nexudus_coworkers (
-        id              BIGINT              IDENTITY(1,1) PRIMARY KEY,
-        sync_run_id     UNIQUEIDENTIFIER    NOT NULL,
-        source_id       BIGINT              NOT NULL,
-        raw_json        NVARCHAR(MAX)       NOT NULL,
-        synced_at       DATETIME2           NOT NULL DEFAULT GETUTCDATE()
-    );
+    DROP TABLE silver.nexudus_colleague_location_access;
 END
 GO
 
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'ix_bronze_nexudus_coworkers_source_id'
-      AND object_id = OBJECT_ID('bronze.nexudus_coworkers')
-)
+IF OBJECT_ID('silver.nexudus_colleagues', 'U') IS NOT NULL
 BEGIN
-    CREATE INDEX ix_bronze_nexudus_coworkers_source_id
-        ON bronze.nexudus_coworkers (source_id);
+    DROP TABLE silver.nexudus_colleagues;
 END
 GO
 
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'ix_bronze_nexudus_coworkers_sync_run'
-      AND object_id = OBJECT_ID('bronze.nexudus_coworkers')
-)
+IF OBJECT_ID('bronze.nexudus_coworkers', 'U') IS NOT NULL
 BEGIN
-    CREATE INDEX ix_bronze_nexudus_coworkers_sync_run
-        ON bronze.nexudus_coworkers (sync_run_id);
-END
-GO
-
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'ix_bronze_nexudus_coworkers_synced_at'
-      AND object_id = OBJECT_ID('bronze.nexudus_coworkers')
-)
-BEGIN
-    CREATE INDEX ix_bronze_nexudus_coworkers_synced_at
-        ON bronze.nexudus_coworkers (synced_at);
-END
-GO
-
--- -----------------------------------------------------------------------------
--- silver.nexudus_colleagues
--- Normalized coworker rows. Uses source_id like the rest of silver.*.
--- -----------------------------------------------------------------------------
-IF OBJECT_ID('silver.nexudus_colleagues', 'U') IS NULL
-BEGIN
-    CREATE TABLE silver.nexudus_colleagues (
-        id                  BIGINT              IDENTITY(1,1) PRIMARY KEY,
-        source_id           BIGINT              NOT NULL,
-        CONSTRAINT uq_silver_nexudus_colleagues_source_id UNIQUE (source_id),
-        bronze_id           BIGINT              NULL,
-        sync_run_id         UNIQUEIDENTIFIER    NULL,
-        team_business_id    BIGINT              NULL,
-        full_name           NVARCHAR(512)       NULL,
-        first_name          NVARCHAR(255)       NULL,
-        last_name           NVARCHAR(255)       NULL,
-        email               NVARCHAR(512)       NULL,
-        status              NVARCHAR(128)       NULL,
-        first_seen_at       DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
-        last_synced_at      DATETIME2           NOT NULL DEFAULT GETUTCDATE()
-    );
-END
-GO
-
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'ix_silver_nexudus_colleagues_email'
-      AND object_id = OBJECT_ID('silver.nexudus_colleagues')
-)
-BEGIN
-    CREATE INDEX ix_silver_nexudus_colleagues_email
-        ON silver.nexudus_colleagues (email);
-END
-GO
-
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'ix_silver_nexudus_colleagues_team_business_id'
-      AND object_id = OBJECT_ID('silver.nexudus_colleagues')
-)
-BEGIN
-    CREATE INDEX ix_silver_nexudus_colleagues_team_business_id
-        ON silver.nexudus_colleagues (team_business_id);
-END
-GO
-
--- -----------------------------------------------------------------------------
--- silver.nexudus_colleague_location_access
--- Soft link table:
---   colleague_source_id -> silver.nexudus_colleagues.source_id
---   location_source_id  -> silver.nexudus_locations.source_id
--- -----------------------------------------------------------------------------
-IF OBJECT_ID('silver.nexudus_colleague_location_access', 'U') IS NULL
-BEGIN
-    CREATE TABLE silver.nexudus_colleague_location_access (
-        id                      BIGINT              IDENTITY(1,1) PRIMARY KEY,
-        colleague_source_id     BIGINT              NOT NULL,
-        location_source_id      BIGINT              NOT NULL,
-        source                  NVARCHAR(128)       NOT NULL
-            CONSTRAINT df_silver_nexudus_colleague_location_access_source
-            DEFAULT 'nexudus_coworker_business_access',
-        first_seen_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
-        last_synced_at          DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
-        CONSTRAINT uq_silver_nexudus_colleague_location_access
-            UNIQUE (colleague_source_id, location_source_id)
-    );
-END
-GO
-
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'ix_silver_nexudus_colleague_location_access_location'
-      AND object_id = OBJECT_ID('silver.nexudus_colleague_location_access')
-)
-BEGIN
-    CREATE INDEX ix_silver_nexudus_colleague_location_access_location
-        ON silver.nexudus_colleague_location_access (location_source_id);
-END
-GO
-
-IF NOT EXISTS (
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'ix_silver_nexudus_colleague_location_access_colleague'
-      AND object_id = OBJECT_ID('silver.nexudus_colleague_location_access')
-)
-BEGIN
-    CREATE INDEX ix_silver_nexudus_colleague_location_access_colleague
-        ON silver.nexudus_colleague_location_access (colleague_source_id);
+    DROP TABLE bronze.nexudus_coworkers;
 END
 GO
 
@@ -419,6 +295,3 @@ BEGIN
         ON meta.xero_oauth_states (expires_at);
 END
 GO
-
-
-SELECT COUNT(1) FROM silver.xero_invoices
