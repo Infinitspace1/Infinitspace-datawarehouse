@@ -45,6 +45,7 @@ Default ETL execution order in UTC:
 3. queue fanout via `silver_entity_worker`
 4. `03:00` `refresh_ava_availability`
 5. `04:00` `xero_invoice_sync` (includes PDF caching for overdue invoices)
+6. `05:00` `bamboohr_sync`
 
 Important operational caveat:
 
@@ -187,6 +188,11 @@ Infinitspace-datawarehouse/
         extra_services.py
         coworker_invoices.py
         coworkers.py
+    bamboohr/
+      __init__.py
+      client.py
+      transformers/
+        employees.py
     xero/
       oauth.py
       flow.py
@@ -281,6 +287,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `test_connections` | `functions/admin_health.py` | HTTP | on-demand | only when `ENABLE_ADMIN_FUNCTIONS=1` |
 | `run_costar_extractor` | `functions/real_estate_costar.py` | HTTP POST | `real-estate/costar/run` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — enqueues only, returns 202 |
 | `costar_extraction_worker` | `functions/real_estate_costar_worker.py` | queue | `costar-extraction-tasks` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — does the actual extraction |
+| `bamboohr_sync` | `functions/bamboohr_sync.py` | timer | `0 0 5 * * *` | syncs all BambooHR employees to bronze + silver; join key: `work_email` |
 
 ---
 
@@ -304,6 +311,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - `bronze.nexudus_coworkers`
 - `bronze.xero_invoices`
 - `bronze.xero_invoice_pdfs` — stores `blob_path` reference, not raw bytes
+- `bronze.bamboohr_employees`
 
 Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only history.
 
@@ -324,6 +332,7 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `silver.location_transit_stations`
 - `silver.location_neighborhoods`
 - `silver.xero_overdue_invoice_contacts` — view joining overdue Xero invoices to Nexudus customer email data
+- `silver.bamboohr_employees` — join key: `work_email` → `silver.nexudus_coworkers.email`
 
 ### AVA
 
@@ -501,6 +510,11 @@ AZURE_STORAGE_CONTAINER_XERO_PDFS=xero-invoice-pdfs
 
 # Queue trigger storage
 AzureWebJobsStorage=...
+
+# BambooHR
+BAMBOOHR_SUBDOMAIN=infinitspace
+BAMBOOHR_API_KEY=...
+BAMBOOHR_SYNC_SCHEDULE="0 0 5 * * *"  # optional override
 
 # Google Maps
 GOOGLE_MAPS_API_KEY=...
@@ -704,6 +718,7 @@ az functionapp config appsettings set `
 | Google Maps scheduled pipeline | not wired | utilities exist, not registered in default app |
 | Core layer population | planned | not implemented |
 | Real Estate CoStar extractor HTTP function | done | `ENABLE_REAL_ESTATE_FUNCTIONS=1` to activate |
+| BambooHR employee sync | done | bronze + silver; `work_email` is join key to Nexudus coworkers |
 
 ---
 
@@ -721,6 +736,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-07 (added Real Estate CoStar extractor function)
+Last updated: 2026-04-09 (added BambooHR employee sync)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team
