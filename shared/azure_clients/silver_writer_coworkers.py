@@ -13,6 +13,62 @@ from shared.nexudus.transformers.coworkers import transform_coworker
 
 logger = logging.getLogger(__name__)
 
+_MERGE_SQL = """
+    MERGE silver.nexudus_coworkers AS target
+    USING (SELECT ? AS source_id) AS source
+        ON target.source_id = source.source_id
+    WHEN MATCHED THEN UPDATE SET
+        unique_id = ?, bronze_id = ?, sync_run_id = ?,
+        coworker_type = ?, full_name = ?, email = ?, billing_email = ?, billing_name = ?,
+        company_name = ?, team_name = ?, team_names = ?, team_ids = ?, business_ids = ?,
+        location_source_id = ?, location_name = ?,
+        mobile_phone = ?, land_line = ?,
+        address = ?, post_code = ?, city_name = ?, state = ?,
+        billing_address = ?, billing_post_code = ?, billing_city_name = ?, billing_state = ?,
+        tax_id_number = ?, billing_day = ?,
+        tariff_id = ?, tariff_name = ?, next_tariff_id = ?, next_tariff_name = ?,
+        coworker_contract_ids = ?, coworker_contract_tariff_names = ?,
+        active = ?, archived = ?, user_active = ?,
+        notify_on_new_invoice = ?, notify_on_new_payment = ?, notify_on_failed_payment = ?,
+        do_not_process_invoices_automatically = ?,
+        user_last_access = ?, registration_date = ?, renewal_date = ?, start_date = ?, cancellation_date = ?,
+        created_on = ?, updated_on = ?,
+        last_synced_at = GETUTCDATE()
+    WHEN NOT MATCHED THEN INSERT (
+        source_id, unique_id, bronze_id, sync_run_id,
+        coworker_type, full_name, email, billing_email, billing_name,
+        company_name, team_name, team_names, team_ids, business_ids,
+        location_source_id, location_name,
+        mobile_phone, land_line,
+        address, post_code, city_name, state,
+        billing_address, billing_post_code, billing_city_name, billing_state,
+        tax_id_number, billing_day,
+        tariff_id, tariff_name, next_tariff_id, next_tariff_name,
+        coworker_contract_ids, coworker_contract_tariff_names,
+        active, archived, user_active,
+        notify_on_new_invoice, notify_on_new_payment, notify_on_failed_payment,
+        do_not_process_invoices_automatically,
+        user_last_access, registration_date, renewal_date, start_date, cancellation_date,
+        created_on, updated_on
+    ) VALUES (
+        ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?,
+        ?, ?, ?, ?,
+        ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?,
+        ?, ?, ?, ?, ?,
+        ?, ?
+    );
+"""
+
 
 class SilverCoworkersWriter:
     def __init__(self, sync_run_id: uuid.UUID):
@@ -23,17 +79,21 @@ class SilverCoworkersWriter:
         rows = self._load_latest_bronze()
         logger.info("Loaded %s bronze coworker records", len(rows))
 
-        ok = errors = 0
+        params_list = []
+        errors = 0
         for row in rows:
             raw = json.loads(row["raw_json"])
             try:
                 coworker = transform_coworker(raw, row["id"], self.sync_run_id)
-                self._upsert(coworker)
-                ok += 1
+                params_list.append(self._make_params(coworker))
             except Exception as exc:
                 logger.warning("Failed source_id=%s: %s", raw.get("Id"), exc)
                 errors += 1
 
+        if params_list:
+            self.sql.execute_many(_MERGE_SQL, params_list)
+
+        ok = len(params_list)
         logger.info("Silver coworkers: %s upserted, %s errors", ok, errors)
         return {"coworkers": ok, "errors": errors}
 
@@ -51,26 +111,7 @@ class SilverCoworkersWriter:
             """
         )
 
-    def _upsert(self, coworker: dict) -> None:
-        cols_update = """
-            unique_id = ?, bronze_id = ?, sync_run_id = ?,
-            coworker_type = ?, full_name = ?, email = ?, billing_email = ?, billing_name = ?,
-            company_name = ?, team_name = ?, team_names = ?, team_ids = ?, business_ids = ?,
-            location_source_id = ?, location_name = ?,
-            mobile_phone = ?, land_line = ?,
-            address = ?, post_code = ?, city_name = ?, state = ?,
-            billing_address = ?, billing_post_code = ?, billing_city_name = ?, billing_state = ?,
-            tax_id_number = ?, billing_day = ?,
-            tariff_id = ?, tariff_name = ?, next_tariff_id = ?, next_tariff_name = ?,
-            coworker_contract_ids = ?, coworker_contract_tariff_names = ?,
-            active = ?, archived = ?, user_active = ?,
-            notify_on_new_invoice = ?, notify_on_new_payment = ?, notify_on_failed_payment = ?,
-            do_not_process_invoices_automatically = ?,
-            user_last_access = ?, registration_date = ?, renewal_date = ?, start_date = ?, cancellation_date = ?,
-            created_on = ?, updated_on = ?,
-            last_synced_at = GETUTCDATE()
-        """
-
+    def _make_params(self, coworker: dict) -> tuple:
         vals = (
             coworker["unique_id"], coworker["bronze_id"], coworker["sync_run_id"],
             coworker["coworker_type"], coworker["full_name"], coworker["email"], coworker["billing_email"], coworker["billing_name"],
@@ -88,46 +129,4 @@ class SilverCoworkersWriter:
             coworker["user_last_access"], coworker["registration_date"], coworker["renewal_date"], coworker["start_date"], coworker["cancellation_date"],
             coworker["created_on"], coworker["updated_on"],
         )
-
-        self.sql.execute_non_query(
-            f"""
-            MERGE silver.nexudus_coworkers AS target
-            USING (SELECT ? AS source_id) AS source
-                ON target.source_id = source.source_id
-            WHEN MATCHED THEN UPDATE SET {cols_update}
-            WHEN NOT MATCHED THEN INSERT (
-                source_id, unique_id, bronze_id, sync_run_id,
-                coworker_type, full_name, email, billing_email, billing_name,
-                company_name, team_name, team_names, team_ids, business_ids,
-                location_source_id, location_name,
-                mobile_phone, land_line,
-                address, post_code, city_name, state,
-                billing_address, billing_post_code, billing_city_name, billing_state,
-                tax_id_number, billing_day,
-                tariff_id, tariff_name, next_tariff_id, next_tariff_name,
-                coworker_contract_ids, coworker_contract_tariff_names,
-                active, archived, user_active,
-                notify_on_new_invoice, notify_on_new_payment, notify_on_failed_payment,
-                do_not_process_invoices_automatically,
-                user_last_access, registration_date, renewal_date, start_date, cancellation_date,
-                created_on, updated_on
-            ) VALUES (
-                ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?,
-                ?, ?, ?, ?, ?,
-                ?, ?
-            );
-            """,
-            (coworker["source_id"], *vals, coworker["source_id"], *vals),
-        )
+        return (coworker["source_id"], *vals, coworker["source_id"], *vals)

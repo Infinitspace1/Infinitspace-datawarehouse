@@ -13,6 +13,41 @@ from shared.nexudus.transformers.resources import transform_resource
 
 logger = logging.getLogger(__name__)
 
+_MERGE_SQL = """
+    MERGE silver.nexudus_resources AS target
+    USING (SELECT ? AS source_id) AS source
+        ON target.source_id = source.source_id
+    WHEN MATCHED THEN UPDATE SET
+        bronze_id = ?, sync_run_id = ?,
+        location_source_id = ?, nexudus_uuid = ?,
+        name = ?, description = ?,
+        resource_type_id = ?, resource_type_name = ?,
+        group_id = ?, group_name = ?,
+        visible = ?, online = ?, visible_to_others = ?, available = ?,
+        capacity = ?, size = ?, floor_number = ?, accessible = ?,
+        created_on = ?, updated_on = ?,
+        last_synced_at = GETUTCDATE()
+    WHEN NOT MATCHED THEN INSERT (
+        source_id, bronze_id, sync_run_id,
+        location_source_id, nexudus_uuid,
+        name, description,
+        resource_type_id, resource_type_name,
+        group_id, group_name,
+        visible, online, visible_to_others, available,
+        capacity, size, floor_number, accessible,
+        created_on, updated_on
+    ) VALUES (
+        ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?
+    );
+"""
+
 
 class SilverResourcesWriter:
 
@@ -24,19 +59,23 @@ class SilverResourcesWriter:
         rows = self._load_latest_bronze()
         logger.info(f"Loaded {len(rows)} bronze resource records")
 
-        ok = errors = 0
+        params_list = []
+        errors = 0
         for row in rows:
             raw = json.loads(row["raw_json"])
             try:
                 r = transform_resource(raw, row["id"], self.sync_run_id)
                 if r is None:
                     continue
-                self._upsert(r)
-                ok += 1
+                params_list.append(self._make_params(r))
             except Exception as e:
                 logger.warning(f"Failed source_id={raw.get('Id')}: {e}")
                 errors += 1
 
+        if params_list:
+            self.sql.execute_many(_MERGE_SQL, params_list)
+
+        ok = len(params_list)
         logger.info(f"Silver resources: {ok} upserted, {errors} errors")
         return {"resources": ok, "errors": errors}
 
@@ -52,19 +91,7 @@ class SilverResourcesWriter:
                     AND b.synced_at  = latest.latest
         """)
 
-    def _upsert(self, r: dict):
-        cols_update = """
-            bronze_id = ?, sync_run_id = ?,
-            location_source_id = ?, nexudus_uuid = ?,
-            name = ?, description = ?,
-            resource_type_id = ?, resource_type_name = ?,
-            group_id = ?, group_name = ?,
-            visible = ?, online = ?, visible_to_others = ?, available = ?,
-            capacity = ?, size = ?, floor_number = ?, accessible = ?,
-            created_on = ?, updated_on = ?,
-            last_synced_at = GETUTCDATE()
-        """
-
+    def _make_params(self, r: dict) -> tuple:
         vals = (
             r["bronze_id"], r["sync_run_id"],
             r["location_source_id"], r["nexudus_uuid"],
@@ -75,29 +102,4 @@ class SilverResourcesWriter:
             r["capacity"], r["size"], r["floor_number"], r["accessible"],
             r["created_on"], r["updated_on"],
         )
-
-        self.sql.execute_non_query(f"""
-            MERGE silver.nexudus_resources AS target
-            USING (SELECT ? AS source_id) AS source
-                ON target.source_id = source.source_id
-            WHEN MATCHED THEN UPDATE SET {cols_update}
-            WHEN NOT MATCHED THEN INSERT (
-                source_id, bronze_id, sync_run_id,
-                location_source_id, nexudus_uuid,
-                name, description,
-                resource_type_id, resource_type_name,
-                group_id, group_name,
-                visible, online, visible_to_others, available,
-                capacity, size, floor_number, accessible,
-                created_on, updated_on
-            ) VALUES (
-                ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?
-            );
-        """, (r["source_id"], *vals, r["source_id"], *vals))
+        return (r["source_id"], *vals, r["source_id"], *vals)

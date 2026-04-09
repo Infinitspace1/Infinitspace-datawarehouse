@@ -13,6 +13,71 @@ from shared.nexudus.transformers.contracts import transform_contract
 
 logger = logging.getLogger(__name__)
 
+_MERGE_SQL = """
+    MERGE silver.nexudus_contracts AS target
+    USING (SELECT ? AS source_id) AS source
+        ON target.source_id = source.source_id
+    WHEN MATCHED THEN UPDATE SET
+        unique_id = ?, bronze_id = ?, sync_run_id = ?,
+        active = ?, cancelled = ?, main_contract = ?, in_paused_period = ?,
+        coworker_id = ?, coworker_name = ?, coworker_email = ?,
+        coworker_company = ?, coworker_billing_name = ?,
+        coworker_type = ?, coworker_active = ?,
+        location_source_id = ?, location_name = ?,
+        tariff_id = ?, tariff_name = ?, tariff_price = ?, currency_code = ?,
+        next_tariff_id = ?, next_tariff_name = ?,
+        floor_plan_desk_ids = ?, floor_plan_desk_names = ?,
+        price = ?, price_with_products = ?, unit_price = ?,
+        quantity = ?, billing_day = ?,
+        apply_pro_rating = ?, pro_rate_cancellation = ?,
+        include_signup_fee = ?, cancellation_limit_days = ?,
+        start_date = ?, contract_term = ?, renewal_date = ?,
+        cancellation_date = ?, invoiced_period = ?,
+        term_duration_months = ?,
+        notes = ?, updated_by = ?,
+        created_on = ?, updated_on = ?,
+        last_synced_at = GETUTCDATE()
+    WHEN NOT MATCHED THEN INSERT (
+        source_id, unique_id, bronze_id, sync_run_id,
+        active, cancelled, main_contract, in_paused_period,
+        coworker_id, coworker_name, coworker_email,
+        coworker_company, coworker_billing_name,
+        coworker_type, coworker_active,
+        location_source_id, location_name,
+        tariff_id, tariff_name, tariff_price, currency_code,
+        next_tariff_id, next_tariff_name,
+        floor_plan_desk_ids, floor_plan_desk_names,
+        price, price_with_products, unit_price,
+        quantity, billing_day,
+        apply_pro_rating, pro_rate_cancellation,
+        include_signup_fee, cancellation_limit_days,
+        start_date, contract_term, renewal_date,
+        cancellation_date, invoiced_period,
+        term_duration_months,
+        notes, updated_by,
+        created_on, updated_on
+    ) VALUES (
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?,
+        ?, ?,
+        ?, ?
+    );
+"""
+
 
 class SilverContractsWriter:
 
@@ -24,17 +89,21 @@ class SilverContractsWriter:
         rows = self._load_latest_bronze()
         logger.info(f"Loaded {len(rows)} bronze contract records")
 
-        ok = errors = 0
+        params_list = []
+        errors = 0
         for row in rows:
             raw = json.loads(row["raw_json"])
             try:
                 c = transform_contract(raw, row["id"], self.sync_run_id)
-                self._upsert(c)
-                ok += 1
+                params_list.append(self._make_params(c))
             except Exception as e:
                 logger.warning(f"Failed source_id={raw.get('Id')}: {e}")
                 errors += 1
 
+        if params_list:
+            self.sql.execute_many(_MERGE_SQL, params_list)
+
+        ok = len(params_list)
         logger.info(f"Silver contracts: {ok} upserted, {errors} errors")
         return {"contracts": ok, "errors": errors}
 
@@ -50,29 +119,7 @@ class SilverContractsWriter:
                     AND b.synced_at  = latest.latest
         """)
 
-    def _upsert(self, c: dict):
-        cols_update = """
-            unique_id = ?, bronze_id = ?, sync_run_id = ?,
-            active = ?, cancelled = ?, main_contract = ?, in_paused_period = ?,
-            coworker_id = ?, coworker_name = ?, coworker_email = ?,
-            coworker_company = ?, coworker_billing_name = ?,
-            coworker_type = ?, coworker_active = ?,
-            location_source_id = ?, location_name = ?,
-            tariff_id = ?, tariff_name = ?, tariff_price = ?, currency_code = ?,
-            next_tariff_id = ?, next_tariff_name = ?,
-            floor_plan_desk_ids = ?, floor_plan_desk_names = ?,
-            price = ?, price_with_products = ?, unit_price = ?,
-            quantity = ?, billing_day = ?,
-            apply_pro_rating = ?, pro_rate_cancellation = ?,
-            include_signup_fee = ?, cancellation_limit_days = ?,
-            start_date = ?, contract_term = ?, renewal_date = ?,
-            cancellation_date = ?, invoiced_period = ?,
-            term_duration_months = ?,
-            notes = ?, updated_by = ?,
-            created_on = ?, updated_on = ?,
-            last_synced_at = GETUTCDATE()
-        """
-
+    def _make_params(self, c: dict) -> tuple:
         vals = (
             c["unique_id"],             c["bronze_id"],         c["sync_run_id"],
             c["active"],                c["cancelled"],         c["main_contract"],     c["in_paused_period"],
@@ -93,49 +140,4 @@ class SilverContractsWriter:
             c["notes"],                 c["updated_by"],
             c["created_on"],            c["updated_on"],
         )
-
-        self.sql.execute_non_query(f"""
-            MERGE silver.nexudus_contracts AS target
-            USING (SELECT ? AS source_id) AS source
-                ON target.source_id = source.source_id
-            WHEN MATCHED THEN UPDATE SET {cols_update}
-            WHEN NOT MATCHED THEN INSERT (
-                source_id, unique_id, bronze_id, sync_run_id,
-                active, cancelled, main_contract, in_paused_period,
-                coworker_id, coworker_name, coworker_email,
-                coworker_company, coworker_billing_name,
-                coworker_type, coworker_active,
-                location_source_id, location_name,
-                tariff_id, tariff_name, tariff_price, currency_code,
-                next_tariff_id, next_tariff_name,
-                floor_plan_desk_ids, floor_plan_desk_names,
-                price, price_with_products, unit_price,
-                quantity, billing_day,
-                apply_pro_rating, pro_rate_cancellation,
-                include_signup_fee, cancellation_limit_days,
-                start_date, contract_term, renewal_date,
-                cancellation_date, invoiced_period,
-                term_duration_months,
-                notes, updated_by,
-                created_on, updated_on
-            ) VALUES (
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?,
-                ?, ?,
-                ?, ?
-            );
-        """, (c["source_id"], *vals, c["source_id"], *vals))
+        return (c["source_id"], *vals, c["source_id"], *vals)

@@ -266,22 +266,28 @@ class XeroInvoiceSyncService:
         return rows[0]
 
     def cache_overdue_pdfs(self) -> dict[str, Any]:
+        """Alias kept for backwards compatibility — delegates to cache_missing_pdfs."""
+        return self.cache_missing_pdfs()
+
+    def cache_missing_pdfs(self, limit: Optional[int] = None) -> dict[str, Any]:
         """
-        Fetch and cache PDFs for all overdue invoices that don't have a blob_path yet.
-        Called after the main invoice sync so new overdue invoices get a PDF immediately.
+        Fetch and cache PDFs for all invoices that don't have a blob_path yet,
+        regardless of status (paid, overdue, voided, etc.).
+        Called after the main invoice sync so newly synced invoices get a PDF.
+        The pdf_blob_path IS NULL filter is the natural watermark — already-cached
+        invoices are never re-fetched.
         """
+        top = f"TOP {limit}" if limit else ""
         rows = self.sql.execute_query(
-            """
-            SELECT
+            f"""
+            SELECT {top}
                 xi.source_id,
                 xi.xero_tenant_id,
                 xi.xero_connection_id,
                 xi.invoice_number
             FROM silver.xero_invoices xi
-            WHERE xi.invoice_status = 'AUTHORISED'
-              AND xi.amount_due > 0
-              AND xi.due_date < CAST(GETUTCDATE() AS DATE)
-              AND xi.pdf_blob_path IS NULL
+            WHERE xi.pdf_blob_path IS NULL
+            ORDER BY xi.invoice_date DESC
             """
         )
         ok = errors = 0
