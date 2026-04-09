@@ -19,43 +19,34 @@ _MERGE_SQL = """
     USING (SELECT ? AS source_id) AS source
         ON target.source_id = source.source_id
     WHEN MATCHED THEN UPDATE SET
-        employee_number = ?, first_name = ?, last_name = ?, display_name = ?,
-        work_email = ?, personal_email = ?,
+        employee_number = ?, first_name = ?, last_name = ?,
+        work_email = ?,
         job_title = ?, department = ?, division = ?, location = ?,
         manager_id = ?, manager_name = ?,
-        employment_status = ?, hire_date = ?, termination_date = ?,
-        work_phone = ?, work_phone_ext = ?, mobile_phone = ?,
-        cost_center = ?, pay_group = ?, flsa_code = ?,
-        gender = ?, nationality = ?, marital_status = ?, date_of_birth = ?,
-        address1 = ?, city = ?, state = ?, country = ?, zip_code = ?,
-        photo_url = ?,
+        hire_date = ?,
+        work_phone = ?, work_phone_ext = ?,
+        address1 = ?, city = ?,
         bronze_id = ?, sync_run_id = ?,
         last_synced_at = GETUTCDATE()
     WHEN NOT MATCHED THEN INSERT (
         source_id,
-        employee_number, first_name, last_name, display_name,
-        work_email, personal_email,
+        employee_number, first_name, last_name,
+        work_email,
         job_title, department, division, location,
         manager_id, manager_name,
-        employment_status, hire_date, termination_date,
-        work_phone, work_phone_ext, mobile_phone,
-        cost_center, pay_group, flsa_code,
-        gender, nationality, marital_status, date_of_birth,
-        address1, city, state, country, zip_code,
-        photo_url,
+        hire_date,
+        work_phone, work_phone_ext,
+        address1, city,
         bronze_id, sync_run_id
     ) VALUES (
         ?,
-        ?, ?, ?, ?,
-        ?, ?,
-        ?, ?, ?, ?,
-        ?, ?,
         ?, ?, ?,
-        ?, ?, ?,
-        ?, ?, ?,
-        ?, ?, ?, ?,
-        ?, ?, ?, ?, ?,
         ?,
+        ?, ?, ?, ?,
+        ?, ?,
+        ?,
+        ?, ?,
+        ?, ?,
         ?, ?
     );
 """
@@ -104,16 +95,13 @@ class SilverBambooHRWriter:
 
     def _make_params(self, emp: dict) -> tuple:
         vals = (
-            emp["employee_number"], emp["first_name"], emp["last_name"], emp["display_name"],
-            emp["work_email"], emp["personal_email"],
+            emp["employee_number"], emp["first_name"], emp["last_name"],
+            emp["work_email"],
             emp["job_title"], emp["department"], emp["division"], emp["location"],
             emp["manager_id"], emp["manager_name"],
-            emp["employment_status"], emp["hire_date"], emp["termination_date"],
-            emp["work_phone"], emp["work_phone_ext"], emp["mobile_phone"],
-            emp["cost_center"], emp["pay_group"], emp["flsa_code"],
-            emp["gender"], emp["nationality"], emp["marital_status"], emp["date_of_birth"],
-            emp["address1"], emp["city"], emp["state"], emp["country"], emp["zip_code"],
-            emp["photo_url"],
+            emp["hire_date"],
+            emp["work_phone"], emp["work_phone_ext"],
+            emp["address1"], emp["city"],
             emp["bronze_id"], emp["sync_run_id"],
         )
         return (emp["source_id"], *vals, emp["source_id"], *vals)
