@@ -1,5 +1,5 @@
 """
-Sync Xero invoices from all stored tenants into bronze/silver.
+Sync Xero accounts and invoices from all stored tenants into bronze/silver.
 
 Usage:
   python scripts/python_scripts/xero_sync_invoices.py

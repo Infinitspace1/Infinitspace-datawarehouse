@@ -4,10 +4,12 @@ shared/xero/invoice_sync.py
 Warehouse sync for Xero invoices across all stored tenants on a connection.
 
 Data model:
+  - bronze.xero_accounts: raw account payloads
   - bronze.xero_invoices: raw invoice payloads
+  - silver.xero_accounts: typed account rows
   - silver.xero_invoices: typed invoice rows
   - silver.xero_invoice_line_items: typed invoice line items
-  - bronze.xero_invoice_pdfs: optional cached PDF bytes
+  - bronze.xero_invoice_pdfs: optional cached PDF metadata/blob paths
 """
 from __future__ import annotations
 
@@ -19,6 +21,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
+
+import requests
 
 from shared.azure_clients.blob_writer import BlobWriter
 from shared.xero.client import XeroApiClient
@@ -37,6 +41,9 @@ class XeroInvoiceSyncStats:
     tenant_count: int = 0
     tenant_ids_processed: list[str] = None
     incremental_since_utc: Optional[str] = None
+    account_rows_created: int = 0
+    account_rows_updated: int = 0
+    account_count_seen: int = 0
     invoice_rows_created: int = 0
     invoice_rows_updated: int = 0
     bronze_rows_created: int = 0
@@ -44,11 +51,14 @@ class XeroInvoiceSyncStats:
     line_item_rows_written: int = 0
     pdf_rows_cached: int = 0
     invoice_count_seen: int = 0
+    account_sync_skipped_tenant_ids: list[str] = None
     failed_tenant_ids: list[str] = None
 
     def __post_init__(self) -> None:
         if self.tenant_ids_processed is None:
             self.tenant_ids_processed = []
+        if self.account_sync_skipped_tenant_ids is None:
+            self.account_sync_skipped_tenant_ids = []
         if self.failed_tenant_ids is None:
             self.failed_tenant_ids = []
 
@@ -106,6 +116,12 @@ def _invoice_contact(invoice: dict[str, Any]) -> tuple[Optional[str], Optional[s
     if not isinstance(contact, dict):
         return None, None
     return _to_text(contact.get("ContactID")), _to_text(contact.get("Name"))
+
+
+def _account_label(account_code: Optional[str], account_name: Optional[str]) -> Optional[str]:
+    if account_code and account_name:
+        return f"{account_code} - {account_name}"
+    return account_name or account_code
 
 
 class XeroInvoiceSyncService:
@@ -420,6 +436,13 @@ class XeroInvoiceSyncService:
             stats.incremental_since_utc = if_modified_since.isoformat()
 
         self.store.mark_invoice_sync_started(connection_id=connection_id, tenant_id=tenant_id)
+        self._sync_tenant_accounts(
+            client=client,
+            sync_run_id=sync_run_id,
+            connection_id=connection_id,
+            tenant_id=tenant_id,
+            stats=stats,
+        )
         latest_modified_utc = tenant_state.get("last_invoice_modified_utc") if tenant_state else None
         if isinstance(latest_modified_utc, datetime) and latest_modified_utc.tzinfo is None:
             latest_modified_utc = latest_modified_utc.replace(tzinfo=timezone.utc)
@@ -527,6 +550,61 @@ class XeroInvoiceSyncService:
 
             page += 1
 
+    def _sync_tenant_accounts(
+        self,
+        client: XeroApiClient,
+        sync_run_id: str,
+        connection_id: int,
+        tenant_id: str,
+        stats: XeroInvoiceSyncStats,
+    ) -> None:
+        try:
+            payload = client.get_accounts(tenant_id=tenant_id)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in {401, 403}:
+                stats.account_sync_skipped_tenant_ids.append(tenant_id)
+                logger.warning(
+                    "Skipping Xero accounts sync because the connection is missing settings scope or access",
+                    extra={"xero_connection_id": connection_id, "xero_tenant_id": tenant_id, "status_code": status},
+                )
+                return
+            raise
+
+        accounts = payload.get("Accounts", []) if isinstance(payload, dict) else []
+        if not accounts:
+            return
+
+        with self.sql.get_connection() as conn:
+            cursor = conn.cursor()
+            for account in accounts:
+                account_id = _to_text(account.get("AccountID"))
+                if not account_id:
+                    continue
+
+                bronze_id, bronze_action = self._upsert_bronze_account(
+                    cursor=cursor,
+                    sync_run_id=sync_run_id,
+                    connection_id=connection_id,
+                    tenant_id=tenant_id,
+                    account_id=account_id,
+                    account=account,
+                )
+                if bronze_action == "INSERT":
+                    stats.account_rows_created += 1
+                else:
+                    stats.account_rows_updated += 1
+
+                self._upsert_silver_account(
+                    cursor=cursor,
+                    sync_run_id=sync_run_id,
+                    bronze_id=bronze_id,
+                    connection_id=connection_id,
+                    tenant_id=tenant_id,
+                    account=account,
+                )
+                stats.account_count_seen += 1
+
     def _resolve_if_modified_since(
         self,
         tenant_state: Optional[dict[str, Any]],
@@ -617,6 +695,141 @@ class XeroInvoiceSyncService:
         )
         action, bronze_id = cursor.fetchone()
         return int(bronze_id), str(action)
+
+    def _upsert_bronze_account(
+        self,
+        cursor,
+        sync_run_id: str,
+        connection_id: int,
+        tenant_id: str,
+        account_id: str,
+        account: dict[str, Any],
+    ) -> tuple[int, str]:
+        cursor.execute(
+            """
+            MERGE bronze.xero_accounts AS target
+            USING (SELECT ? AS xero_tenant_id, ? AS source_id) AS source
+                ON target.xero_tenant_id = source.xero_tenant_id
+               AND target.source_id = source.source_id
+            WHEN MATCHED THEN UPDATE SET
+                sync_run_id = ?,
+                xero_connection_id = ?,
+                raw_json = ?,
+                synced_at = GETUTCDATE()
+            WHEN NOT MATCHED THEN INSERT (
+                sync_run_id,
+                xero_connection_id,
+                xero_tenant_id,
+                source_id,
+                raw_json
+            ) VALUES (?, ?, ?, ?, ?)
+            OUTPUT $action, inserted.id;
+            """,
+            (
+                tenant_id,
+                account_id,
+                sync_run_id,
+                connection_id,
+                json.dumps(account, default=str, ensure_ascii=False),
+                sync_run_id,
+                connection_id,
+                tenant_id,
+                account_id,
+                json.dumps(account, default=str, ensure_ascii=False),
+            ),
+        )
+        action, bronze_id = cursor.fetchone()
+        return int(bronze_id), str(action)
+
+    def _upsert_silver_account(
+        self,
+        cursor,
+        sync_run_id: str,
+        bronze_id: int,
+        connection_id: int,
+        tenant_id: str,
+        account: dict[str, Any],
+    ) -> str:
+        account_id = _to_text(account.get("AccountID"))
+        account_code = _to_text(account.get("Code"))
+        account_name = _to_text(account.get("Name"))
+        cursor.execute(
+            """
+            MERGE silver.xero_accounts AS target
+            USING (SELECT ? AS xero_tenant_id, ? AS source_id) AS source
+                ON target.xero_tenant_id = source.xero_tenant_id
+               AND target.source_id = source.source_id
+            WHEN MATCHED THEN UPDATE SET
+                bronze_id = ?,
+                sync_run_id = ?,
+                xero_connection_id = ?,
+                account_code = ?,
+                account_name = ?,
+                account_label = ?,
+                account_type = ?,
+                account_class = ?,
+                status = ?,
+                description = ?,
+                tax_type = ?,
+                enable_payments_to_account = ?,
+                show_in_expense_claims = ?,
+                last_synced_at = GETUTCDATE()
+            WHEN NOT MATCHED THEN INSERT (
+                bronze_id,
+                sync_run_id,
+                xero_connection_id,
+                xero_tenant_id,
+                source_id,
+                account_code,
+                account_name,
+                account_label,
+                account_type,
+                account_class,
+                status,
+                description,
+                tax_type,
+                enable_payments_to_account,
+                show_in_expense_claims
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            OUTPUT $action;
+            """,
+            (
+                tenant_id,
+                account_id,
+                bronze_id,
+                sync_run_id,
+                connection_id,
+                account_code,
+                account_name,
+                _account_label(account_code, account_name),
+                _to_text(account.get("Type")),
+                _to_text(account.get("Class")),
+                _to_text(account.get("Status")),
+                _to_text(account.get("Description")),
+                _to_text(account.get("TaxType")),
+                bool(account.get("EnablePaymentsToAccount", False)),
+                bool(account.get("ShowInExpenseClaims", False)),
+                bronze_id,
+                sync_run_id,
+                connection_id,
+                tenant_id,
+                account_id,
+                account_code,
+                account_name,
+                _account_label(account_code, account_name),
+                _to_text(account.get("Type")),
+                _to_text(account.get("Class")),
+                _to_text(account.get("Status")),
+                _to_text(account.get("Description")),
+                _to_text(account.get("TaxType")),
+                bool(account.get("EnablePaymentsToAccount", False)),
+                bool(account.get("ShowInExpenseClaims", False)),
+            ),
+        )
+        row = cursor.fetchone()
+        return str(row[0])
 
     def _upsert_silver_invoice(
         self,
@@ -793,6 +1006,7 @@ class XeroInvoiceSyncService:
                     index,
                     _to_text(item.get("Description")),
                     _to_text(item.get("ItemCode")),
+                    _to_text(item.get("AccountID")),
                     _to_text(item.get("AccountCode")),
                     _to_text(item.get("TaxType")),
                     json.dumps(item.get("Tracking"), default=str, ensure_ascii=False)
@@ -816,6 +1030,7 @@ class XeroInvoiceSyncService:
                     line_item_index,
                     description,
                     item_code,
+                    account_id,
                     account_code,
                     tax_type,
                     tracking_json,
@@ -825,7 +1040,7 @@ class XeroInvoiceSyncService:
                     tax_amount,
                     discount_rate,
                     raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )

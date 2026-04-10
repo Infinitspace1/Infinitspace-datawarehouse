@@ -307,3 +307,40 @@ SELECT TOP 10 * FROM silver.xero_invoice_line_items
 
 SELECT * FROM silver.xero_invoices
 WHERE invoice_number = 'C29-INV-2025.07-0001'
+
+SELECT TOP 20
+    g.xero_tenant_id,
+    g.xero_invoice_source_id,
+    g.tenant_name,
+    g.invoice_number,
+    g.contact_name,
+    g.amount_due,
+    g.workflow_type
+FROM gold.finance_dashboard_invoice_worklist g
+WHERE g.workflow_type = 'recurrent'
+ORDER BY g.due_date, g.invoice_number;
+
+
+
+SELECT
+    g.tenant_name,
+    g.invoice_number,
+    g.workflow_type,
+    li.line_item_index,
+    li.description,
+    li.account_code,
+    acc.account_name,
+    acc.account_label
+FROM gold.finance_dashboard_invoice_worklist g
+JOIN silver.xero_invoice_line_items li
+    ON li.xero_tenant_id = g.xero_tenant_id
+   AND li.invoice_source_id = g.xero_invoice_source_id
+LEFT JOIN silver.xero_accounts acc
+    ON acc.xero_tenant_id = li.xero_tenant_id
+   AND (
+        acc.source_id = li.account_id
+        OR (li.account_id IS NULL AND acc.account_code = li.account_code)
+   )
+WHERE g.xero_tenant_id = '09777773-0b7d-4c7e-b73c-26e49f067e21'
+  AND g.xero_invoice_source_id = '63ee7033-8824-46d0-bc4e-04b08dcd6947'
+ORDER BY li.line_item_index;

@@ -48,7 +48,10 @@ class XeroOAuthService:
         self.client_id = client_id or os.getenv("XERO_CLIENT_ID")
         self.client_secret = client_secret or os.getenv("XERO_CLIENT_SECRET")
         self.redirect_uri = redirect_uri or os.getenv("XERO_REDIRECT_URI")
-        self.scopes = scopes or os.getenv("XERO_SCOPES", "offline_access accounting.transactions accounting.contacts")
+        self.scopes = scopes or os.getenv(
+            "XERO_SCOPES",
+            "offline_access accounting.transactions accounting.contacts accounting.settings.read",
+        )
         self.timeout_seconds = timeout_seconds
         self.leeway_seconds = leeway_seconds
         self._validate_config()
