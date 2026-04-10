@@ -13,6 +13,74 @@ from shared.nexudus.transformers.products import transform_product
 
 logger = logging.getLogger(__name__)
 
+_MERGE_SQL = """
+    MERGE silver.nexudus_products AS target
+    USING (SELECT ? AS source_id) AS source
+        ON target.source_id = source.source_id
+    WHEN MATCHED THEN UPDATE SET
+        bronze_id = ?, sync_run_id = ?,
+        item_type = ?, product_type_label = ?,
+        location_source_id = ?, location_name = ?, floor_plan_id = ?, floor_plan_name = ?,
+        name = ?, area_code = ?,
+        price = ?, currency_code = ?,
+        is_available = ?, available_from = ?, available_to = ?,
+        coworker_id = ?, coworker_name = ?, coworker_company = ?,
+        coworker_email = ?, contract_ids_raw = ?,
+        size_sqm = ?, custom_size_sqm = ?, capacity = ?, size_is_linked_to_area = ?,
+        resource_id = ?, resource_name = ?, resource_type_name = ?,
+        resource_allocation = ?, resource_shifts = ?,
+        amenity_air_conditioning = ?, amenity_heating = ?, amenity_internet = ?,
+        amenity_large_display = ?, amenity_natural_light = ?, amenity_whiteboard = ?,
+        amenity_soundproof = ?, amenity_quiet_zone = ?, amenity_tea_coffee = ?,
+        amenity_security_lock = ?, amenity_cctv = ?, amenity_catering = ?,
+        amenity_conference_phone = ?, amenity_projector = ?, amenity_standing_desk = ?,
+        amenity_drinks = ?, amenity_privacy_screen = ?, amenity_voice_recorder = ?,
+        amenity_standard_phone = ?, amenity_wireless_charger = ?,
+        created_on = ?, updated_on = ?,
+        last_synced_at = GETUTCDATE()
+    WHEN NOT MATCHED THEN INSERT (
+        source_id, bronze_id, sync_run_id,
+        item_type, product_type_label,
+        location_source_id, location_name, floor_plan_id, floor_plan_name,
+        name, area_code,
+        price, currency_code,
+        is_available, available_from, available_to,
+        coworker_id, coworker_name, coworker_company,
+        coworker_email, contract_ids_raw,
+        size_sqm, custom_size_sqm, capacity, size_is_linked_to_area,
+        resource_id, resource_name, resource_type_name,
+        resource_allocation, resource_shifts,
+        amenity_air_conditioning, amenity_heating, amenity_internet,
+        amenity_large_display, amenity_natural_light, amenity_whiteboard,
+        amenity_soundproof, amenity_quiet_zone, amenity_tea_coffee,
+        amenity_security_lock, amenity_cctv, amenity_catering,
+        amenity_conference_phone, amenity_projector, amenity_standing_desk,
+        amenity_drinks, amenity_privacy_screen, amenity_voice_recorder,
+        amenity_standard_phone, amenity_wireless_charger,
+        created_on, updated_on
+    ) VALUES (
+        ?, ?, ?,
+        ?, ?,
+        ?, ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?, ?
+    );
+"""
+
 
 class SilverProductsWriter:
 
@@ -24,19 +92,23 @@ class SilverProductsWriter:
         rows = self._load_latest_bronze()
         logger.info(f"Loaded {len(rows)} bronze product records")
 
-        ok = errors = 0
+        params_list = []
+        errors = 0
         for row in rows:
             raw = json.loads(row["raw_json"])
             try:
                 p = transform_product(raw, row["id"], self.sync_run_id)
                 if p["location_source_id"] in {1376491116, 1376491117}:
                     continue    # skip beyond Global products
-                self._upsert(p)
-                ok += 1
+                params_list.append(self._make_params(p))
             except Exception as e:
                 logger.warning(f"Failed source_id={raw.get('Id')}: {e}")
                 errors += 1
 
+        if params_list:
+            self.sql.execute_many(_MERGE_SQL, params_list)
+
+        ok = len(params_list)
         logger.info(f"Silver products: {ok} upserted, {errors} errors")
         return {"products": ok, "errors": errors}
 
@@ -52,30 +124,7 @@ class SilverProductsWriter:
                     AND b.synced_at  = latest.latest
         """)
 
-    def _upsert(self, p: dict):
-        cols_update = """
-            bronze_id = ?, sync_run_id = ?,
-            item_type = ?, product_type_label = ?,
-            location_source_id = ?, location_name = ?, floor_plan_id = ?, floor_plan_name = ?,
-            name = ?, area_code = ?,
-            price = ?, currency_code = ?,
-            is_available = ?, available_from = ?, available_to = ?,
-            coworker_id = ?, coworker_name = ?, coworker_company = ?,
-            coworker_email = ?, contract_ids_raw = ?,
-            size_sqm = ?, custom_size_sqm = ?, capacity = ?, size_is_linked_to_area = ?,
-            resource_id = ?, resource_name = ?, resource_type_name = ?,
-            resource_allocation = ?, resource_shifts = ?,
-            amenity_air_conditioning = ?, amenity_heating = ?, amenity_internet = ?,
-            amenity_large_display = ?, amenity_natural_light = ?, amenity_whiteboard = ?,
-            amenity_soundproof = ?, amenity_quiet_zone = ?, amenity_tea_coffee = ?,
-            amenity_security_lock = ?, amenity_cctv = ?, amenity_catering = ?,
-            amenity_conference_phone = ?, amenity_projector = ?, amenity_standing_desk = ?,
-            amenity_drinks = ?, amenity_privacy_screen = ?, amenity_voice_recorder = ?,
-            amenity_standard_phone = ?, amenity_wireless_charger = ?,
-            created_on = ?, updated_on = ?,
-            last_synced_at = GETUTCDATE()
-        """
-
+    def _make_params(self, p: dict) -> tuple:
         vals = (
             p["bronze_id"],         p["sync_run_id"],
             p["item_type"],         p["product_type_label"],
@@ -99,51 +148,4 @@ class SilverProductsWriter:
             p["amenity_standard_phone"],   p["amenity_wireless_charger"],
             p["created_on"],        p["updated_on"],
         )
-
-        self.sql.execute_non_query(f"""
-            MERGE silver.nexudus_products AS target
-            USING (SELECT ? AS source_id) AS source
-                ON target.source_id = source.source_id
-            WHEN MATCHED THEN UPDATE SET {cols_update}
-            WHEN NOT MATCHED THEN INSERT (
-                source_id, bronze_id, sync_run_id,
-                item_type, product_type_label,
-                location_source_id, location_name, floor_plan_id, floor_plan_name,
-                name, area_code,
-                price, currency_code,
-                is_available, available_from, available_to,
-                coworker_id, coworker_name, coworker_company,
-                coworker_email, contract_ids_raw,
-                size_sqm, custom_size_sqm, capacity, size_is_linked_to_area,
-                resource_id, resource_name, resource_type_name,
-                resource_allocation, resource_shifts,
-                amenity_air_conditioning, amenity_heating, amenity_internet,
-                amenity_large_display, amenity_natural_light, amenity_whiteboard,
-                amenity_soundproof, amenity_quiet_zone, amenity_tea_coffee,
-                amenity_security_lock, amenity_cctv, amenity_catering,
-                amenity_conference_phone, amenity_projector, amenity_standing_desk,
-                amenity_drinks, amenity_privacy_screen, amenity_voice_recorder,
-                amenity_standard_phone, amenity_wireless_charger,
-                created_on, updated_on
-            ) VALUES (
-                ?, ?, ?,
-                ?, ?,
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?,
-                ?, ?
-            );
-        """, (p["source_id"], *vals, p["source_id"], *vals))
+        return (p["source_id"], *vals, p["source_id"], *vals)

@@ -38,6 +38,8 @@ import azure.functions as func
 from shared.azure_clients.silver_write_locations import SilverLocationsWriter
 from shared.azure_clients.silver_writer_products import SilverProductsWriter
 from shared.azure_clients.silver_writer_contracts import SilverContractsWriter
+from shared.azure_clients.silver_writer_coworker_invoices import SilverCoworkerInvoicesWriter
+from shared.azure_clients.silver_writer_coworkers import SilverCoworkersWriter
 from shared.azure_clients.silver_writer_resources import SilverResourcesWriter
 from shared.azure_clients.silver_writer_extra_services import SilverExtraServicesWriter
 from shared.azure_clients.run_tracker import RunTracker
@@ -62,6 +64,14 @@ _ENTITY_MAP = {
     "contracts": (
         SilverContractsWriter,
         lambda r: r.get("contracts", 0),
+    ),
+    "coworker_invoices": (
+        SilverCoworkerInvoicesWriter,
+        lambda r: r.get("coworker_invoices", 0),
+    ),
+    "coworkers": (
+        SilverCoworkersWriter,
+        lambda r: r.get("coworkers", 0),
     ),
     "resources": (
         SilverResourcesWriter,

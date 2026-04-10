@@ -284,6 +284,33 @@ class TestXeroIntegration(unittest.TestCase):
         self.assertEqual(mock_request.call_args.kwargs["params"]["page"], 3)
         self.assertEqual(mock_request.call_args.kwargs["headers"]["xero-tenant-id"], "tenant-alt")
 
+    def test_get_accounts_uses_accounts_endpoint(self):
+        oauth = FakeOAuth()
+        store = FakeStore()
+        store._connection = StoredXeroConnection(
+            id=1,
+            owner_type="workspace",
+            owner_id="default",
+            xero_user_id="xero-user-1",
+            access_token="access-ok",
+            refresh_token="refresh-ok",
+            id_token=None,
+            scope="offline_access accounting.contacts accounting.invoices accounting.settings.read",
+            token_type="Bearer",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=60),
+            selected_xero_tenant_id="tenant-xyz",
+            is_connected=True,
+            last_error=None,
+        )
+        client = XeroApiClient(store=store, oauth_service=oauth)
+
+        with patch("shared.xero.client.requests.request") as mock_request:
+            mock_request.return_value = FakeResponse(payload={"Accounts": []})
+            client.get_accounts(tenant_id="tenant-alt")
+
+        self.assertIn("/api.xro/2.0/Accounts", mock_request.call_args.kwargs["url"])
+        self.assertEqual(mock_request.call_args.kwargs["headers"]["xero-tenant-id"], "tenant-alt")
+
     def test_get_invoice_pdf_requests_pdf_accept_header(self):
         oauth = FakeOAuth()
         store = FakeStore()

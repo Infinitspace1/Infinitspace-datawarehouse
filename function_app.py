@@ -35,7 +35,9 @@ app = func.FunctionApp()
 
 if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     from functions.ava_refresh import bp as ava_bp
+    from functions.bamboohr_sync import bp as bamboohr_bp
     from functions.bronze_nexudus import bp as bronze_bp
+    from functions.finance_dashboard_refresh import bp as finance_dashboard_bp
     from functions.silver_nexudus import bp as silver_bp
     from functions.silver_worker import bp as silver_worker_bp
     from functions.xero_sync import bp as xero_sync_bp
@@ -45,6 +47,8 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     app.register_functions(silver_worker_bp)
     app.register_functions(ava_bp)
     app.register_functions(xero_sync_bp)
+    app.register_functions(bamboohr_bp)
+    app.register_functions(finance_dashboard_bp)
 
 
 if _env_flag("ENABLE_ADMIN_FUNCTIONS", False):

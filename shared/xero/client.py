@@ -48,6 +48,16 @@ class XeroApiClient:
             params=params,
         )
 
+    def get_accounts(
+        self,
+        tenant_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return self.request(
+            method="GET",
+            path="/api.xro/2.0/Accounts",
+            tenant_id=tenant_id,
+        )
+
     def get_invoice(
         self,
         invoice_id: str,

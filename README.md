@@ -7,7 +7,7 @@ This project runs scheduled Azure Functions that ingest operational data into Az
 - `bronze`: raw source payloads
 - `silver`: typed and normalized entities
 - `ava`: denormalized product availability for downstream use
-- `core`: planned, not implemented yet
+- `gold`: production tables for downstream applications
 
 ## Current Pipelines
 
@@ -16,7 +16,7 @@ This project runs scheduled Azure Functions that ingest operational data into Az
 - `nexudus_to_bronze`
   - Timer trigger
   - Default schedule: `02:00 UTC`
-  - Fetches `locations`, `products`, `contracts`, `resources`, `extra_services`
+  - Fetches `locations`, `products`, `contracts`, `coworker_invoices`, `coworkers`, `resources`, `extra_services`
   - Writes raw rows to `bronze.nexudus_*`
   - Writes JSON snapshots to blob storage
 
@@ -42,12 +42,33 @@ This project runs scheduled Azure Functions that ingest operational data into Az
   - Timer trigger
   - Default schedule: `04:00 UTC`
   - Reads all stored Xero tenants for the default connection
+  - Writes raw accounts to `bronze.xero_accounts`
   - Writes raw invoices to `bronze.xero_invoices`
+  - Writes typed accounts to `silver.xero_accounts`
   - Writes typed invoices to `silver.xero_invoices`
   - Writes line items to `silver.xero_invoice_line_items`
   - Refreshes the Xero tenant directory in `silver.xero_tenants`
   - Exposes the same directory through `xero.silver_tenants`
   - Optionally caches PDFs in `bronze.xero_invoice_pdfs`
+
+- `refresh_finance_dashboard`
+  - Timer trigger
+  - Default schedule: `05:30 UTC`
+  - Runs `gold.sp_refresh_finance_dashboard`
+  - Rebuilds `gold.finance_dashboard_invoice_worklist`
+  - Rebuilds `gold.finance_dashboard_user_access`
+
+### Gold Production Tables
+
+- `gold.finance_dashboard_user_access`
+  - Maps BambooHR CM / ACM users to accessible Nexudus locations and Xero tenants
+  - Encodes the Amsterdam shared-access rule for Republica, Herengracht, and Zuidtoren
+
+- `gold.finance_dashboard_invoice_worklist`
+  - Exposes unpaid Nexudus-backed Xero invoices for the finance dashboard website
+  - Resolves company email from Nexudus billing/customer data when available
+  - Classifies invoices into `recurrent` or `one_off`
+  - Uses synced Xero account metadata, with manual overrides in `meta.finance_dashboard_xero_account_map`
 
 ## Function App Model
 
@@ -118,6 +139,7 @@ Minimum local configuration:
 - `XERO_CLIENT_ID`
 - `XERO_CLIENT_SECRET`
 - `XERO_REDIRECT_URI`
+- `XERO_SCOPES`
 - `INTEGRATIONS_ENCRYPTION_KEY`
 
 For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settings.json`.
@@ -131,6 +153,9 @@ For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settin
 .\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step sql
 .\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step all --dry-run --limit 20
 .\venv\Scripts\python.exe scripts\python_scripts\test_local.py --step all --limit 50
+.\venv\Scripts\python.exe scripts\python_scripts\sync_nexudus_billing.py --dry-run --limit 50
+.\venv\Scripts\python.exe scripts\python_scripts\sync_nexudus_billing.py
+.\venv\Scripts\python.exe scripts\python_scripts\xero_nexudus_link_audit.py --limit 100 --show-unmatched
 ```
 
 ### Nexudus Silver
@@ -156,7 +181,7 @@ For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settin
 ### Unit Tests
 
 ```powershell
-.\venv\Scripts\python.exe -m unittest tests.test_xero_integration tests.test_xero_tenant_directory
+.\venv\Scripts\python.exe -m unittest tests.test_xero_integration tests.test_xero_tenant_directory tests.test_xero_nexudus_invoice_linking
 ```
 
 ## Xero Auth and Refresh
@@ -166,10 +191,13 @@ The supported production path is DB-backed, not `.env` refresh-token rotation:
 - OAuth state is stored in `meta.xero_oauth_states`
 - Encrypted tokens are stored in `meta.xero_connections`
 - Tenant metadata and sync watermarks are stored in `meta.xero_tenants`
+- Account metadata is stored in `silver.xero_accounts`
 - Tenant-to-location directory rows are stored in `silver.xero_tenants`
 - `xero.silver_tenants` is a view alias for the same directory
 - Automatic refresh happens in `shared/xero/client.py`
 - If Xero returns `invalid_grant`, the connection is marked disconnected
+
+Recommended Xero scopes now include `accounting.settings.read` so the sync can read account names for finance-dashboard classification. Existing connections without that scope will continue syncing invoices, but account sync will be skipped until the app is re-authorized.
 
 Recommended verification:
 
@@ -225,6 +253,14 @@ Default UTC order:
 3. queue fanout via `silver_entity_worker`
 4. `03:00` `refresh_ava_availability`
 5. `04:00` `xero_invoice_sync`
+6. `05:00` `bamboohr_sync`
+7. `05:30` `refresh_finance_dashboard`
+
+Suggested reminder flow after this extension:
+
+1. Nexudus bronze/silver lands `coworker_invoices` and `coworkers`
+2. Xero sync refreshes `silver.xero_invoices`
+3. Query `silver.xero_overdue_invoice_contacts` for reminder-ready rows
 
 Important:
 
@@ -300,10 +336,11 @@ ORDER BY tenant_name;
 - Nexudus silver pipeline: done
 - AVA refresh pipeline: done
 - Xero OAuth, token refresh, tenant storage, and invoice sync: done
+- Xero accounts sync: done
 - Xero tenant-to-location directory: done
 - Optional admin HTTP routes: done, but not part of the default ETL app
 - Google Maps enrichment utilities: present, not part of the scheduled ETL app
-- Core layer population: not implemented
+- Gold finance dashboard tables: done
 
 ## Key Docs
 

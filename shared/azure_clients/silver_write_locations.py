@@ -15,6 +15,68 @@ from shared.nexudus.transformers.locations import transform_location, transform_
 
 logger = logging.getLogger(__name__)
 
+_LOCATIONS_SQL = """
+    MERGE silver.nexudus_locations AS target
+    USING (SELECT ? AS source_id) AS source
+        ON target.source_id = source.source_id
+    WHEN MATCHED THEN UPDATE SET
+        bronze_id     = ?,
+        sync_run_id   = ?,
+        nexudus_uuid  = ?,
+        name          = ?,
+        web_address   = ?,
+        address       = ?,
+        postal_code   = ?,
+        city          = ?,
+        state         = ?,
+        country_name  = ?,
+        country_id    = ?,
+        latitude      = ?,
+        longitude     = ?,
+        phone         = ?,
+        email         = ?,
+        web_contact   = ?,
+        currency_code = ?,
+        description   = ?,
+        short_intro   = ?,
+        created_on    = ?,
+        updated_on    = ?,
+        last_synced_at = GETUTCDATE()
+    WHEN NOT MATCHED THEN INSERT (
+        source_id, bronze_id, sync_run_id,
+        nexudus_uuid, name, web_address,
+        address, postal_code, city, state,
+        country_name, country_id, latitude, longitude,
+        phone, email, web_contact, currency_code,
+        description, short_intro, created_on, updated_on
+    ) VALUES (
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?
+    );
+"""
+
+_HOURS_SQL = """
+    MERGE silver.nexudus_location_hours AS target
+    USING (
+        SELECT ? AS location_source_id, ? AS day_of_week
+    ) AS source
+        ON target.location_source_id = source.location_source_id
+       AND target.day_of_week        = source.day_of_week
+    WHEN MATCHED THEN UPDATE SET
+        is_closed      = ?,
+        open_time      = ?,
+        close_time     = ?,
+        last_synced_at = GETUTCDATE()
+    WHEN NOT MATCHED THEN INSERT (
+        location_source_id, day_of_week, day_name,
+        is_closed, open_time, close_time
+    ) VALUES (?, ?, ?, ?, ?, ?);
+"""
+
 
 class SilverLocationsWriter:
 
@@ -30,8 +92,8 @@ class SilverLocationsWriter:
         bronze_rows = self._load_latest_bronze()
         logger.info(f"Loaded {len(bronze_rows)} bronze location records")
 
-        loc_count = 0
-        hours_count = 0
+        loc_params = []
+        hours_params = []
 
         for row in bronze_rows:
             bronze_id = row["id"]
@@ -42,8 +104,7 @@ class SilverLocationsWriter:
                 if loc is None:
                     logger.debug(f"Skipping excluded location source_id={raw.get('Id')}")
                     continue
-                self._upsert_location(loc)
-                loc_count += 1
+                loc_params.append(self._make_loc_params(loc))
             except Exception as e:
                 logger.warning(f"Location transform failed for bronze_id={bronze_id}: {e}")
                 continue
@@ -52,11 +113,17 @@ class SilverLocationsWriter:
                 hours_rows = transform_location_hours(raw)
                 if hours_rows is not None:
                     for h in hours_rows:
-                        self._upsert_hours(h)
-                    hours_count += len(hours_rows)
+                        hours_params.append(self._make_hours_params(h))
             except Exception as e:
                 logger.warning(f"Hours transform failed for source_id={raw.get('Id')}: {e}")
 
+        if loc_params:
+            self.sql.execute_many(_LOCATIONS_SQL, loc_params)
+        if hours_params:
+            self.sql.execute_many(_HOURS_SQL, hours_params)
+
+        loc_count = len(loc_params)
+        hours_count = len(hours_params)
         logger.info(f"Silver upserted: {loc_count} locations, {hours_count} hours rows")
         return {"locations": loc_count, "location_hours": hours_count}
 
@@ -78,55 +145,10 @@ class SilverLocationsWriter:
                     AND b.synced_at = latest.latest
         """)
 
-    # ── Upserts ───────────────────────────────────────────────
+    # ── Param builders ────────────────────────────────────────
 
-    def _upsert_location(self, loc: dict):
-        self.sql.execute_non_query("""
-            MERGE silver.nexudus_locations AS target
-            USING (SELECT ? AS source_id) AS source
-                ON target.source_id = source.source_id
-            WHEN MATCHED THEN UPDATE SET
-                bronze_id     = ?,
-                sync_run_id   = ?,
-                nexudus_uuid  = ?,
-                name          = ?,
-                web_address   = ?,
-                address       = ?,
-                postal_code   = ?,
-                city          = ?,
-                state         = ?,
-                country_name  = ?,
-                country_id    = ?,
-                latitude      = ?,
-                longitude     = ?,
-                phone         = ?,
-                email         = ?,
-                web_contact   = ?,
-                currency_code = ?,
-                description   = ?,
-                short_intro   = ?,
-                created_on    = ?,
-                updated_on    = ?,
-                last_synced_at = GETUTCDATE()
-            WHEN NOT MATCHED THEN INSERT (
-                source_id, bronze_id, sync_run_id,
-                nexudus_uuid, name, web_address,
-                address, postal_code, city, state,
-                country_name, country_id, latitude, longitude,
-                phone, email, web_contact, currency_code,
-                description, short_intro, created_on, updated_on
-            ) VALUES (
-                ?, ?, ?,
-                ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?,
-                ?, ?, ?, ?
-            );
-        """, (
-            # USING clause
-            loc["source_id"],
-            # UPDATE SET
+    def _make_loc_params(self, loc: dict) -> tuple:
+        vals = (
             loc["bronze_id"],   loc["sync_run_id"],
             loc["nexudus_uuid"], loc["name"],       loc["web_address"],
             loc["address"],     loc["postal_code"], loc["city"],    loc["state"],
@@ -135,35 +157,11 @@ class SilverLocationsWriter:
             loc["currency_code"],
             loc["description"], loc["short_intro"],
             loc["created_on"],  loc["updated_on"],
-            # INSERT VALUES
-            loc["source_id"],   loc["bronze_id"],   loc["sync_run_id"],
-            loc["nexudus_uuid"],loc["name"],         loc["web_address"],
-            loc["address"],     loc["postal_code"],  loc["city"],    loc["state"],
-            loc["country_name"],loc["country_id"],   loc["latitude"],loc["longitude"],
-            loc["phone"],       loc["email"],        loc["web_contact"],
-            loc["currency_code"],
-            loc["description"], loc["short_intro"],
-            loc["created_on"],  loc["updated_on"],
-        ))
+        )
+        return (loc["source_id"], *vals, loc["source_id"], *vals)
 
-    def _upsert_hours(self, h: dict):
-        self.sql.execute_non_query("""
-            MERGE silver.nexudus_location_hours AS target
-            USING (
-                SELECT ? AS location_source_id, ? AS day_of_week
-            ) AS source
-                ON target.location_source_id = source.location_source_id
-               AND target.day_of_week        = source.day_of_week
-            WHEN MATCHED THEN UPDATE SET
-                is_closed      = ?,
-                open_time      = ?,
-                close_time     = ?,
-                last_synced_at = GETUTCDATE()
-            WHEN NOT MATCHED THEN INSERT (
-                location_source_id, day_of_week, day_name,
-                is_closed, open_time, close_time
-            ) VALUES (?, ?, ?, ?, ?, ?);
-        """, (
+    def _make_hours_params(self, h: dict) -> tuple:
+        return (
             # USING
             h["location_source_id"], h["day_of_week"],
             # UPDATE
@@ -171,4 +169,4 @@ class SilverLocationsWriter:
             # INSERT
             h["location_source_id"], h["day_of_week"], h["day_name"],
             h["is_closed"], h["open_time"], h["close_time"],
-        ))
+        )

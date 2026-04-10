@@ -39,6 +39,8 @@ ENTITIES = [
     "locations",
     "products",
     "contracts",
+    "coworker_invoices",
+    "coworkers",
     "resources",
     "extra_services",
 ]

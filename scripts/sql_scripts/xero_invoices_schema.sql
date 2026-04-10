@@ -1,13 +1,56 @@
 -- =============================================================================
 -- xero_invoices_schema.sql
 --
--- Creates the bronze and silver tables for Xero invoice sync.
+-- Creates the bronze and silver tables for Xero accounting sync.
 --
---   bronze.xero_invoices            Raw invoice payloads (upsert on tenant+source_id)
---   silver.xero_invoices            Typed invoice rows (upsert on tenant+source_id)
---   silver.xero_invoice_line_items  Line items (DELETE + INSERT per invoice)
---   bronze.xero_invoice_pdfs        Cached PDF bytes (upsert on tenant+invoice_source_id)
+--   bronze.xero_accounts           Raw account payloads (upsert on tenant+source_id)
+--   bronze.xero_invoices           Raw invoice payloads (upsert on tenant+source_id)
+--   silver.xero_accounts           Typed account rows (upsert on tenant+source_id)
+--   silver.xero_invoices           Typed invoice rows (upsert on tenant+source_id)
+--   silver.xero_invoice_line_items Line items (DELETE + INSERT per invoice)
+--   bronze.xero_invoice_pdfs       Cached PDF metadata/blob paths
 -- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- bronze.xero_accounts
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('bronze.xero_accounts', 'U') IS NULL
+BEGIN
+    CREATE TABLE bronze.xero_accounts (
+        id                  BIGINT              IDENTITY(1,1) PRIMARY KEY,
+        sync_run_id         UNIQUEIDENTIFIER    NOT NULL,
+        xero_connection_id  BIGINT              NOT NULL,
+        xero_tenant_id      NVARCHAR(128)       NOT NULL,
+        source_id           NVARCHAR(128)       NOT NULL,
+        raw_json            NVARCHAR(MAX)       NOT NULL,
+        synced_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
+        CONSTRAINT uq_bronze_xero_accounts_tenant_source
+            UNIQUE (xero_tenant_id, source_id)
+    );
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_bronze_xero_accounts_tenant_id'
+      AND object_id = OBJECT_ID('bronze.xero_accounts')
+)
+BEGIN
+    CREATE INDEX ix_bronze_xero_accounts_tenant_id
+        ON bronze.xero_accounts (xero_tenant_id);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_bronze_xero_accounts_synced_at'
+      AND object_id = OBJECT_ID('bronze.xero_accounts')
+)
+BEGIN
+    CREATE INDEX ix_bronze_xero_accounts_synced_at
+        ON bronze.xero_accounts (synced_at);
+END
+GO
 
 -- -----------------------------------------------------------------------------
 -- bronze.xero_invoices
@@ -47,6 +90,69 @@ IF NOT EXISTS (
 BEGIN
     CREATE INDEX ix_bronze_xero_invoices_synced_at
         ON bronze.xero_invoices (synced_at);
+END
+GO
+
+-- -----------------------------------------------------------------------------
+-- silver.xero_accounts
+-- -----------------------------------------------------------------------------
+IF OBJECT_ID('silver.xero_accounts', 'U') IS NULL
+BEGIN
+    CREATE TABLE silver.xero_accounts (
+        id                          BIGINT              IDENTITY(1,1) PRIMARY KEY,
+        bronze_id                   BIGINT              NULL,
+        sync_run_id                 UNIQUEIDENTIFIER    NULL,
+        xero_connection_id          BIGINT              NOT NULL,
+        xero_tenant_id              NVARCHAR(128)       NOT NULL,
+        source_id                   NVARCHAR(128)       NOT NULL,
+        CONSTRAINT uq_silver_xero_accounts_tenant_source
+            UNIQUE (xero_tenant_id, source_id),
+        account_code                NVARCHAR(64)        NULL,
+        account_name                NVARCHAR(255)       NULL,
+        account_label               NVARCHAR(512)       NULL,
+        account_type                NVARCHAR(64)        NULL,
+        account_class               NVARCHAR(64)        NULL,
+        status                      NVARCHAR(32)        NULL,
+        description                 NVARCHAR(1024)      NULL,
+        tax_type                    NVARCHAR(64)        NULL,
+        enable_payments_to_account  BIT                 NOT NULL DEFAULT 0,
+        show_in_expense_claims      BIT                 NOT NULL DEFAULT 0,
+        first_seen_at               DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
+        last_synced_at              DATETIME2           NOT NULL DEFAULT GETUTCDATE()
+    );
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_silver_xero_accounts_tenant_id'
+      AND object_id = OBJECT_ID('silver.xero_accounts')
+)
+BEGIN
+    CREATE INDEX ix_silver_xero_accounts_tenant_id
+        ON silver.xero_accounts (xero_tenant_id);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_silver_xero_accounts_tenant_code'
+      AND object_id = OBJECT_ID('silver.xero_accounts')
+)
+BEGIN
+    CREATE INDEX ix_silver_xero_accounts_tenant_code
+        ON silver.xero_accounts (xero_tenant_id, account_code);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_silver_xero_accounts_tenant_label'
+      AND object_id = OBJECT_ID('silver.xero_accounts')
+)
+BEGIN
+    CREATE INDEX ix_silver_xero_accounts_tenant_label
+        ON silver.xero_accounts (xero_tenant_id, account_label);
 END
 GO
 
@@ -92,6 +198,7 @@ BEGIN
         pdf_cached_at           DATETIME2           NULL,
         pdf_content_type        NVARCHAR(128)       NULL,
         pdf_file_name           NVARCHAR(512)       NULL,
+        pdf_blob_path           NVARCHAR(512)       NULL,
         first_seen_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
         last_synced_at          DATETIME2           NOT NULL DEFAULT GETUTCDATE()
     );
@@ -154,6 +261,7 @@ BEGIN
         line_item_index     INT                 NOT NULL,
         description         NVARCHAR(MAX)       NULL,
         item_code           NVARCHAR(255)       NULL,
+        account_id          NVARCHAR(128)       NULL,
         account_code        NVARCHAR(64)        NULL,
         tax_type            NVARCHAR(64)        NULL,
         tracking_json       NVARCHAR(MAX)       NULL,
@@ -167,6 +275,13 @@ BEGIN
 END
 GO
 
+IF COL_LENGTH('silver.xero_invoice_line_items', 'account_id') IS NULL
+BEGIN
+    ALTER TABLE silver.xero_invoice_line_items
+    ADD account_id NVARCHAR(128) NULL;
+END
+GO
+
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
     WHERE name = 'ix_silver_xero_invoice_line_items_invoice'
@@ -175,6 +290,28 @@ IF NOT EXISTS (
 BEGIN
     CREATE INDEX ix_silver_xero_invoice_line_items_invoice
         ON silver.xero_invoice_line_items (xero_tenant_id, invoice_source_id);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_silver_xero_invoice_line_items_account_id'
+      AND object_id = OBJECT_ID('silver.xero_invoice_line_items')
+)
+BEGIN
+    CREATE INDEX ix_silver_xero_invoice_line_items_account_id
+        ON silver.xero_invoice_line_items (xero_tenant_id, account_id);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_silver_xero_invoice_line_items_account_code'
+      AND object_id = OBJECT_ID('silver.xero_invoice_line_items')
+)
+BEGIN
+    CREATE INDEX ix_silver_xero_invoice_line_items_account_code
+        ON silver.xero_invoice_line_items (xero_tenant_id, account_code);
 END
 GO
 
@@ -191,11 +328,28 @@ BEGIN
         invoice_source_id   NVARCHAR(128)       NOT NULL,
         content_type        NVARCHAR(128)       NOT NULL,
         file_name           NVARCHAR(512)       NULL,
-        pdf_bytes           VARBINARY(MAX)      NOT NULL,
+        blob_path           NVARCHAR(512)       NULL,
         synced_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
         CONSTRAINT uq_bronze_xero_invoice_pdfs_tenant_invoice
             UNIQUE (xero_tenant_id, invoice_source_id)
     );
+END
+GO
+
+IF COL_LENGTH('bronze.xero_invoice_pdfs', 'blob_path') IS NULL
+BEGIN
+    ALTER TABLE bronze.xero_invoice_pdfs
+    ADD blob_path NVARCHAR(512) NULL;
+END
+GO
+
+IF COL_LENGTH('bronze.xero_invoice_pdfs', 'pdf_bytes') IS NOT NULL
+BEGIN
+    ALTER TABLE bronze.xero_invoice_pdfs
+    ALTER COLUMN pdf_bytes VARBINARY(MAX) NULL;
+
+    ALTER TABLE bronze.xero_invoice_pdfs
+    DROP COLUMN pdf_bytes;
 END
 GO
 
@@ -238,7 +392,6 @@ BEGIN
 END
 GO
 
-
 SELECT
     xero_tenant_id,
     tenant_name,
@@ -249,5 +402,10 @@ SELECT
 FROM meta.xero_tenants
 ORDER BY tenant_name;
 
+SELECT * FROM silver.xero_accounts
+ORDER BY last_synced_at DESC;
+
 SELECT * FROM silver.xero_invoices
 ORDER BY last_synced_at DESC;
+
+

@@ -25,6 +25,7 @@ from shared.nexudus.client import NexudusClient
 from shared.azure_clients.blob_writer import BlobWriter
 from shared.azure_clients.bronze_writer import BronzeWriter
 from shared.azure_clients.run_tracker import RunTracker
+from shared.azure_clients.sql_client import get_sql_client
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
         locations = await _sync_locations(client, blob_writer, writer, run_id)
         products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
         await _sync_contracts(client, blob_writer, writer, run_id, products)
+        _, coworker_ids = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
+        await _sync_coworkers(client, blob_writer, writer, run_id, coworker_ids)
         await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
         await _sync_extra_services(client, blob_writer, writer, run_id)
 
@@ -190,4 +193,93 @@ async def _sync_extra_services(
         logger.info(
             f"Extra services: {run.rows_read} fetched, {run.rows_written} written to bronze "
             f"[blob={blob_path}]"
+        )
+
+
+def _get_coworker_invoices_watermark() -> str | None:
+    """Return ISO timestamp of the last successful coworker_invoices bronze run, or None."""
+    try:
+        sql = get_sql_client()
+        rows = sql.execute_query(
+            """
+            SELECT TOP 1 finished_at
+            FROM meta.sync_runs
+            WHERE source_name = 'nexudus'
+              AND entity = 'coworker_invoices'
+              AND layer = 'bronze'
+              AND status = 'success'
+            ORDER BY finished_at DESC
+            """
+        )
+        if rows and rows[0].get("finished_at"):
+            ts = rows[0]["finished_at"]
+            dt = ts if hasattr(ts, "strftime") else __import__("datetime").datetime.fromisoformat(str(ts))
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception as exc:
+        logger.warning("Could not read coworker_invoices watermark: %s", exc)
+    return None
+
+
+async def _sync_coworker_invoices(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> tuple[list[dict], list[int]]:
+    watermark = _get_coworker_invoices_watermark()
+    extra_params = {"UpdatedSince": watermark} if watermark else {}
+    if watermark:
+        logger.info("Coworker invoices: incremental fetch since %s", watermark)
+    else:
+        logger.info("Coworker invoices: no watermark found, doing full fetch")
+
+    async with RunTracker("nexudus", "coworker_invoices", "bronze", metadata=str(run_id)) as run:
+        records = await client.get_all("billing/coworkerinvoices", extra_params=extra_params)
+        run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("coworker_invoices", records, run_id)
+        run.rows_written = writer.write_coworker_invoices(records)
+        coworker_ids = sorted({int(r["CoworkerId"]) for r in records if r.get("CoworkerId")})
+        logger.info(
+            "Coworker invoices: %s fetched, %s written to bronze. Distinct coworker ids: %s [blob=%s]",
+            run.rows_read,
+            run.rows_written,
+            len(coworker_ids),
+            blob_path,
+        )
+        return records, coworker_ids
+
+
+async def _sync_coworkers(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+    coworker_ids: list[int],
+) -> None:
+    if not coworker_ids:
+        logger.info("Coworkers: no CoworkerIds found in coworker invoices, skipping")
+        return
+
+    async with RunTracker("nexudus", "coworkers", "bronze", metadata=str(run_id)) as run:
+        run.rows_read = len(coworker_ids)
+        tasks = [client.get_coworker(coworker_id) for coworker_id in coworker_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        records = []
+        for coworker_id, result in zip(coworker_ids, results):
+            if isinstance(result, Exception):
+                logger.warning("Coworker %s failed: %s", coworker_id, result)
+                run.rows_skipped += 1
+                continue
+            if result:
+                records.append(result)
+
+        blob_path = blob_writer.write_snapshot("coworkers", records, run_id)
+        run.rows_written = writer.write_coworkers(records)
+        logger.info(
+            "Coworkers: %s attempted, %s written, %s skipped [blob=%s]",
+            run.rows_read,
+            run.rows_written,
+            run.rows_skipped,
+            blob_path,
         )
