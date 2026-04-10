@@ -19,7 +19,7 @@ import os
 from datetime import datetime, timezone
 
 from azure.identity import DefaultAzureCredential
-from azure.storage.queue import QueueClient, QueueServiceClient
+from azure.storage.queue import QueueClient
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +34,16 @@ class CostarTaskQueue:
         if not account_name:
             raise EnvironmentError("AZURE_STORAGE_ACCOUNT_NAME is required for CostarTaskQueue")
 
-        account_url = f"https://{account_name}.queue.core.windows.net"
+        account_url = f"https://{account_name}.queue.core.windows.net/{COSTAR_TASK_QUEUE}"
         credential = DefaultAzureCredential()
-        service = QueueServiceClient(
+        # QueueClient directly — not via QueueServiceClient.get_queue_client()
+        # which silently ignores encode/decode policy kwargs.
+        # message_encode_policy=None disables base64 encoding so the message
+        # is stored as plain text, matching host.json messageEncoding: "none".
+        self._queue = QueueClient(
             account_url=account_url,
+            queue_name=COSTAR_TASK_QUEUE,
             credential=credential,
-        )
-        self._queue = service.get_queue_client(
-            COSTAR_TASK_QUEUE,
             message_encode_policy=None,
             message_decode_policy=None,
         )
@@ -71,7 +73,8 @@ class CostarTaskQueue:
                 "enqueued_at":      "<iso-datetime-utc>"
             }
 
-        The Azure SDK base64-encodes the message body automatically.
+        Messages are sent as plain text (no base64) to match host.json
+        messageEncoding: "none".
         """
         message = json.dumps({
             "job_id": job_id,

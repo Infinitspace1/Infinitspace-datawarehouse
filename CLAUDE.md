@@ -46,6 +46,7 @@ Default ETL execution order in UTC:
 4. `03:00` `refresh_ava_availability`
 5. `04:00` `xero_invoice_sync` (includes PDF caching for overdue invoices)
 6. `05:00` `bamboohr_sync`
+7. `05:30` `replyio_stats_sync`
 
 Important operational caveat:
 
@@ -101,6 +102,11 @@ Real Estate (HTTP trigger, optional)
   -> BuildingContactExtractor (Anthropic API)
   -> uploads XLSX to Blob (excel-outputs/<job_id>_contacts.xlsx)
   -> updates bronze.costar_pdf_extractor_logs (Real Estate DB)
+
+Reply.io API
+  -> replyio_stats_sync (timer, 05:30 UTC)
+  -> bronze.replyio_sequence_steps
+  -> bronze.replyio_sequence_step_performance (daily stats, yesterday)
 ```
 
 ---
@@ -138,6 +144,7 @@ This means the default Azure Function App should show only:
 - `silver_entity_worker`
 - `refresh_ava_availability`
 - `xero_invoice_sync`
+- `replyio_stats_sync`
 
 ---
 
@@ -163,6 +170,7 @@ Infinitspace-datawarehouse/
     admin_health.py
     real_estate_costar.py
     real_estate_costar_worker.py
+    replyio_sync.py
   shared/
     azure_clients/
       sql_client.py
@@ -204,6 +212,9 @@ Infinitspace-datawarehouse/
     integrations/
       xero_nexudus_overdue.py
     gmaps/
+    replyio/
+      __init__.py
+      client.py
     real_estate/
       __init__.py
       building_contact_extractor.py   (copy from AI-REAL-ESTATE/extract_building_contacts_improved.py)
@@ -288,6 +299,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `run_costar_extractor` | `functions/real_estate_costar.py` | HTTP POST | `real-estate/costar/run` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — enqueues only, returns 202 |
 | `costar_extraction_worker` | `functions/real_estate_costar_worker.py` | queue | `costar-extraction-tasks` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — does the actual extraction |
 | `bamboohr_sync` | `functions/bamboohr_sync.py` | timer | `0 0 5 * * *` | syncs all BambooHR employees to bronze + silver; join key: `work_email` |
+| `replyio_stats_sync` | `functions/replyio_sync.py` | timer | `0 30 5 * * *` | syncs Reply.io sequence steps + daily step performance stats to bronze |
 
 ---
 
@@ -312,6 +324,8 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - `bronze.xero_invoices`
 - `bronze.xero_invoice_pdfs` — stores `blob_path` reference, not raw bytes
 - `bronze.bamboohr_employees`
+- `bronze.replyio_sequence_steps`
+- `bronze.replyio_sequence_step_performance`
 
 Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only history.
 
@@ -527,6 +541,9 @@ XERO_POST_AUTH_REDIRECT_URI=...
 XERO_SCOPES="offline_access accounting.invoices accounting.payments ..."
 INTEGRATIONS_ENCRYPTION_KEY=...
 
+# Reply.io
+REPLY_IO_API_KEY=...
+
 # Function registration
 ENABLE_ETL_FUNCTIONS=1
 ENABLE_ADMIN_FUNCTIONS=0
@@ -537,6 +554,7 @@ SILVER_SYNC_SCHEDULE="0 30 2 * * *"
 AVA_REFRESH_SCHEDULE="0 0 3 * * *"
 XERO_INVOICE_SYNC_SCHEDULE="0 0 4 * * *"
 XERO_INVOICE_SYNC_FORCE_FULL=0
+REPLYIO_SYNC_SCHEDULE="0 30 5 * * *"
 ```
 
 ---
@@ -719,6 +737,7 @@ az functionapp config appsettings set `
 | Core layer population | planned | not implemented |
 | Real Estate CoStar extractor HTTP function | done | `ENABLE_REAL_ESTATE_FUNCTIONS=1` to activate |
 | BambooHR employee sync | done | bronze + silver; `work_email` is join key to Nexudus coworkers |
+| Reply.io stats sync | done | bronze only; sequence steps + daily step performance; 4 AB test sequences |
 
 ---
 
@@ -736,6 +755,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-09 (added BambooHR employee sync)
+Last updated: 2026-04-10 (added Reply.io stats sync)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team
