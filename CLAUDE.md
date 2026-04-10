@@ -719,7 +719,7 @@ az functionapp config appsettings set `
 ---
 
 ## Current Status
-
+ 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Nexudus bronze sync | done | 7 entities (added coworker_invoices + coworkers) |
