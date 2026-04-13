@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,9 @@ from shared.xero.tenant_directory import XeroTenantDirectoryService
 _XERO_DOTNET_DATE_RE = re.compile(r"^/Date\((?P<ms>-?\d+)(?P<offset>[+-]\d{4})?\)/$")
 logger = logging.getLogger(__name__)
 DEFAULT_INCREMENTAL_LOOKBACK = timedelta(minutes=5)
+PDF_FETCH_MAX_RETRIES = 5
+PDF_FETCH_DEFAULT_RETRY_AFTER_SECONDS = 60
+PDF_FETCH_THROTTLE_SECONDS = 1.2
 
 
 @dataclass
@@ -223,7 +227,8 @@ class XeroInvoiceSyncService:
             invoice_id=invoice_id,
             tenant_id=resolved_tenant_id,
         )
-        pdf_bytes, content_type, file_name = client.get_invoice_pdf(
+        pdf_bytes, content_type, file_name = self._fetch_invoice_pdf_with_retry(
+            client=client,
             invoice_id=invoice_id,
             tenant_id=resolved_tenant_id,
         )
@@ -317,7 +322,8 @@ class XeroInvoiceSyncService:
             client = connections[conn_id]
 
             try:
-                pdf_bytes, content_type, file_name = client.get_invoice_pdf(
+                pdf_bytes, content_type, file_name = self._fetch_invoice_pdf_with_retry(
+                    client=client,
                     invoice_id=str(row["source_id"]),
                     tenant_id=str(row["xero_tenant_id"]),
                 )
@@ -341,17 +347,60 @@ class XeroInvoiceSyncService:
                     )
                 ok += 1
                 logger.info(
-                    "PDF cached for overdue invoice",
+                    "PDF cached for invoice missing a blob path",
                     extra={"invoice_number": row["invoice_number"], "blob_path": blob_path},
                 )
             except Exception:
                 errors += 1
                 logger.exception(
-                    "Failed to cache PDF for overdue invoice",
+                    "Failed to cache PDF for invoice missing a blob path",
                     extra={"invoice_number": row["invoice_number"]},
                 )
+            time.sleep(PDF_FETCH_THROTTLE_SECONDS)
 
         return {"pdfs_cached": ok, "pdfs_failed": errors, "pdfs_total": len(rows)}
+
+    def _fetch_invoice_pdf_with_retry(
+        self,
+        client: XeroApiClient,
+        invoice_id: str,
+        tenant_id: str,
+    ) -> tuple[bytes, str, Optional[str]]:
+        for attempt in range(1, PDF_FETCH_MAX_RETRIES + 1):
+            try:
+                return client.get_invoice_pdf(
+                    invoice_id=invoice_id,
+                    tenant_id=tenant_id,
+                )
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code != 429 or attempt == PDF_FETCH_MAX_RETRIES:
+                    raise
+
+                wait_seconds = self._resolve_retry_after_seconds(exc)
+                logger.warning(
+                    "Xero PDF fetch rate limited; retrying",
+                    extra={
+                        "invoice_id": invoice_id,
+                        "tenant_id": tenant_id,
+                        "attempt": attempt,
+                        "max_retries": PDF_FETCH_MAX_RETRIES,
+                        "wait_seconds": wait_seconds,
+                    },
+                )
+                time.sleep(wait_seconds + 1)
+
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _resolve_retry_after_seconds(self, exc: requests.HTTPError) -> int:
+        if exc.response is None:
+            return PDF_FETCH_DEFAULT_RETRY_AFTER_SECONDS
+
+        raw_value = exc.response.headers.get("Retry-After")
+        try:
+            return max(1, int(str(raw_value).strip()))
+        except (AttributeError, TypeError, ValueError):
+            return PDF_FETCH_DEFAULT_RETRY_AFTER_SECONDS
 
     def _upload_pdf(
         self,
@@ -524,7 +573,8 @@ class XeroInvoiceSyncService:
                     )
 
                     if include_pdfs:
-                        pdf_bytes, content_type, file_name = client.get_invoice_pdf(
+                        pdf_bytes, content_type, file_name = self._fetch_invoice_pdf_with_retry(
+                            client=client,
                             invoice_id=invoice_id,
                             tenant_id=tenant_id,
                         )
@@ -545,6 +595,7 @@ class XeroInvoiceSyncService:
                             file_name=file_name,
                         )
                         stats.pdf_rows_cached += 1
+                        time.sleep(PDF_FETCH_THROTTLE_SECONDS)
 
                     stats.invoice_count_seen += 1
 

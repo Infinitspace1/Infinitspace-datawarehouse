@@ -48,7 +48,8 @@ async def xero_invoice_sync(timer: func.TimerRequest) -> None:
                 extra={"failed": stats["failed_tenant_ids"]},
             )
 
-        # Cache PDFs for any invoices (any status) that don't have one yet
+        # Cache PDFs for any invoices (any status) that don't have one yet.
+        # This reuses the shared backfill logic so the ETL timer gets retry/pacing safeguards too.
         pdf_stats = service.cache_missing_pdfs()
         logger.info("Xero PDF cache complete", extra={"pdf_stats": json.dumps(pdf_stats, default=str)})
 

@@ -44,7 +44,7 @@ Default ETL execution order in UTC:
 2. `02:30` `bronze_to_silver`
 3. queue fanout via `silver_entity_worker`
 4. `03:00` `refresh_ava_availability`
-5. `04:00` `xero_invoice_sync` (includes PDF caching for overdue invoices)
+5. `04:00` `xero_invoice_sync` (includes PDF caching for invoices missing `pdf_blob_path`)
 6. `05:00` `bamboohr_sync`
 7. `05:30` `replyio_stats_sync`
 
@@ -293,7 +293,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `bronze_to_silver` | `functions/silver_nexudus.py` | timer | `0 30 2 * * *` | enqueues 7 queue messages (includes coworker_invoices + coworkers) |
 | `silver_entity_worker` | `functions/silver_worker.py` | queue | `silver-sync-tasks` | one entity per invocation |
 | `refresh_ava_availability` | `functions/ava_refresh.py` | timer | `0 0 3 * * *` | executes AVA stored procedure |
-| `xero_invoice_sync` | `functions/xero_sync.py` | timer | `0 0 4 * * *` | syncs all linked Xero tenants + caches PDFs for overdue invoices |
+| `xero_invoice_sync` | `functions/xero_sync.py` | timer | `0 0 4 * * *` | syncs all linked Xero tenants + caches PDFs for invoices missing `pdf_blob_path`; reuses the backfill retry/throttle flow |
 | admin HTTP routes | `functions/integrations_admin.py` | HTTP | on-demand | only when `ENABLE_ADMIN_FUNCTIONS=1` |
 | `test_connections` | `functions/admin_health.py` | HTTP | on-demand | only when `ENABLE_ADMIN_FUNCTIONS=1` |
 | `run_costar_extractor` | `functions/real_estate_costar.py` | HTTP POST | `real-estate/costar/run` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — enqueues only, returns 202 |
@@ -416,7 +416,8 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
   - incremental by tenant using `If-Modified-Since`
   - updates `meta.xero_tenants` watermarks
   - refreshes `silver.xero_tenants` after invoice sync
-  - `cache_overdue_pdfs()` runs after sync — fetches PDFs only for overdue invoices with no `pdf_blob_path`
+  - `cache_missing_pdfs()` runs after sync — fetches PDFs for any invoice with no `pdf_blob_path`
+  - reuses the same retry/throttle flow as `scripts/python_scripts/backfill_xero_pdfs.py`
   - does not use `RunTracker`
 - `shared/xero/tenant_directory.py`
   - matches legal Xero tenant names to Nexudus locations
@@ -429,7 +430,7 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - blob path format: `{xero_tenant_id}/{yyyy}/{mm}/{invoice_source_id}.pdf`
 - `bronze.xero_invoice_pdfs.blob_path` and `silver.xero_invoices.pdf_blob_path` hold the reference
 - `BlobWriter.write_pdf()` uploads; `BlobWriter.read_pdf()` downloads by path
-- `pdf_blob_path IS NULL` is the natural watermark — only new overdue invoices are fetched each night
+- `pdf_blob_path IS NULL` is the natural watermark — only invoices still missing a cached PDF are fetched each night
 
 ### Xero ↔ Nexudus Invoice Linking
 
@@ -594,7 +595,7 @@ Xero PDF validation:
 .\venv\Scripts\python.exe scripts\python_scripts\test_xero_pdf.py
 # Test full round-trip: fetch -> blob upload -> SQL -> read back
 .\venv\Scripts\python.exe scripts\python_scripts\test_xero_pdf_cache.py
-# Backfill PDFs for all existing overdue invoices
+# Backfill PDFs for all existing invoices missing `pdf_blob_path`
 .\venv\Scripts\python.exe scripts\python_scripts\backfill_xero_pdfs.py --dry-run
 .\venv\Scripts\python.exe scripts\python_scripts\backfill_xero_pdfs.py
 ```
@@ -729,7 +730,7 @@ az functionapp config appsettings set `
 | Xero auto-refresh | done | disconnects on `invalid_grant` |
 | Xero invoice sync | done | incremental by tenant |
 | Xero tenant directory | done | refreshed after Xero sync and exposed as `xero.silver_tenants` |
-| Xero invoice PDF caching | done | blob storage (`xero-invoice-pdfs`); path in `silver.xero_invoices.pdf_blob_path`; auto-cached nightly for overdue invoices |
+| Xero invoice PDF caching | done | blob storage (`xero-invoice-pdfs`); path in `silver.xero_invoices.pdf_blob_path`; auto-cached nightly for invoices missing `pdf_blob_path` |
 | Nexudus coworker invoices + coworkers | done | incremental via UpdatedSince watermark |
 | Xero ↔ Nexudus invoice linking | done | `silver.xero_overdue_invoice_contacts` view; 5/12 tenants connected |
 | Optional admin HTTP routes | done | separate deployment mode |
@@ -755,6 +756,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-10 (added Reply.io stats sync)
+Last updated: 2026-04-13 (moved Xero PDF backfill retry/throttle flow into the ETL timer path)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

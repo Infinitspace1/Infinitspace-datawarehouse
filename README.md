@@ -49,7 +49,8 @@ This project runs scheduled Azure Functions that ingest operational data into Az
   - Writes line items to `silver.xero_invoice_line_items`
   - Refreshes the Xero tenant directory in `silver.xero_tenants`
   - Exposes the same directory through `xero.silver_tenants`
-  - Optionally caches PDFs in `bronze.xero_invoice_pdfs`
+  - Nightly caches PDFs for invoices still missing `pdf_blob_path` into `bronze.xero_invoice_pdfs`
+  - Uses the same retry/throttle safeguards as `scripts/python_scripts/backfill_xero_pdfs.py`
 
 - `refresh_finance_dashboard`
   - Timer trigger
@@ -349,4 +350,4 @@ ORDER BY tenant_name;
 - [docs/silver_table_relationships.md](docs/silver_table_relationships.md)
 - [docs/deploy.md](docs/deploy.md)
 
-Last updated: 2026-04-07
+Last updated: 2026-04-13
