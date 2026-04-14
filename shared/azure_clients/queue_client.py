@@ -32,7 +32,9 @@ class SilverTaskQueue:
         if not account_name:
             raise EnvironmentError("AZURE_STORAGE_ACCOUNT_NAME is required for queue client")
 
-        account_url = f"https://{account_name}.queue.core.windows.net/{SILVER_TASK_QUEUE}"
+        # QueueClient expects the storage account root URL here; queue_name is
+        # appended internally when building /<queue>/messages requests.
+        account_url = f"https://{account_name}.queue.core.windows.net"
         credential = DefaultAzureCredential()
         # QueueClient directly - not via QueueServiceClient.get_queue_client(),
         # which silently ignores encode/decode policy kwargs.

@@ -34,6 +34,8 @@ class CostarTaskQueue:
         if not account_name:
             raise EnvironmentError("AZURE_STORAGE_ACCOUNT_NAME is required for CostarTaskQueue")
 
+        # QueueClient expects the storage account root URL here; queue_name is
+        # appended internally when building /<queue>/messages requests.
         account_url = f"https://{account_name}.queue.core.windows.net"
         credential = DefaultAzureCredential()
         # QueueClient directly — not via QueueServiceClient.get_queue_client()
