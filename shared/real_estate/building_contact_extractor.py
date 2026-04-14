@@ -14,13 +14,11 @@ import json
 import logging
 import os
 import time
-from io import BytesIO
 from typing import Any, Dict
 
 import anthropic
 import fitz  # PyMuPDF
 import pandas as pd
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -76,23 +74,21 @@ class BuildingContactExtractor:
 
         logger.info("Initialized extractor for pages %s-%s", start_page, end_page)
 
-    def _page_to_image(self, doc: fitz.Document, page_num: int) -> Image.Image:
-        """Convert a single PDF page to a PIL Image using PyMuPDF."""
+    def _page_to_png_bytes(self, doc: fitz.Document, page_num: int) -> bytes:
+        """Convert a single PDF page to PNG bytes using PyMuPDF."""
         page = doc[page_num - 1]  # fitz uses 0-based indexing
         pix = page.get_pixmap(dpi=IMAGE_DPI)
-        return Image.open(BytesIO(pix.tobytes("png")))
+        return pix.tobytes("png")
 
-    def image_to_base64(self, image: Image.Image) -> str:
-        """Convert PIL Image to base64 string."""
-        buffered = BytesIO()
-        image.save(buffered, format="PNG", optimize=True)
-        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+    def image_to_base64(self, png_bytes: bytes) -> str:
+        """Convert PNG bytes to base64 string."""
+        return base64.b64encode(png_bytes).decode("utf-8")
 
-    def extract_from_page(self, image: Image.Image, page_number: int) -> Dict[str, Any]:
+    def extract_from_page(self, png_bytes: bytes, page_number: int) -> Dict[str, Any]:
         """Extract building and contact information from a single page using Claude."""
         logger.info("Processing page %s...", page_number)
 
-        base64_image = self.image_to_base64(image)
+        base64_image = self.image_to_base64(png_bytes)
 
         prompt = """You are extracting contact information from a commercial real estate database page. Your task is to extract ONLY the information that is EXPLICITLY shown on this page.
 
@@ -280,8 +276,8 @@ Extract every contact you see, even if they only have minimal information."""
         try:
             for page_num in range(self.start_page, self.end_page + 1):
                 try:
-                    image = self._page_to_image(doc, page_num)
-                    page_data = self.extract_from_page(image, page_num)
+                    png_bytes = self._page_to_png_bytes(doc, page_num)
+                    page_data = self.extract_from_page(png_bytes, page_num)
                     self._collect_rows(page_data)
 
                     if "error" in page_data:
