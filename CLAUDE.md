@@ -30,8 +30,7 @@ Platform:
 Current deployment docs target:
 
 - resource group: `infinitspace-prod-northeurope-data-rg`
-- ETL app: `func-infinitspace-datawarehouse`
-- optional admin app: `func-infinitspace-datawarehouse-admin`
+- ETL app: `func-infinitspace-etl`
 - storage account: `staccinfinitspaceprod001`
 
 ---
@@ -217,7 +216,7 @@ Infinitspace-datawarehouse/
       client.py
     real_estate/
       __init__.py
-      building_contact_extractor.py   (copy from AI-REAL-ESTATE/extract_building_contacts_improved.py)
+      building_contact_extractor.py   (adapted from AI-REAL-ESTATE repo, uses PyMuPDF)
     azure_clients/
       ...
       costar_queue_client.py
@@ -310,7 +309,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - uses `bronze.costar_pdf_extractor_logs` (in Real Estate DB, not datawarehouse DB)
 - connection string: `AZURE_SQL_PDF_JOBS_CONNECTION_STRING`
 - extractor module: `shared/real_estate/building_contact_extractor.py`
-  (copy of `extract_building_contacts_improved.py` from AI-REAL-ESTATE repo)
+  (adapted from AI-REAL-ESTATE repo, uses PyMuPDF — no system dependencies)
 
 ### Bronze
 
@@ -687,18 +686,18 @@ Before deploying, ensure the new env var is set:
 ```powershell
 az functionapp config appsettings set `
   --resource-group infinitspace-prod-northeurope-data-rg `
-  --name func-infinitspace-datawarehouse `
+  --name func-infinitspace-etl `
   --settings AZURE_STORAGE_CONTAINER_XERO_PDFS=xero-invoice-pdfs
 ```
 
 ETL app:
 
 ```powershell
-func azure functionapp publish func-infinitspace-datawarehouse --python
+func azure functionapp publish func-infinitspace-etl --python
 
 az functionapp config appsettings set `
   --resource-group infinitspace-prod-northeurope-data-rg `
-  --name func-infinitspace-datawarehouse `
+  --name func-infinitspace-etl `
   --settings `
     ENABLE_ETL_FUNCTIONS=1 `
     ENABLE_ADMIN_FUNCTIONS=0
@@ -707,11 +706,11 @@ az functionapp config appsettings set `
 Optional admin app:
 
 ```powershell
-func azure functionapp publish func-infinitspace-datawarehouse-admin --python
+func azure functionapp publish func-infinitspace-etl --python
 
 az functionapp config appsettings set `
   --resource-group infinitspace-prod-northeurope-data-rg `
-  --name func-infinitspace-datawarehouse-admin `
+  --name func-infinitspace-etl `
   --settings `
     ENABLE_ETL_FUNCTIONS=0 `
     ENABLE_ADMIN_FUNCTIONS=1
@@ -756,6 +755,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-13 (moved Xero PDF backfill retry/throttle flow into the ETL timer path)
+Last updated: 2026-04-14 (fixed CoStar extractor for Azure Functions: replaced pdf2image+poppler with PyMuPDF, cleaned up local-only patterns, updated func app name to func-infinitspace-etl)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

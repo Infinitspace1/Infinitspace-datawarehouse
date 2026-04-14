@@ -34,7 +34,7 @@ class CostarTaskQueue:
         if not account_name:
             raise EnvironmentError("AZURE_STORAGE_ACCOUNT_NAME is required for CostarTaskQueue")
 
-        account_url = f"https://{account_name}.queue.core.windows.net/{COSTAR_TASK_QUEUE}"
+        account_url = f"https://{account_name}.queue.core.windows.net"
         credential = DefaultAzureCredential()
         # QueueClient directly — not via QueueServiceClient.get_queue_client()
         # which silently ignores encode/decode policy kwargs.

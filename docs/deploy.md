@@ -1,7 +1,7 @@
 Deploy the default ETL Function App:
 
 ```powershell
-func azure functionapp publish func-infinitspace-datawarehouse --python
+func azure functionapp publish func-infinitspace-etl --python
 ```
 
 Set ETL app settings so only the pipeline triggers are registered:
@@ -9,7 +9,7 @@ Set ETL app settings so only the pipeline triggers are registered:
 ```powershell
 az functionapp config appsettings set `
   --resource-group infinitspace-prod-northeurope-data-rg `
-  --name func-infinitspace-datawarehouse `
+  --name func-infinitspace-etl `
   --settings `
     ENABLE_ETL_FUNCTIONS=1 `
     ENABLE_ADMIN_FUNCTIONS=0 `
@@ -32,11 +32,11 @@ az role assignment create --assignee c7182846-ab9c-44bf-9a54-b94515e95f4f --role
 Optional: deploy a separate admin Function App from the same repo:
 
 ```powershell
-func azure functionapp publish func-infinitspace-datawarehouse-admin --python
+func azure functionapp publish func-infinitspace-etl --python
 
 az functionapp config appsettings set `
   --resource-group infinitspace-prod-northeurope-data-rg `
-  --name func-infinitspace-datawarehouse-admin `
+  --name func-infinitspace-etl `
   --settings `
     ENABLE_ETL_FUNCTIONS=0 `
     ENABLE_ADMIN_FUNCTIONS=1
@@ -58,7 +58,7 @@ The production refresh path is DB-backed:
 Optional access restriction toggle for an admin app:
 
 ```powershell
-az functionapp config access-restriction remove --resource-group infinitspace-prod-northeurope-data-rg --name func-infinitspace-datawarehouse-admin --rule-name "DenyAllPublic" --action Deny
+az functionapp config access-restriction remove --resource-group infinitspace-prod-northeurope-data-rg --name func-infinitspace-etl --rule-name "DenyAllPublic" --action Deny
 
-az functionapp config access-restriction add --resource-group infinitspace-prod-northeurope-data-rg --name func-infinitspace-datawarehouse-admin --rule-name "DenyAllPublic" --action Deny --priority 100 --ip-address 0.0.0.0/0
+az functionapp config access-restriction add --resource-group infinitspace-prod-northeurope-data-rg --name func-infinitspace-etl --rule-name "DenyAllPublic" --action Deny --priority 100 --ip-address 0.0.0.0/0
 ```

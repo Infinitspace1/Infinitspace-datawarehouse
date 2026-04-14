@@ -15,7 +15,6 @@ Message format (JSON):
     }
 
 Design properties:
-  - No HTTP timeout risk — queue workers run up to 10 minutes on Consumption plan.
   - Raising on failure causes Azure to re-queue the message automatically.
   - After maxDequeueCount retries (default 5) the message moves to the poison
     queue (costar-extraction-tasks-poison) for manual inspection.
@@ -38,7 +37,6 @@ Connection binding:
 
 Extractor dependency:
   shared/real_estate/building_contact_extractor.py
-  (copy of extract_building_contacts_improved.py from AI-REAL-ESTATE repo)
 """
 from __future__ import annotations
 
@@ -46,7 +44,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import azure.functions as func
@@ -109,7 +107,8 @@ def _pdf_table() -> str:
     return t
 
 
-def _update_job(job_id: str, **kwargs: Any) -> None:
+def _update_job(job_id: str, conn: pyodbc.Connection, **kwargs: Any) -> None:
+    """Update job row using a shared connection."""
     bad = set(kwargs) - _PDF_JOB_UPDATE_COLUMNS
     if bad:
         raise ValueError(f"Invalid columns: {bad}")
@@ -120,13 +119,9 @@ def _update_job(job_id: str, **kwargs: Any) -> None:
     set_clause = ", ".join(f"{k} = ?" for k in keys)
     values = [kwargs[k] for k in keys]
     values.append(job_id)
-    conn = _connect_sql()
-    try:
-        cur = conn.cursor()
-        cur.execute(f"UPDATE {table} SET {set_clause} WHERE id = ?", values)
-        conn.commit()
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE {table} SET {set_clause} WHERE id = ?", values)
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -145,16 +140,16 @@ def _container_name() -> str:
     return _env("BLOB_CONTAINER_NAME", "real-estate-costar-automation")
 
 
-def _download_blob(blob_name: str, local_path: str) -> None:
-    container = _blob_service().get_container_client(_container_name())
+def _download_blob(blob_svc: BlobServiceClient, blob_name: str, local_path: str) -> None:
+    container = blob_svc.get_container_client(_container_name())
     folder = _env("BLOB_FOLDER_UPLOADS", "pdf-uploads")
     bc = container.get_blob_client(f"{folder}/{blob_name}")
     with open(local_path, "wb") as f:
         f.write(bc.download_blob().readall())
 
 
-def _upload_blob(local_path: str, blob_name: str) -> None:
-    container = _blob_service().get_container_client(_container_name())
+def _upload_blob(blob_svc: BlobServiceClient, local_path: str, blob_name: str) -> None:
+    container = blob_svc.get_container_client(_container_name())
     folder = _env("BLOB_FOLDER_OUTPUTS", "excel-outputs")
     bc = container.get_blob_client(f"{folder}/{blob_name}")
     with open(local_path, "rb") as f:
@@ -172,9 +167,8 @@ def _run_extraction_job(
     end_page: int,
 ) -> None:
     """Download PDF, run extractor, upload results, update job status throughout."""
-    # Lazy import — avoids crashing the entire function app at startup
-    # if heavy dependencies (pdf2image, anthropic, etc.) fail to load
     from shared.real_estate.building_contact_extractor import BuildingContactExtractor
+
     temp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     temp_pdf.close()
     temp_xlsx = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
@@ -182,14 +176,17 @@ def _run_extraction_job(
     temp_pdf_path = temp_pdf.name
     temp_output_path = temp_xlsx.name
 
+    blob_svc = _blob_service()
+    conn = _connect_sql()
+
     try:
-        _download_blob(blob_name_upload, temp_pdf_path)
+        _download_blob(blob_svc, blob_name_upload, temp_pdf_path)
 
         _update_job(
-            job_id,
+            job_id, conn,
             status="processing",
             progress=0,
-            started_at=datetime.now().isoformat(),
+            started_at=datetime.now(timezone.utc).isoformat(),
         )
 
         extractor = BuildingContactExtractor(
@@ -205,7 +202,7 @@ def _run_extraction_job(
             total_pages = end_page - start_page + 1
             current = page_num - start_page + 1
             progress = int((current / total_pages) * 100)
-            _update_job(job_id, progress=progress, current_page=page_num)
+            _update_job(job_id, conn, progress=progress, current_page=page_num)
             logger.info("CoStar job %s: page %s/%s (%s%%)", job_id, page_num, end_page, progress)
             return result
 
@@ -213,23 +210,24 @@ def _run_extraction_job(
         extractor.process_pdf()
 
         blob_name_output = f"{job_id}_contacts.xlsx"
-        _upload_blob(temp_output_path, blob_name_output)
+        _upload_blob(blob_svc, temp_output_path, blob_name_output)
 
         _update_job(
-            job_id,
+            job_id, conn,
             status="completed",
             blob_name_output=blob_name_output,
-            completed_at=datetime.now().isoformat(),
+            completed_at=datetime.now(timezone.utc).isoformat(),
             progress=100,
         )
         logger.info("CoStar job %s completed", job_id)
 
     except Exception as e:
         logger.exception("CoStar job %s failed: %s", job_id, e)
-        _update_job(job_id, status="failed", error=str(e))
-        raise  # Re-raise so Azure re-queues the message for retry
+        _update_job(job_id, conn, status="failed", error=str(e))
+        raise
 
     finally:
+        conn.close()
         for p in (temp_pdf_path, temp_output_path):
             try:
                 if p and os.path.exists(p):
@@ -273,9 +271,10 @@ def costar_extraction_worker(msg: func.QueueMessage) -> None:
     )
 
     if not job_id or not blob_name_upload or start_page < 1 or end_page < start_page:
-        # Malformed message — dead-letter it, no point retrying
         logger.error(
             "Malformed CoStar queue message (job_id=%s) — will be dead-lettered after max retries",
             job_id,
         )
         raise ValueError(f"Malformed CoStar queue message: {payload!r}")
+
+    _run_extraction_job(job_id, blob_name_upload, start_page, end_page)
