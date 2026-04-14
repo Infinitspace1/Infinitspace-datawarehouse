@@ -439,7 +439,7 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - same-location matches ranked above cross-location matches
 - `recipient_email` coalesces: `billing_email` → `email` → `coworker_billing_email`
 - rows with `match_reason = 'unmatched'` have no Nexudus record; `recipient_email` will be NULL
-- current coverage: 5 of 12 Xero tenants connected (Starter tier limit)
+- current coverage: all 12 Xero tenants connected (Starter tier limit)
 
 ---
 
@@ -755,6 +755,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-14 (fixed CoStar extractor for Azure Functions: replaced pdf2image+poppler with PyMuPDF, cleaned up local-only patterns, updated func app name to func-infinitspace-etl)
+Last updated: 2026-04-14 (gold finance dashboard: switched due_date/amount_due to Nexudus source, excluded unmatched invoices, added due_amount>0 and due_date>=2026-03-01 filters; all 12 Xero tenants now connected)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

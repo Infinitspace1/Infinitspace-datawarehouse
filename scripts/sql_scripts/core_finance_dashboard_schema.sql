@@ -401,7 +401,6 @@ BEGIN
         FROM silver.xero_invoices inv
         WHERE inv.url LIKE '%nexudus%'
           AND inv.invoice_status = 'AUTHORISED'
-          AND inv.amount_due > 0
           AND COALESCE(inv.invoice_type, N'ACCREC') = N'ACCREC'
     ),
     invoice_base AS (
@@ -466,6 +465,8 @@ BEGIN
             nci.coworker_company_name,
             nci.bill_to_name,
             nci.location_source_id AS nexudus_location_source_id,
+            nci.due_date AS nexudus_due_date,
+            nci.due_amount AS nexudus_due_amount,
             nci.last_synced_at,
             nci.invoice_number AS match_key,
             0 AS nexudus_key_rank
@@ -483,6 +484,8 @@ BEGIN
             nci.coworker_company_name,
             nci.bill_to_name,
             nci.location_source_id AS nexudus_location_source_id,
+            nci.due_date AS nexudus_due_date,
+            nci.due_amount AS nexudus_due_amount,
             nci.last_synced_at,
             nci.payment_reference AS match_key,
             1 AS nexudus_key_rank
@@ -500,6 +503,8 @@ BEGIN
             nmk.coworker_billing_email,
             nmk.coworker_company_name,
             nmk.bill_to_name,
+            nmk.nexudus_due_date,
+            nmk.nexudus_due_amount,
             ROW_NUMBER() OVER (
                 PARTITION BY imk.xero_tenant_id, imk.xero_invoice_source_id
                 ORDER BY
@@ -521,7 +526,9 @@ BEGIN
             coworker_name,
             coworker_billing_email,
             coworker_company_name,
-            bill_to_name
+            bill_to_name,
+            nexudus_due_date,
+            nexudus_due_amount
         FROM ranked_matches
         WHERE rn = 1
     ),
@@ -638,23 +645,23 @@ BEGIN
         ib.reference,
         ib.currency_code,
         ib.invoice_date,
-        ib.due_date,
+        CAST(bm.nexudus_due_date AS DATE) AS due_date,
         CAST(GETUTCDATE() AS DATE) AS as_of_date_utc,
-        DATEDIFF(DAY, CAST(GETUTCDATE() AS DATE), ib.due_date) AS days_until_due,
+        DATEDIFF(DAY, CAST(GETUTCDATE() AS DATE), CAST(bm.nexudus_due_date AS DATE)) AS days_until_due,
         CASE
-            WHEN ib.due_date IS NULL THEN NULL
-            WHEN ib.due_date < CAST(GETUTCDATE() AS DATE)
-                THEN DATEDIFF(DAY, ib.due_date, CAST(GETUTCDATE() AS DATE))
+            WHEN bm.nexudus_due_date IS NULL THEN NULL
+            WHEN CAST(bm.nexudus_due_date AS DATE) < CAST(GETUTCDATE() AS DATE)
+                THEN DATEDIFF(DAY, CAST(bm.nexudus_due_date AS DATE), CAST(GETUTCDATE() AS DATE))
             ELSE 0
         END AS days_overdue,
         CASE
-            WHEN ib.due_date IS NULL THEN N'unknown'
-            WHEN ib.due_date < CAST(GETUTCDATE() AS DATE) THEN N'overdue'
-            WHEN ib.due_date = CAST(GETUTCDATE() AS DATE) THEN N'due_today'
+            WHEN bm.nexudus_due_date IS NULL THEN N'unknown'
+            WHEN CAST(bm.nexudus_due_date AS DATE) < CAST(GETUTCDATE() AS DATE) THEN N'overdue'
+            WHEN CAST(bm.nexudus_due_date AS DATE) = CAST(GETUTCDATE() AS DATE) THEN N'due_today'
             ELSE N'upcoming'
         END AS due_state,
         ib.total,
-        ib.amount_due,
+        bm.nexudus_due_amount AS amount_due,
         ib.amount_paid,
         CASE
             WHEN ISNULL(account_flags.has_recurrent_account, 0) = 1 THEN N'recurrent'
@@ -662,14 +669,16 @@ BEGIN
         END AS workflow_type,
         ib.last_synced_at
     FROM invoice_base ib
+    INNER JOIN best_match bm
+        ON bm.xero_tenant_id = ib.xero_tenant_id
+       AND bm.xero_invoice_source_id = ib.xero_invoice_source_id
     LEFT JOIN invoice_account_flags account_flags
         ON account_flags.xero_tenant_id = ib.xero_tenant_id
        AND account_flags.xero_invoice_source_id = ib.xero_invoice_source_id
-    LEFT JOIN best_match bm
-        ON bm.xero_tenant_id = ib.xero_tenant_id
-       AND bm.xero_invoice_source_id = ib.xero_invoice_source_id
     LEFT JOIN silver.nexudus_coworkers nc
-        ON nc.source_id = bm.nexudus_coworker_id;
+        ON nc.source_id = bm.nexudus_coworker_id
+    WHERE bm.nexudus_due_amount > 0
+      AND bm.nexudus_due_date >= '2026-03-01';
 END
 GO
 
