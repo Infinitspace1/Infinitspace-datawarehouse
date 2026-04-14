@@ -15,4 +15,4 @@ cryptography
 anthropic>=0.40.0
 pandas>=2.2.0
 python-calamine>=0.6.1
-pdf2image>=1.17.0
+pymupdf>=1.24.0

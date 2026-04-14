@@ -59,6 +59,36 @@ This project runs scheduled Azure Functions that ingest operational data into Az
   - Rebuilds `gold.finance_dashboard_invoice_worklist`
   - Rebuilds `gold.finance_dashboard_user_access`
 
+### BambooHR
+
+- `bamboohr_sync`
+  - Timer trigger
+  - Default schedule: `05:00 UTC`
+  - Syncs all BambooHR employees to bronze + silver
+  - Join key: `work_email` to `silver.nexudus_coworkers.email`
+
+### Reply.io
+
+- `replyio_stats_sync`
+  - Timer trigger
+  - Default schedule: `05:30 UTC`
+  - Syncs sequence steps and daily step performance stats to bronze
+
+### Real Estate (CoStar Extractor)
+
+- `run_costar_extractor`
+  - HTTP POST trigger: `/api/real-estate/costar/run`
+  - Auth: Function key (`?code=` or `x-functions-key` header)
+  - Validates payload and enqueues extraction job, returns 202 immediately
+  - Only registered when `ENABLE_REAL_ESTATE_FUNCTIONS=1`
+
+- `costar_extraction_worker`
+  - Queue trigger: `costar-extraction-tasks`
+  - Downloads PDF from blob, extracts building contacts page-by-page using Anthropic Claude API (via PyMuPDF for PDF rendering)
+  - Uploads XLSX results to blob, updates job status in `bronze.costar_pdf_extractor_logs` (Real Estate DB)
+  - Poison queue: `costar-extraction-tasks-poison`
+  - Only registered when `ENABLE_REAL_ESTATE_FUNCTIONS=1`
+
 ### Gold Production Tables
 
 - `gold.finance_dashboard_user_access`
@@ -73,14 +103,21 @@ This project runs scheduled Azure Functions that ingest operational data into Az
 
 ## Function App Model
 
-The repo now supports two deployment modes from the same codebase:
+The repo supports three deployment modes from the same codebase:
 
-- ETL app, default
+- **ETL app** (default)
   - `ENABLE_ETL_FUNCTIONS=1`
   - `ENABLE_ADMIN_FUNCTIONS=0`
-  - Exposes only the production ETL functions
+  - `ENABLE_REAL_ESTATE_FUNCTIONS=0`
+  - Exposes production ETL functions (timers + queue workers)
 
-- Admin app, optional
+- **ETL + Real Estate**
+  - `ENABLE_ETL_FUNCTIONS=1`
+  - `ENABLE_REAL_ESTATE_FUNCTIONS=1`
+  - `ENABLE_ADMIN_FUNCTIONS=0`
+  - Adds the CoStar HTTP endpoint and queue worker to the ETL surface
+
+- **Admin app** (optional, separate deployment)
   - `ENABLE_ETL_FUNCTIONS=0`
   - `ENABLE_ADMIN_FUNCTIONS=1`
   - Exposes manual HTTP routes for Xero OAuth callback, debugging, and smoke tests
@@ -104,19 +141,54 @@ Infinitspace-datawarehouse/
     silver_worker.py
     ava_refresh.py
     xero_sync.py
+    finance_dashboard_refresh.py
+    bamboohr_sync.py
+    replyio_sync.py
+    real_estate_costar.py
+    real_estate_costar_worker.py
     integrations_admin.py
     admin_health.py
   shared/
     azure_clients/
+      sql_client.py
+      bronze_writer.py
+      blob_writer.py
+      queue_client.py
+      costar_queue_client.py
+      run_tracker.py
+      silver_write_locations.py
+      silver_writer_products.py
+      silver_writer_contracts.py
+      silver_writer_resources.py
+      silver_writer_extra_services.py
+      silver_writer_coworker_invoices.py
+      silver_writer_coworkers.py
     nexudus/
+      auth.py
+      client.py
+      transformers/
     xero/
+      oauth.py
+      flow.py
+      token_cipher.py
+      store.py
+      client.py
+      invoice_sync.py
       tenant_directory.py
+    bamboohr/
+      client.py
+      transformers/
+    replyio/
+      client.py
+    real_estate/
+      building_contact_extractor.py
+    integrations/
+      xero_nexudus_overdue.py
     gmaps/
   scripts/
     python_scripts/
     sql_scripts/
   tests/
-    test_xero_tenant_directory.py
   docs/
   deploy/
 ```
@@ -142,6 +214,11 @@ Minimum local configuration:
 - `XERO_REDIRECT_URI`
 - `XERO_SCOPES`
 - `INTEGRATIONS_ENCRYPTION_KEY`
+
+Additional env vars for Real Estate functions:
+
+- `ANTHROPIC_API_KEY`
+- `AZURE_SQL_PDF_JOBS_CONNECTION_STRING`
 
 For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settings.json`.
 
@@ -208,36 +285,52 @@ Recommended verification:
 
 ## Azure Deployment
 
-The current deployment docs target:
+Current deployment targets:
 
 - resource group: `infinitspace-prod-northeurope-data-rg`
-- ETL app: `func-infinitspace-datawarehouse`
-- optional admin app: `func-infinitspace-datawarehouse-admin`
+- ETL app: `func-infinitspace-etl`
 - storage account: `staccinfinitspaceprod001`
 
-Deploy the ETL app:
+### Deploy the ETL app
 
 ```powershell
-func azure functionapp publish func-infinitspace-datawarehouse --python
+func azure functionapp publish func-infinitspace-etl --python
 
 az functionapp config appsettings set `
   --resource-group infinitspace-prod-northeurope-data-rg `
-  --name func-infinitspace-datawarehouse `
+  --name func-infinitspace-etl `
   --settings `
     ENABLE_ETL_FUNCTIONS=1 `
     ENABLE_ADMIN_FUNCTIONS=0 `
+    ENABLE_REAL_ESTATE_FUNCTIONS=0 `
     AZURE_STORAGE_ACCOUNT_NAME=staccinfinitspaceprod001 `
     AZURE_STORAGE_CONTAINER_RAW_NEXUDUS=nexudus-raw-snapshots
 ```
 
-Optional admin app:
+### Deploy with Real Estate enabled
 
 ```powershell
-func azure functionapp publish func-infinitspace-datawarehouse-admin --python
+func azure functionapp publish func-infinitspace-etl --python
 
 az functionapp config appsettings set `
   --resource-group infinitspace-prod-northeurope-data-rg `
-  --name func-infinitspace-datawarehouse-admin `
+  --name func-infinitspace-etl `
+  --settings `
+    ENABLE_ETL_FUNCTIONS=1 `
+    ENABLE_ADMIN_FUNCTIONS=0 `
+    ENABLE_REAL_ESTATE_FUNCTIONS=1 `
+    ANTHROPIC_API_KEY=<key> `
+    AZURE_SQL_PDF_JOBS_CONNECTION_STRING=<Real Estate DB connection string>
+```
+
+### Optional admin app
+
+```powershell
+func azure functionapp publish func-infinitspace-etl --python
+
+az functionapp config appsettings set `
+  --resource-group infinitspace-prod-northeurope-data-rg `
+  --name func-infinitspace-etl `
   --settings `
     ENABLE_ETL_FUNCTIONS=0 `
     ENABLE_ADMIN_FUNCTIONS=1
@@ -255,7 +348,10 @@ Default UTC order:
 4. `03:00` `refresh_ava_availability`
 5. `04:00` `xero_invoice_sync`
 6. `05:00` `bamboohr_sync`
-7. `05:30` `refresh_finance_dashboard`
+7. `05:30` `replyio_stats_sync`
+8. `05:30` `refresh_finance_dashboard`
+
+Real Estate functions are on-demand (HTTP triggered), not scheduled.
 
 Suggested reminder flow after this extension:
 
@@ -307,6 +403,8 @@ ORDER BY tenant_name;
 - `Locations: X fetched, Y written to bronze`
 - `Products: X fetched, Y written to bronze`
 - `Contracts: X fetched, Y written to bronze`
+- `Coworker invoices: X fetched, Y written to bronze. Distinct coworker ids: Z`
+- `Coworkers: X attempted, Y written, Z skipped`
 - `Resources: X attempted, Y written, Z skipped`
 - `Extra services: X fetched, Y written to bronze`
 - `Nexudus -> Bronze sync complete`
@@ -314,7 +412,7 @@ ORDER BY tenant_name;
 ### Expected Silver Logs
 
 - `Bronze -> Silver orchestrator started`
-- `Bronze -> Silver: 5 tasks enqueued`
+- `Bronze -> Silver: 7 tasks enqueued`
 - `Silver worker received: entity=...`
 - `Silver worker complete: entity=...`
 
@@ -329,7 +427,15 @@ ORDER BY tenant_name;
 - `Fetching Xero invoices page`
 - `Writing Xero invoices page`
 - `Xero invoice sync complete`
+- `Xero PDF cache complete: {pdfs_cached: N, pdfs_failed: N, pdfs_total: N}`
 - tenant directory refresh stats inside the final Xero sync payload
+
+### Expected CoStar Logs
+
+- `CoStar job received: job_id=... blob=... pages=...-... — enqueuing`
+- `CoStar worker received: job_id=... blob=... pages=...-...`
+- `CoStar job ...: page X/Y (Z%)`
+- `CoStar job ... completed`
 
 ## Current Status
 
@@ -338,10 +444,14 @@ ORDER BY tenant_name;
 - AVA refresh pipeline: done
 - Xero OAuth, token refresh, tenant storage, and invoice sync: done
 - Xero accounts sync: done
+- Xero invoice PDF caching: done
 - Xero tenant-to-location directory: done
+- BambooHR employee sync: done
+- Reply.io stats sync: done
+- Real Estate CoStar extractor: done (requires `ENABLE_REAL_ESTATE_FUNCTIONS=1`)
+- Gold finance dashboard tables: done
 - Optional admin HTTP routes: done, but not part of the default ETL app
 - Google Maps enrichment utilities: present, not part of the scheduled ETL app
-- Gold finance dashboard tables: done
 
 ## Key Docs
 
@@ -350,4 +460,4 @@ ORDER BY tenant_name;
 - [docs/silver_table_relationships.md](docs/silver_table_relationships.md)
 - [docs/deploy.md](docs/deploy.md)
 
-Last updated: 2026-04-13
+Last updated: 2026-04-14
