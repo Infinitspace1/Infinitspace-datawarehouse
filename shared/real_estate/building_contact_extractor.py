@@ -4,6 +4,7 @@ shared/real_estate/building_contact_extractor.py
 PDF Building Contact Extractor for Azure Functions.
 Uses PyMuPDF (fitz) for PDF-to-image conversion — no system dependencies.
 Uses Anthropic Claude API for contact extraction from page images.
+Uses Google Maps Geocoding API for building address geocoding.
 
 Adapted from AI-REAL-ESTATE/extract_building_contacts_improved.py.
 """
@@ -14,11 +15,14 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 import anthropic
 import fitz  # PyMuPDF
 import pandas as pd
+
+from shared.gmaps.geocoding import GeocodingCache
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +31,7 @@ IMAGE_DPI = 150
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-MAX_TOKENS = 2000
+MAX_TOKENS = 4000
 
 # Rate limiting (Claude Sonnet 4: 50 RPM)
 RATE_LIMIT_RPM = 45
@@ -65,12 +69,21 @@ class BuildingContactExtractor:
         self.start_page = start_page
         self.end_page = end_page
         self.output_file = output_file
+
+        # Current building context (carried across pages)
         self.current_building: str | None = None
         self.current_building_address: str | None = None
-        self.all_rows: list[dict[str, Any]] = []
+        self.current_building_meta: dict[str, Any] = {}
 
+        # Accumulated results
+        self.all_rows: list[dict[str, Any]] = []
+        self.buildings: list[dict[str, Any]] = []
+        self._seen_buildings: set[str] = set()
+
+        # API clients
         self.client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         self.rate_limiter = RateLimiter(max_requests=RATE_LIMIT_RPM, time_window=60)
+        self.geocoding_cache = GeocodingCache()
 
         logger.info("Initialized extractor for pages %s-%s", start_page, end_page)
 
@@ -101,9 +114,16 @@ CRITICAL RULES:
 
 STRUCTURE TO EXTRACT:
 
-**Building Information (from the TOP of the page):**
-- Building name (main heading at top)
-- Building address (full address with city, state, zip, district if shown)
+**Building Information (from the TOP header of the page):**
+- building_name: main heading at top (e.g. "50 California St - 50 California")
+- building_address: the full subtitle line (e.g. "San Francisco, California 94111 (San Francisco County) - Financial District Submarket")
+- building_city: city name (e.g. "San Francisco")
+- building_state: state name (e.g. "California")
+- building_zip: zip/postal code (e.g. "94111")
+- building_county: county in parentheses (e.g. "San Francisco County")
+- building_submarket: submarket after the dash (e.g. "Financial District")
+- building_property_type: property type shown on the right (e.g. "Office")
+- building_star_rating: number of filled stars shown (1-5 integer, count only filled/solid stars)
 
 **Contacts (extract ALL contact sections):**
 For each contact section (Leasing Company, Architect, Developer, Owner, Property Manager, etc.):
@@ -112,7 +132,14 @@ For each contact section (Leasing Company, Architect, Developer, Owner, Property
 - contact_company: Company/organization name
 - contact_job_title: Job title (if shown)
 - contact_email: Email address (if shown)
-- contact_phone: Phone number (if shown)
+- contact_phone: Phone number of the individual contact (if shown, in the same row as the person)
+- company_address: Street address of the company (e.g. "415 Mission St, Suite 46th Floor")
+- company_city: City of the company (e.g. "San Francisco")
+- company_state: State abbreviation of the company (e.g. "CA")
+- company_zip: Zip code of the company (e.g. "94105")
+- company_country: Country of the company (e.g. "USA")
+- company_phone: Main phone number of the company (shown below company name, NOT the individual contact's phone)
+- company_website: Website of the company (e.g. "www.cbre.com")
 
 IMPORTANT NOTES:
 - Some contacts have full details (name, title, email, phone)
@@ -120,11 +147,20 @@ IMPORTANT NOTES:
 - Some contacts only have company name
 - Extract them ALL, with whatever information is available
 - If NO information for a field, use null
+- company_phone is the company's main number, contact_phone is the individual's direct number
+- Multiple contacts may share the same company info (same company_address, company_phone, etc.)
 
 Return ONLY this JSON structure with NO additional text:
 {
-  "building_name": "exact name from page",
-  "building_address": "exact address from page",
+  "building_name": "exact name from page or null",
+  "building_address": "exact subtitle line from page or null",
+  "building_city": "city or null",
+  "building_state": "state or null",
+  "building_zip": "zip or null",
+  "building_county": "county or null",
+  "building_submarket": "submarket or null",
+  "building_property_type": "property type or null",
+  "building_star_rating": 3,
   "contacts": [
     {
       "contact_type": "section heading",
@@ -132,7 +168,14 @@ Return ONLY this JSON structure with NO additional text:
       "contact_company": "company name",
       "contact_job_title": "title or null",
       "contact_email": "email or null",
-      "contact_phone": "phone or null"
+      "contact_phone": "phone or null",
+      "company_address": "street address or null",
+      "company_city": "city or null",
+      "company_state": "state or null",
+      "company_zip": "zip or null",
+      "company_country": "country or null",
+      "company_phone": "company phone or null",
+      "company_website": "website or null"
     }
   ]
 }
@@ -173,13 +216,24 @@ Extract every contact you see, even if they only have minimal information."""
 
                 data = json.loads(response_text)
 
+                # Carry forward building context from previous pages
                 if not data.get("building_name") or data.get("building_name") == "null":
                     if self.current_building:
                         data["building_name"] = self.current_building
                         data["building_address"] = self.current_building_address
+                        for k, v in self.current_building_meta.items():
+                            data.setdefault(k, v)
                 else:
                     self.current_building = data["building_name"]
                     self.current_building_address = data["building_address"]
+                    self.current_building_meta = {
+                        k: data.get(k)
+                        for k in (
+                            "building_city", "building_state", "building_zip",
+                            "building_county", "building_submarket",
+                            "building_property_type", "building_star_rating",
+                        )
+                    }
 
                 data["page_number"] = page_number
 
@@ -217,38 +271,129 @@ Extract every contact you see, even if they only have minimal information."""
             "error": "Max retries exceeded",
         }
 
+    def _process_building(self, page_data: Dict[str, Any]) -> dict[str, Any] | None:
+        """Register a new building (if not seen before) and geocode it.
+
+        Returns the building dict with lat/lng, or None if already registered.
+        """
+        building_name = page_data.get("building_name")
+        if not building_name or building_name in self._seen_buildings:
+            return None
+
+        self._seen_buildings.add(building_name)
+
+        # Build a geocodable address string
+        parts = []
+        if building_name:
+            # Extract just the street part (before " - " if present)
+            street = building_name.split(" - ")[0].strip()
+            parts.append(street)
+        city = page_data.get("building_city")
+        state = page_data.get("building_state")
+        zip_code = page_data.get("building_zip")
+        if city:
+            parts.append(city)
+        if state:
+            parts.append(state)
+        if zip_code:
+            parts.append(zip_code)
+
+        geocode_address = ", ".join(parts) if parts else None
+
+        coords = self.geocoding_cache.get_or_geocode(geocode_address) if geocode_address else None
+
+        building = {
+            "building_name": building_name,
+            "building_address": page_data.get("building_address"),
+            "city": city,
+            "state": state,
+            "zip_code": zip_code,
+            "county": page_data.get("building_county"),
+            "submarket": page_data.get("building_submarket"),
+            "property_type": page_data.get("building_property_type"),
+            "star_rating": page_data.get("building_star_rating"),
+            "latitude": coords["latitude"] if coords else None,
+            "longitude": coords["longitude"] if coords else None,
+            "geocoded_at": datetime.now(timezone.utc).isoformat() if coords else None,
+            "source_page": page_data.get("page_number"),
+        }
+
+        self.buildings.append(building)
+        logger.info(
+            "Registered building: %s (%s, %s)",
+            building_name,
+            building.get("latitude"),
+            building.get("longitude"),
+        )
+        return building
+
     def _collect_rows(self, page_data: Dict[str, Any]) -> None:
         """Accumulate extracted rows in memory."""
         if "error" in page_data or not page_data.get("building_name"):
             return
 
+        # Register building if new
+        self._process_building(page_data)
+
         building_name = page_data["building_name"]
-        building_address = page_data["building_address"]
+        building_address = page_data.get("building_address")
         page_number = page_data["page_number"]
+
+        # Find the building's coordinates from our list
+        building_coords = next(
+            (b for b in self.buildings if b["building_name"] == building_name),
+            {},
+        )
+
+        base_row = {
+            "Building Name": building_name,
+            "Building Address": building_address,
+            "City": page_data.get("building_city"),
+            "State": page_data.get("building_state"),
+            "Zip Code": page_data.get("building_zip"),
+            "County": page_data.get("building_county"),
+            "Submarket": page_data.get("building_submarket"),
+            "Property Type": page_data.get("building_property_type"),
+            "Star Rating": page_data.get("building_star_rating"),
+            "Latitude": building_coords.get("latitude"),
+            "Longitude": building_coords.get("longitude"),
+        }
 
         if not page_data.get("contacts"):
             self.all_rows.append({
-                "Building Name": building_name,
-                "Building Address": building_address,
+                **base_row,
                 "Contact Type": None,
                 "Contact Name": None,
                 "Contact Company": None,
                 "Contact Job Title": None,
                 "Contact Email": None,
                 "Contact Phone": None,
+                "Company Address": None,
+                "Company City": None,
+                "Company State": None,
+                "Company Zip": None,
+                "Company Country": None,
+                "Company Phone": None,
+                "Company Website": None,
                 "Page": page_number,
             })
         else:
             for contact in page_data["contacts"]:
                 self.all_rows.append({
-                    "Building Name": building_name,
-                    "Building Address": building_address,
+                    **base_row,
                     "Contact Type": contact.get("contact_type"),
                     "Contact Name": contact.get("contact_name"),
                     "Contact Company": contact.get("contact_company"),
                     "Contact Job Title": contact.get("contact_job_title"),
                     "Contact Email": contact.get("contact_email"),
                     "Contact Phone": contact.get("contact_phone"),
+                    "Company Address": contact.get("company_address"),
+                    "Company City": contact.get("company_city"),
+                    "Company State": contact.get("company_state"),
+                    "Company Zip": contact.get("company_zip"),
+                    "Company Country": contact.get("company_country"),
+                    "Company Phone": contact.get("company_phone"),
+                    "Company Website": contact.get("company_website"),
                     "Page": page_number,
                 })
 
@@ -286,8 +431,9 @@ Extract every contact you see, even if they only have minimal information."""
 
                     if processed % 5 == 0:
                         logger.info(
-                            "Progress: %s/%s (%.1f%%) | Errors: %s",
-                            processed, total_pages, processed / total_pages * 100, errors,
+                            "Progress: %s/%s (%.1f%%) | Errors: %s | Buildings: %s",
+                            processed, total_pages, processed / total_pages * 100,
+                            errors, len(self.buildings),
                         )
 
                 except Exception as e:
@@ -300,7 +446,8 @@ Extract every contact you see, even if they only have minimal information."""
         self.save_to_excel()
 
         logger.info(
-            "Extraction complete — processed: %s/%s, errors: %s, output: %s",
-            processed, total_pages, errors, self.output_file,
+            "Extraction complete — processed: %s/%s, errors: %s, buildings: %s, contacts: %s, output: %s",
+            processed, total_pages, errors, len(self.buildings), len(self.all_rows),
+            self.output_file,
         )
         return str(self.output_file)

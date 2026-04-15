@@ -157,6 +157,98 @@ def _upload_blob(blob_svc: BlobServiceClient, local_path: str, blob_name: str) -
 
 
 # ---------------------------------------------------------------------------
+# Write extraction results to bronze tables
+# ---------------------------------------------------------------------------
+
+def _write_extraction_results(conn: pyodbc.Connection, job_id: str, extractor: Any) -> None:
+    """Insert buildings and contacts from the extractor into the Real Estate DB.
+
+    Tables: bronze.costar_building, bronze.costar_building_contacts
+    """
+    cur = conn.cursor()
+
+    # Map building_name -> generated DB id
+    building_id_map: dict[str, int] = {}
+
+    # Insert buildings
+    for b in extractor.buildings:
+        cur.execute(
+            """
+            INSERT INTO bronze.costar_building
+                (job_id, building_name, building_address, city, state, zip_code,
+                 county, submarket, property_type, star_rating,
+                 latitude, longitude, geocoded_at, source_page)
+            OUTPUT INSERTED.id
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            job_id,
+            b.get("building_name"),
+            b.get("building_address"),
+            b.get("city"),
+            b.get("state"),
+            b.get("zip_code"),
+            b.get("county"),
+            b.get("submarket"),
+            b.get("property_type"),
+            b.get("star_rating"),
+            b.get("latitude"),
+            b.get("longitude"),
+            b.get("geocoded_at"),
+            b.get("source_page"),
+        )
+        row = cur.fetchone()
+        if row:
+            building_id_map[b["building_name"]] = row[0]
+
+    conn.commit()
+    logger.info("CoStar job %s: inserted %s buildings", job_id, len(building_id_map))
+
+    # Insert contacts
+    contacts_inserted = 0
+    for r in extractor.all_rows:
+        building_name = r.get("Building Name")
+        building_id = building_id_map.get(building_name)
+        if building_id is None:
+            logger.warning("No building_id for contact row: %s", building_name)
+            continue
+
+        # Skip rows with no contact info (empty placeholder rows)
+        if not r.get("Contact Type") and not r.get("Contact Name") and not r.get("Contact Company"):
+            continue
+
+        cur.execute(
+            """
+            INSERT INTO bronze.costar_building_contacts
+                (job_id, building_id, contact_type, contact_name, contact_company,
+                 contact_job_title, contact_email, contact_phone,
+                 company_address, company_city, company_state, company_zip,
+                 company_country, company_phone, company_website, source_page)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            job_id,
+            building_id,
+            r.get("Contact Type"),
+            r.get("Contact Name"),
+            r.get("Contact Company"),
+            r.get("Contact Job Title"),
+            r.get("Contact Email"),
+            r.get("Contact Phone"),
+            r.get("Company Address"),
+            r.get("Company City"),
+            r.get("Company State"),
+            r.get("Company Zip"),
+            r.get("Company Country"),
+            r.get("Company Phone"),
+            r.get("Company Website"),
+            r.get("Page"),
+        )
+        contacts_inserted += 1
+
+    conn.commit()
+    logger.info("CoStar job %s: inserted %s contacts", job_id, contacts_inserted)
+
+
+# ---------------------------------------------------------------------------
 # Core extraction logic
 # ---------------------------------------------------------------------------
 
@@ -208,6 +300,9 @@ def _run_extraction_job(
 
         extractor.extract_from_page = extract_with_progress
         extractor.process_pdf()
+
+        # Write extracted buildings & contacts to DB
+        _write_extraction_results(conn, job_id, extractor)
 
         blob_name_output = f"{job_id}_contacts.xlsx"
         _upload_blob(blob_svc, temp_output_path, blob_name_output)
