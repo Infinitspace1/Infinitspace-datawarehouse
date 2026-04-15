@@ -134,3 +134,39 @@ class NexudusClient:
             GET /api/spaces/coworkers/{id}
         """
         return await self.get_one(f"spaces/coworkers/{coworker_id}")
+
+    async def get_coworker_invoice_lines(self, invoice_source_id: int) -> list[dict]:
+        """
+        Fetch all line items for a single coworker invoice.
+
+        Endpoint:
+            GET /api/billing/coworkerinvoicelines?CoworkerInvoiceLine_CoworkerInvoice={id}
+        """
+        return await self.get_all(
+            "billing/coworkerinvoicelines",
+            extra_params={"CoworkerInvoiceLine_CoworkerInvoice": invoice_source_id},
+        )
+
+    async def get_invoice_pdf(self, invoice_source_id: int) -> Optional[bytes]:
+        """
+        Download the PDF for a coworker invoice.
+
+        Endpoint:
+            GET /api/billing/coworkerinvoice/{id}/pdf
+
+        Returns raw PDF bytes, or None if the invoice has no PDF (404).
+        """
+        url = f"{BASE_URL}/billing/coworkerinvoice/{invoice_source_id}/pdf"
+        try:
+            async with self._semaphore:
+                async with self._session.get(url) as resp:
+                    if resp.status == 404:
+                        logger.warning("No PDF for invoice %s", invoice_source_id)
+                        return None
+                    resp.raise_for_status()
+                    return await resp.read()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
+                logger.warning("No PDF for invoice %s", invoice_source_id)
+                return None
+            raise

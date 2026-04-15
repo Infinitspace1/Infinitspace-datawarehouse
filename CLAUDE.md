@@ -24,7 +24,7 @@ Platform:
 
 - Azure Functions
 - Azure SQL
-- Azure Blob Storage for raw Nexudus snapshots and Xero invoice PDFs
+- Azure Blob Storage for raw Nexudus snapshots, Nexudus invoice PDFs, and Xero invoice PDFs
 - Azure Storage Queue for silver fanout
 
 Current deployment docs target:
@@ -43,9 +43,11 @@ Default ETL execution order in UTC:
 2. `02:30` `bronze_to_silver`
 3. queue fanout via `silver_entity_worker`
 4. `03:00` `refresh_ava_availability`
-5. `04:00` `xero_invoice_sync` (includes PDF caching for invoices missing `pdf_blob_path`)
-6. `05:00` `bamboohr_sync`
-7. `05:30` `replyio_stats_sync`
+5. `03:30` `nexudus_invoice_pdf_cache` (caches PDFs for invoices missing `pdf_blob_path`)
+6. `04:00` `xero_invoice_sync` (includes PDF caching for invoices missing `pdf_blob_path`)
+7. `05:00` `bamboohr_sync`
+8. `05:30` `replyio_stats_sync`
+9. `05:30` `refresh_finance_dashboard`
 
 Important operational caveat:
 
@@ -66,11 +68,12 @@ Nexudus API
   -> bronze.nexudus_coworkers           (distinct CoworkerIds from invoices)
   -> bronze.nexudus_resources
   -> bronze.nexudus_extra_services
+  -> bronze.nexudus_coworker_invoice_lines (per-invoice line items)
   -> blob snapshots (nexudus-raw-snapshots container)
 
 bronze_to_silver
   -> Azure Storage Queue: silver-sync-tasks
-  -> silver_entity_worker x 7
+  -> silver_entity_worker x 8
   -> silver.nexudus_locations
   -> silver.nexudus_location_hours
   -> silver.nexudus_products
@@ -79,6 +82,12 @@ bronze_to_silver
   -> silver.nexudus_coworkers
   -> silver.nexudus_resources
   -> silver.nexudus_extra_services
+  -> silver.nexudus_coworker_invoice_lines
+
+nexudus_invoice_pdf_cache (timer, 03:30 UTC)
+  -> downloads PDFs from Nexudus API for invoices missing pdf_blob_path
+  -> uploads to Azure Blob: nexudus-invoice-pdfs container
+  -> updates silver.nexudus_coworker_invoices.pdf_blob_path
 
 refresh_ava_availability
   -> EXEC ava.sp_refresh_product_availability
@@ -106,6 +115,11 @@ Reply.io API
   -> replyio_stats_sync (timer, 05:30 UTC)
   -> bronze.replyio_sequence_steps
   -> bronze.replyio_sequence_step_performance (daily stats, yesterday)
+
+refresh_finance_dashboard (timer, 05:30 UTC)
+  -> EXEC gold.sp_refresh_finance_dashboard
+  -> gold.finance_dashboard_user_access (BambooHR -> Nexudus locations)
+  -> gold.finance_dashboard_invoice_worklist (Nexudus invoices, Nexudus-only)
 ```
 
 ---
@@ -164,7 +178,9 @@ Infinitspace-datawarehouse/
     silver_nexudus.py
     silver_worker.py
     ava_refresh.py
+    nexudus_invoice_pdf_cache.py
     xero_sync.py
+    finance_dashboard_refresh.py
     integrations_admin.py
     admin_health.py
     real_estate_costar.py
@@ -183,10 +199,12 @@ Infinitspace-datawarehouse/
       silver_writer_resources.py
       silver_writer_extra_services.py
       silver_writer_coworker_invoices.py
+      silver_writer_coworker_invoice_lines.py
       silver_writer_coworkers.py
     nexudus/
       auth.py
       client.py
+      invoice_pdf_cache.py
       transformers/
         locations.py
         products.py
@@ -194,6 +212,7 @@ Infinitspace-datawarehouse/
         resources.py
         extra_services.py
         coworker_invoices.py
+        coworker_invoice_lines.py
         coworkers.py
     bamboohr/
       __init__.py
@@ -261,6 +280,7 @@ Infinitspace-datawarehouse/
       ava_sp_refresh_product_availability.sql
       integrations_nexudus_xero_schema.sql
       nexudus_billing_sync_schema.sql
+      nexudus_coworker_invoice_lines_schema.sql
       xero_invoices_schema.sql
       xero_pdf_blob_migration.sql
       test.sql
@@ -288,8 +308,8 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 
 | Function | File | Trigger | Default schedule or binding | Notes |
 |----------|------|---------|-----------------------------|-------|
-| `nexudus_to_bronze` | `functions/bronze_nexudus.py` | timer | `0 0 2 * * *` | writes bronze + blob snapshots; coworker invoices/coworkers are incremental via UpdatedSince |
-| `bronze_to_silver` | `functions/silver_nexudus.py` | timer | `0 30 2 * * *` | enqueues 7 queue messages (includes coworker_invoices + coworkers) |
+| `nexudus_to_bronze` | `functions/bronze_nexudus.py` | timer | `0 0 2 * * *` | writes bronze + blob snapshots; 8 entities including coworker_invoice_lines |
+| `bronze_to_silver` | `functions/silver_nexudus.py` | timer | `0 30 2 * * *` | enqueues 8 queue messages (includes coworker_invoice_lines) |
 | `silver_entity_worker` | `functions/silver_worker.py` | queue | `silver-sync-tasks` | one entity per invocation |
 | `refresh_ava_availability` | `functions/ava_refresh.py` | timer | `0 0 3 * * *` | executes AVA stored procedure |
 | `xero_invoice_sync` | `functions/xero_sync.py` | timer | `0 0 4 * * *` | syncs all linked Xero tenants + caches PDFs for invoices missing `pdf_blob_path`; reuses the backfill retry/throttle flow |
@@ -298,6 +318,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `run_costar_extractor` | `functions/real_estate_costar.py` | HTTP POST | `real-estate/costar/run` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — enqueues only, returns 202 |
 | `costar_extraction_worker` | `functions/real_estate_costar_worker.py` | queue | `costar-extraction-tasks` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — does the actual extraction |
 | `bamboohr_sync` | `functions/bamboohr_sync.py` | timer | `0 0 5 * * *` | syncs all BambooHR employees to bronze + silver; join key: `work_email` |
+| `nexudus_invoice_pdf_cache` | `functions/nexudus_invoice_pdf_cache.py` | timer | `0 30 3 * * *` | caches Nexudus invoice PDFs to blob for invoices missing `pdf_blob_path` |
 | `replyio_stats_sync` | `functions/replyio_sync.py` | timer | `0 30 5 * * *` | syncs Reply.io sequence steps + daily step performance stats to bronze |
 
 ---
@@ -323,6 +344,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - `bronze.xero_invoices`
 - `bronze.xero_invoice_pdfs` — stores `blob_path` reference, not raw bytes
 - `bronze.bamboohr_employees`
+- `bronze.nexudus_coworker_invoice_lines`
 - `bronze.replyio_sequence_steps`
 - `bronze.replyio_sequence_step_performance`
 
@@ -336,7 +358,8 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `silver.nexudus_contracts`
 - `silver.nexudus_resources`
 - `silver.nexudus_extra_services`
-- `silver.nexudus_coworker_invoices`
+- `silver.nexudus_coworker_invoices` — includes `pdf_blob_path`, `pdf_cached_at`
+- `silver.nexudus_coworker_invoice_lines` — per-invoice line items with `financial_account_code`/`financial_account_name`
 - `silver.nexudus_coworkers`
 - `silver.xero_invoices` — includes `pdf_blob_path`, `pdf_cached_at`
 - `silver.xero_invoice_line_items`
@@ -354,6 +377,17 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
   - populated by stored procedure
   - no incremental logic
 
+### Gold
+
+- `gold.finance_dashboard_user_access`
+  - materialized BambooHR employee → Nexudus location access table
+  - CM/ACM access rules with Amsterdam exception
+- `gold.finance_dashboard_invoice_worklist`
+  - materialized Nexudus invoice worklist (Nexudus-only, no Xero dependency)
+  - workflow_type: `recurrent` if any line item has `financial_account_name LIKE '%MEMBERSHIP FEES%'`
+  - includes `pdf_blob_path` for cached Nexudus invoice PDFs
+  - rebuilt by `gold.sp_refresh_finance_dashboard`
+
 ### Meta
 
 - `meta.sync_runs`
@@ -362,6 +396,7 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `meta.xero_oauth_states`
 - `meta.xero_connections`
 - `meta.xero_tenants`
+- `meta.finance_dashboard_location_settings` — per-location finance email, seeded from known locations
 
 ### Xero Directory
 
@@ -379,13 +414,15 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 
 - `functions/bronze_nexudus.py`
 - fetch order:
-  - locations
-  - products
-  - contracts
-  - coworker_invoices (incremental — passes `UpdatedSince` watermark from `meta.sync_runs` on subsequent runs)
-  - coworkers (fetches only distinct CoworkerIds seen in coworker_invoices)
-  - resources
-  - extra_services
+  - locations (incremental via `UpdatedSince` watermark)
+  - products (incremental via `UpdatedSince` watermark)
+  - contracts (incremental via `UpdatedSince` watermark)
+  - coworker_invoices (incremental via `UpdatedSince` watermark)
+  - coworkers (per-ID from invoices — no `UpdatedSince`)
+  - resources (per-ID from products — no `UpdatedSince`)
+  - extra_services (incremental via `UpdatedSince` watermark)
+  - coworker_invoice_lines (fetches lines only for invoices updated in current run)
+- all paginated entities use `UpdatedSince` watermark from `meta.sync_runs.finished_at` on subsequent runs; first run does full fetch
 - each entity writes a `RunTracker` row
 - each entity also writes a blob snapshot
 
@@ -395,7 +432,7 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `functions/silver_worker.py` performs the actual transformation
 - queue retries are safe because silver writes are idempotent upserts
 - poison queue: `silver-sync-tasks-poison`
-- entities: locations, products, contracts, coworker_invoices, coworkers, resources, extra_services
+- entities: locations, products, contracts, coworker_invoices, coworkers, resources, extra_services, coworker_invoice_lines
 
 ### AVA Refresh
 
@@ -421,6 +458,15 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `shared/xero/tenant_directory.py`
   - matches legal Xero tenant names to Nexudus locations
   - preserves any manually maintained `community_manager_name`
+
+### Nexudus Invoice PDF Storage
+
+- PDFs are stored in Azure Blob Storage, not in SQL
+- container: `nexudus-invoice-pdfs` on `staccinfinitspaceprod001`
+- blob path format: `{location_source_id}/{yyyy}/{mm}/{invoice_source_id}.pdf`
+- `silver.nexudus_coworker_invoices.pdf_blob_path` holds the reference
+- `pdf_blob_path IS NULL` is the natural watermark — only invoices still missing a cached PDF are fetched each run
+- timer function: `nexudus_invoice_pdf_cache` at 03:30 UTC
 
 ### Xero PDF Storage
 
@@ -521,6 +567,7 @@ AZURE_SQL_TRUST_SERVER_CERTIFICATE=false
 AZURE_STORAGE_ACCOUNT_NAME=staccinfinitspaceprod001
 AZURE_STORAGE_CONTAINER_RAW_NEXUDUS=nexudus-raw-snapshots
 AZURE_STORAGE_CONTAINER_XERO_PDFS=xero-invoice-pdfs
+AZURE_STORAGE_CONTAINER_NEXUDUS_PDFS=nexudus-invoice-pdfs
 
 # Queue trigger storage
 AzureWebJobsStorage=...
@@ -554,6 +601,8 @@ SILVER_SYNC_SCHEDULE="0 30 2 * * *"
 AVA_REFRESH_SCHEDULE="0 0 3 * * *"
 XERO_INVOICE_SYNC_SCHEDULE="0 0 4 * * *"
 XERO_INVOICE_SYNC_FORCE_FULL=0
+NEXUDUS_PDF_CACHE_SCHEDULE="0 30 3 * * *"
+FINANCE_DASHBOARD_REFRESH_SCHEDULE="0 30 5 * * *"
 REPLYIO_SYNC_SCHEDULE="0 30 5 * * *"
 ```
 
@@ -722,8 +771,8 @@ az functionapp config appsettings set `
  
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Nexudus bronze sync | done | 7 entities (added coworker_invoices + coworkers) |
-| Nexudus silver fanout | done | queue-based, 7 entities |
+| Nexudus bronze sync | done | 8 entities (added coworker_invoice_lines) |
+| Nexudus silver fanout | done | queue-based, 8 entities |
 | AVA refresh | done | stored procedure rebuild |
 | Xero OAuth + tenant storage | done | DB-backed |
 | Xero auto-refresh | done | disconnects on `invalid_grant` |
@@ -738,6 +787,9 @@ az functionapp config appsettings set `
 | Real Estate CoStar extractor HTTP function | done | `ENABLE_REAL_ESTATE_FUNCTIONS=1` to activate |
 | BambooHR employee sync | done | bronze + silver; `work_email` is join key to Nexudus coworkers |
 | Reply.io stats sync | done | bronze only; sequence steps + daily step performance; 4 AB test sequences |
+| Nexudus coworker invoice lines | done | bronze + silver; `financial_account_code`/`financial_account_name` per line item |
+| Nexudus invoice PDF caching | done | blob storage (`nexudus-invoice-pdfs`); path in `silver.nexudus_coworker_invoices.pdf_blob_path` |
+| Finance dashboard gold layer | done | Nexudus-only; `gold.finance_dashboard_invoice_worklist` + `gold.finance_dashboard_user_access`; rebuilt by `gold.sp_refresh_finance_dashboard` |
 
 ---
 
@@ -755,6 +807,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-14 (gold finance dashboard: switched due_date/amount_due to Nexudus source, excluded unmatched invoices, added due_amount>0 and due_date>=2026-03-01 filters; all 12 Xero tenants now connected)
+Last updated: 2026-04-15 (gold finance dashboard rewritten to Nexudus-only: removed Xero dependency from gold tables; added coworker_invoice_lines bronze+silver entity; added Nexudus invoice PDF caching; workflow_type classification now uses Nexudus financial_account_name; user access table simplified to BambooHR+Nexudus only)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

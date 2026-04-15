@@ -227,6 +227,27 @@ class BronzeWriter:
             rows,
         )
 
+    def write_coworker_invoice_lines(self, records: list[dict]) -> int:
+        """
+        bronze.nexudus_coworker_invoice_lines
+        source_id           = CoworkerInvoiceLine Id
+        invoice_source_id   = CoworkerInvoiceId
+        """
+        rows = []
+        for r in records:
+            rows.append((
+                self.sync_run_id,
+                r.get("Id"),
+                r.get("CoworkerInvoiceId"),
+                self._to_json(r),
+            ))
+        return self._batch_upsert(
+            "bronze.nexudus_coworker_invoice_lines",
+            ["sync_run_id", "source_id", "invoice_source_id", "raw_json"],
+            ["sync_run_id", "invoice_source_id", "raw_json"],
+            rows,
+        )
+
     def write_coworkers(self, records: list[dict]) -> int:
         """
         bronze.nexudus_coworkers

@@ -5,11 +5,26 @@ Blueprint: Timer trigger (daily) that pulls all Nexudus entities
 and writes raw JSON to the bronze layer.
 
 Entities pulled (in order):
-  1. locations        -- GET /sys/businesses
-  2. products         -- GET /sys/floorplandesks (all item types)
-  3. contracts        -- GET /billing/coworkercontracts
-  4. resources        -- GET /spaces/resources/{id}
-  5. extra_services   -- GET /billing/extraservices
+  1. locations              -- GET /sys/businesses
+  2. products               -- GET /sys/floorplandesks (all item types)
+  3. contracts              -- GET /billing/coworkercontracts
+  4. coworker_invoices      -- GET /billing/coworkerinvoices
+  5. coworkers              -- GET /spaces/coworkers/{id}
+  6. resources              -- GET /spaces/resources/{id}
+  7. extra_services         -- GET /billing/extraservices
+  8. coworker_invoice_lines -- GET /billing/coworkerinvoicelines (per invoice)
+
+Incremental sync:
+  Paginated entities (locations, products, contracts, extra_services,
+  coworker_invoices) use the UpdatedSince watermark from meta.sync_runs.
+  First run does a full fetch; subsequent runs only fetch records updated
+  since the last successful bronze run for that entity.
+
+  Per-record entities (resources, coworkers) are driven by their parent
+  entity and cannot use UpdatedSince directly.
+
+  coworker_invoice_lines fetches lines only for invoices updated in the
+  current run (from coworker_invoices).
 
 Each entity gets its own RunTracker entry in meta.sync_runs.
 """
@@ -34,6 +49,45 @@ bp = func.Blueprint()
 SCHEDULE = os.getenv("NEXUDUS_SYNC_SCHEDULE", "0 0 2 * * *")
 
 
+# ── Watermark helper ────────────────────────────────────────────
+
+def _get_watermark(entity: str) -> str | None:
+    """Return ISO timestamp of the last successful bronze run for entity, or None."""
+    try:
+        sql = get_sql_client()
+        rows = sql.execute_query(
+            """
+            SELECT TOP 1 finished_at
+            FROM meta.sync_runs
+            WHERE source_name = 'nexudus'
+              AND entity = ?
+              AND layer = 'bronze'
+              AND status = 'success'
+            ORDER BY finished_at DESC
+            """,
+            (entity,),
+        )
+        if rows and rows[0].get("finished_at"):
+            ts = rows[0]["finished_at"]
+            dt = ts if hasattr(ts, "strftime") else __import__("datetime").datetime.fromisoformat(str(ts))
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception as exc:
+        logger.warning("Could not read %s watermark: %s", entity, exc)
+    return None
+
+
+def _incremental_params(entity: str) -> dict:
+    """Build extra_params with UpdatedSince if a watermark exists."""
+    watermark = _get_watermark(entity)
+    if watermark:
+        logger.info("%s: incremental fetch since %s", entity, watermark)
+        return {"UpdatedSince": watermark}
+    logger.info("%s: no watermark found, doing full fetch", entity)
+    return {}
+
+
+# ── Main trigger ────────────────────────────────────────────────
+
 @bp.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
 async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
     logger.info("Nexudus -> Bronze sync started")
@@ -52,13 +106,16 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
         locations = await _sync_locations(client, blob_writer, writer, run_id)
         products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
         await _sync_contracts(client, blob_writer, writer, run_id, products)
-        _, coworker_ids = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
+        invoice_records, coworker_ids = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
         await _sync_coworkers(client, blob_writer, writer, run_id, coworker_ids)
         await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
         await _sync_extra_services(client, blob_writer, writer, run_id)
+        await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, invoice_records)
 
     logger.info(f"Nexudus -> Bronze sync complete [run_id={run_id}]")
 
+
+# ── Entity sync functions ───────────────────────────────────────
 
 async def _sync_locations(
     client: NexudusClient,
@@ -66,8 +123,9 @@ async def _sync_locations(
     writer: BronzeWriter,
     run_id: uuid.UUID,
 ) -> list[dict]:
+    extra_params = _incremental_params("locations")
     async with RunTracker("nexudus", "locations", "bronze", metadata=str(run_id)) as run:
-        records = await client.get_all("sys/businesses")
+        records = await client.get_all("sys/businesses", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("locations", records, run_id)
         run.rows_written = writer.write_locations(records)
@@ -85,8 +143,9 @@ async def _sync_products(
     run_id: uuid.UUID,
     locations: list[dict],
 ) -> tuple[list[dict], dict[int, list[int]]]:
+    extra_params = _incremental_params("products")
     async with RunTracker("nexudus", "products", "bronze", metadata=str(run_id)) as run:
-        records = await client.get_all("sys/floorplandesks")
+        records = await client.get_all("sys/floorplandesks", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("products", records, run_id)
         run.rows_written = writer.write_products(records)
@@ -115,8 +174,9 @@ async def _sync_contracts(
     run_id: uuid.UUID,
     products: list[dict],
 ) -> None:
+    extra_params = _incremental_params("contracts")
     async with RunTracker("nexudus", "contracts", "bronze", metadata=str(run_id)) as run:
-        records = await client.get_all("billing/coworkercontracts")
+        records = await client.get_all("billing/coworkercontracts", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("contracts", records, run_id)
         run.rows_written = writer.write_contracts(records)
@@ -133,6 +193,7 @@ async def _sync_resources(
     run_id: uuid.UUID,
     resource_ids_by_location: dict[int, list[int]],
 ) -> None:
+    """Resources are fetched per-ID from products — no UpdatedSince support."""
     all_resource_ids = [
         (location_id, resource_id)
         for location_id, ids in resource_ids_by_location.items()
@@ -185,8 +246,9 @@ async def _sync_extra_services(
     writer: BronzeWriter,
     run_id: uuid.UUID,
 ) -> None:
+    extra_params = _incremental_params("extra_services")
     async with RunTracker("nexudus", "extra_services", "bronze", metadata=str(run_id)) as run:
-        records = await client.get_all("billing/extraservices")
+        records = await client.get_all("billing/extraservices", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("extra_services", records, run_id)
         run.rows_written = writer.write_extra_services(records)
@@ -196,43 +258,13 @@ async def _sync_extra_services(
         )
 
 
-def _get_coworker_invoices_watermark() -> str | None:
-    """Return ISO timestamp of the last successful coworker_invoices bronze run, or None."""
-    try:
-        sql = get_sql_client()
-        rows = sql.execute_query(
-            """
-            SELECT TOP 1 finished_at
-            FROM meta.sync_runs
-            WHERE source_name = 'nexudus'
-              AND entity = 'coworker_invoices'
-              AND layer = 'bronze'
-              AND status = 'success'
-            ORDER BY finished_at DESC
-            """
-        )
-        if rows and rows[0].get("finished_at"):
-            ts = rows[0]["finished_at"]
-            dt = ts if hasattr(ts, "strftime") else __import__("datetime").datetime.fromisoformat(str(ts))
-            return dt.strftime("%Y-%m-%dT%H:%M:%S")
-    except Exception as exc:
-        logger.warning("Could not read coworker_invoices watermark: %s", exc)
-    return None
-
-
 async def _sync_coworker_invoices(
     client: NexudusClient,
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
 ) -> tuple[list[dict], list[int]]:
-    watermark = _get_coworker_invoices_watermark()
-    extra_params = {"UpdatedSince": watermark} if watermark else {}
-    if watermark:
-        logger.info("Coworker invoices: incremental fetch since %s", watermark)
-    else:
-        logger.info("Coworker invoices: no watermark found, doing full fetch")
-
+    extra_params = _incremental_params("coworker_invoices")
     async with RunTracker("nexudus", "coworker_invoices", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("billing/coworkerinvoices", extra_params=extra_params)
         run.rows_read = len(records)
@@ -256,6 +288,7 @@ async def _sync_coworkers(
     run_id: uuid.UUID,
     coworker_ids: list[int],
 ) -> None:
+    """Coworkers are fetched per-ID from invoices — no UpdatedSince support."""
     if not coworker_ids:
         logger.info("Coworkers: no CoworkerIds found in coworker invoices, skipping")
         return
@@ -281,5 +314,58 @@ async def _sync_coworkers(
             run.rows_read,
             run.rows_written,
             run.rows_skipped,
+            blob_path,
+        )
+
+
+async def _sync_coworker_invoice_lines(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+    invoice_records: list[dict],
+) -> None:
+    """Fetch line items only for invoices updated in the current run.
+
+    On the first run (no invoice_records because coworker_invoices did a full
+    fetch with UpdatedSince and returned everything), this processes all of them.
+    On incremental runs, only invoices that changed are re-fetched.
+    """
+    if not invoice_records:
+        logger.info("Coworker invoice lines: no updated invoices, skipping")
+        return
+
+    invoice_source_ids = [
+        int(r["Id"]) for r in invoice_records if r.get("Id")
+    ]
+
+    async with RunTracker("nexudus", "coworker_invoice_lines", "bronze", metadata=str(run_id)) as run:
+        run.rows_read = len(invoice_source_ids)
+        all_lines: list[dict] = []
+        errors = 0
+
+        for invoice_id in invoice_source_ids:
+            try:
+                lines = await client.get_coworker_invoice_lines(invoice_id)
+                all_lines.extend(lines)
+            except Exception as exc:
+                logger.warning("Invoice lines for %s failed: %s", invoice_id, exc)
+                errors += 1
+
+        run.rows_skipped = errors
+        if all_lines:
+            blob_path = blob_writer.write_snapshot("coworker_invoice_lines", all_lines, run_id)
+            run.rows_written = writer.write_coworker_invoice_lines(all_lines)
+        else:
+            blob_path = "none"
+            run.rows_written = 0
+
+        logger.info(
+            "Coworker invoice lines: %s invoices queried, %s lines fetched, "
+            "%s written to bronze, %s errors [blob=%s]",
+            len(invoice_source_ids),
+            len(all_lines),
+            run.rows_written,
+            errors,
             blob_path,
         )

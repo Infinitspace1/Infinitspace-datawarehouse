@@ -43,6 +43,7 @@ ENTITIES = [
     "coworkers",
     "resources",
     "extra_services",
+    "coworker_invoice_lines",
 ]
 
 

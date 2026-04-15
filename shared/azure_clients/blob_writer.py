@@ -29,6 +29,7 @@ class BlobWriter:
         self.account_name = os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "staccinfinitspaceprod001")
         self.container_name = os.getenv("AZURE_STORAGE_CONTAINER_RAW_NEXUDUS", "nexudus-raw-snapshots")
         self.pdf_container_name = os.getenv("AZURE_STORAGE_CONTAINER_XERO_PDFS", "xero-invoice-pdfs")
+        self.nexudus_pdf_container_name = os.getenv("AZURE_STORAGE_CONTAINER_NEXUDUS_PDFS", "nexudus-invoice-pdfs")
         if not self.account_name:
             raise EnvironmentError("AZURE_STORAGE_ACCOUNT_NAME is required")
 
@@ -37,8 +38,9 @@ class BlobWriter:
         self._service = BlobServiceClient(account_url=account_url, credential=credential)
         self._container = self._service.get_container_client(self.container_name)
         self._pdf_container = self._service.get_container_client(self.pdf_container_name)
+        self._nexudus_pdf_container = self._service.get_container_client(self.nexudus_pdf_container_name)
 
-        for container in (self._container, self._pdf_container):
+        for container in (self._container, self._pdf_container, self._nexudus_pdf_container):
             try:
                 container.create_container()
             except ResourceExistsError:
@@ -61,6 +63,30 @@ class BlobWriter:
         blob_name = f"{tenant_id}/{now:%Y}/{now:%m}/{invoice_source_id}.pdf"
         content_settings = ContentSettings(content_type=content_type)
         self._pdf_container.upload_blob(
+            name=blob_name,
+            data=pdf_bytes,
+            overwrite=True,
+            content_settings=content_settings,
+        )
+        return blob_name
+
+    def write_nexudus_pdf(
+        self,
+        location_source_id: int,
+        invoice_source_id: int,
+        pdf_bytes: bytes,
+        content_type: str = "application/pdf",
+    ) -> str:
+        """
+        Upload a PDF to the nexudus-invoice-pdfs container.
+
+        Blob path: {location_source_id}/{yyyy}/{mm}/{invoice_source_id}.pdf
+        Returns the blob path (stored in SQL as the reference).
+        """
+        now = datetime.now(timezone.utc)
+        blob_name = f"{location_source_id}/{now:%Y}/{now:%m}/{invoice_source_id}.pdf"
+        content_settings = ContentSettings(content_type=content_type)
+        self._nexudus_pdf_container.upload_blob(
             name=blob_name,
             data=pdf_bytes,
             overwrite=True,

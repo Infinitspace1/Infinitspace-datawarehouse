@@ -39,6 +39,7 @@ from shared.azure_clients.silver_write_locations import SilverLocationsWriter
 from shared.azure_clients.silver_writer_products import SilverProductsWriter
 from shared.azure_clients.silver_writer_contracts import SilverContractsWriter
 from shared.azure_clients.silver_writer_coworker_invoices import SilverCoworkerInvoicesWriter
+from shared.azure_clients.silver_writer_coworker_invoice_lines import SilverCoworkerInvoiceLinesWriter
 from shared.azure_clients.silver_writer_coworkers import SilverCoworkersWriter
 from shared.azure_clients.silver_writer_resources import SilverResourcesWriter
 from shared.azure_clients.silver_writer_extra_services import SilverExtraServicesWriter
@@ -80,6 +81,10 @@ _ENTITY_MAP = {
     "extra_services": (
         SilverExtraServicesWriter,
         lambda r: r.get("extra_services", 0),
+    ),
+    "coworker_invoice_lines": (
+        SilverCoworkerInvoiceLinesWriter,
+        lambda r: r.get("coworker_invoice_lines", 0),
     ),
 }
 
