@@ -26,6 +26,12 @@ Incremental sync:
   coworker_invoice_lines fetches lines only for invoices updated in the
   current run (from coworker_invoices).
 
+Change detection:
+  All entity writers compare SHA-256 hashes of incoming payloads against
+  stored hashes. Only records with changed payloads are written to bronze
+  and passed downstream. This avoids unnecessary DB writes and expensive
+  per-record API calls for unchanged data.
+
 Each entity gets its own RunTracker entry in meta.sync_runs.
 """
 import asyncio
@@ -106,11 +112,11 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
         locations = await _sync_locations(client, blob_writer, writer, run_id)
         products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
         await _sync_contracts(client, blob_writer, writer, run_id, products)
-        invoice_records, coworker_ids = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
+        changed_invoices, coworker_ids = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
         await _sync_coworkers(client, blob_writer, writer, run_id, coworker_ids)
         await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
         await _sync_extra_services(client, blob_writer, writer, run_id)
-        await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, invoice_records)
+        await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, changed_invoices)
 
     logger.info(f"Nexudus -> Bronze sync complete [run_id={run_id}]")
 
@@ -128,10 +134,11 @@ async def _sync_locations(
         records = await client.get_all("sys/businesses", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("locations", records, run_id)
-        run.rows_written = writer.write_locations(records)
+        changed, run.rows_written = writer.write_locations(records)
+        run.rows_skipped = len(records) - len(changed)
         logger.info(
-            f"Locations: {run.rows_read} fetched, {run.rows_written} written to bronze "
-            f"[blob={blob_path}]"
+            "Locations: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
         )
         return records
 
@@ -148,10 +155,12 @@ async def _sync_products(
         records = await client.get_all("sys/floorplandesks", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("products", records, run_id)
-        run.rows_written = writer.write_products(records)
+        changed, run.rows_written = writer.write_products(records)
+        run.rows_skipped = len(records) - len(changed)
 
+        # Build resource IDs only from changed products
         resource_ids_by_location: dict[int, list[int]] = {}
-        for r in records:
+        for r in changed:
             resource_id = r.get("ResourceId")
             location_id = r.get("FloorPlanBusinessId")
             if resource_id and location_id:
@@ -160,9 +169,10 @@ async def _sync_products(
                     resource_ids_by_location[location_id].append(resource_id)
 
         logger.info(
-            f"Products: {run.rows_read} fetched, {run.rows_written} written to bronze. "
-            f"ResourceIds found: {sum(len(v) for v in resource_ids_by_location.values())} "
-            f"[blob={blob_path}]"
+            "Products: %s fetched, %s changed, %s skipped, %s written to bronze. "
+            "ResourceIds from changed: %s [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written,
+            sum(len(v) for v in resource_ids_by_location.values()), blob_path,
         )
         return records, resource_ids_by_location
 
@@ -179,10 +189,11 @@ async def _sync_contracts(
         records = await client.get_all("billing/coworkercontracts", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("contracts", records, run_id)
-        run.rows_written = writer.write_contracts(records)
+        changed, run.rows_written = writer.write_contracts(records)
+        run.rows_skipped = len(records) - len(changed)
         logger.info(
-            f"Contracts: {run.rows_read} fetched, {run.rows_written} written to bronze "
-            f"[blob={blob_path}]"
+            "Contracts: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
         )
 
 
@@ -201,7 +212,7 @@ async def _sync_resources(
     ]
 
     if not all_resource_ids:
-        logger.info("Resources: no ResourceIds found in products, skipping")
+        logger.info("Resources: no ResourceIds found in changed products, skipping")
         return
 
     async with RunTracker("nexudus", "resources", "bronze", metadata=str(run_id)) as run:
@@ -230,13 +241,13 @@ async def _sync_resources(
 
         total_written = 0
         for record, location_id in records:
-            total_written += writer.write_resources([record], location_id=location_id)
+            _changed, written = writer.write_resources([record], location_id=location_id)
+            total_written += written
 
         run.rows_written = total_written
         logger.info(
-            f"Resources: {run.rows_read} attempted, "
-            f"{run.rows_written} written, {run.rows_skipped} skipped "
-            f"[blob={blob_path}]"
+            "Resources: %s attempted, %s written, %s skipped [blob=%s]",
+            run.rows_read, run.rows_written, run.rows_skipped, blob_path,
         )
 
 
@@ -251,10 +262,11 @@ async def _sync_extra_services(
         records = await client.get_all("billing/extraservices", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("extra_services", records, run_id)
-        run.rows_written = writer.write_extra_services(records)
+        changed, run.rows_written = writer.write_extra_services(records)
+        run.rows_skipped = len(records) - len(changed)
         logger.info(
-            f"Extra services: {run.rows_read} fetched, {run.rows_written} written to bronze "
-            f"[blob={blob_path}]"
+            "Extra services: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
         )
 
 
@@ -269,16 +281,17 @@ async def _sync_coworker_invoices(
         records = await client.get_all("billing/coworkerinvoices", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("coworker_invoices", records, run_id)
-        run.rows_written = writer.write_coworker_invoices(records)
-        coworker_ids = sorted({int(r["CoworkerId"]) for r in records if r.get("CoworkerId")})
+        changed, run.rows_written = writer.write_coworker_invoices(records)
+        run.rows_skipped = len(records) - len(changed)
+        # Only derive coworker IDs from changed invoices
+        coworker_ids = sorted({int(r["CoworkerId"]) for r in changed if r.get("CoworkerId")})
         logger.info(
-            "Coworker invoices: %s fetched, %s written to bronze. Distinct coworker ids: %s [blob=%s]",
-            run.rows_read,
-            run.rows_written,
-            len(coworker_ids),
-            blob_path,
+            "Coworker invoices: %s fetched, %s changed, %s skipped, %s written to bronze. "
+            "Distinct coworker ids from changed: %s [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written,
+            len(coworker_ids), blob_path,
         )
-        return records, coworker_ids
+        return changed, coworker_ids
 
 
 async def _sync_coworkers(
@@ -290,7 +303,7 @@ async def _sync_coworkers(
 ) -> None:
     """Coworkers are fetched per-ID from invoices — no UpdatedSince support."""
     if not coworker_ids:
-        logger.info("Coworkers: no CoworkerIds found in coworker invoices, skipping")
+        logger.info("Coworkers: no CoworkerIds found in changed invoices, skipping")
         return
 
     async with RunTracker("nexudus", "coworkers", "bronze", metadata=str(run_id)) as run:
@@ -308,13 +321,10 @@ async def _sync_coworkers(
                 records.append(result)
 
         blob_path = blob_writer.write_snapshot("coworkers", records, run_id)
-        run.rows_written = writer.write_coworkers(records)
+        _changed, run.rows_written = writer.write_coworkers(records)
         logger.info(
             "Coworkers: %s attempted, %s written, %s skipped [blob=%s]",
-            run.rows_read,
-            run.rows_written,
-            run.rows_skipped,
-            blob_path,
+            run.rows_read, run.rows_written, run.rows_skipped, blob_path,
         )
 
 
@@ -323,20 +333,15 @@ async def _sync_coworker_invoice_lines(
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
-    invoice_records: list[dict],
+    changed_invoices: list[dict],
 ) -> None:
-    """Fetch line items only for invoices updated in the current run.
-
-    On the first run (no invoice_records because coworker_invoices did a full
-    fetch with UpdatedSince and returned everything), this processes all of them.
-    On incremental runs, only invoices that changed are re-fetched.
-    """
-    if not invoice_records:
-        logger.info("Coworker invoice lines: no updated invoices, skipping")
+    """Fetch line items only for invoices that actually changed in the current run."""
+    if not changed_invoices:
+        logger.info("Coworker invoice lines: no changed invoices, skipping")
         return
 
     invoice_source_ids = [
-        int(r["Id"]) for r in invoice_records if r.get("Id")
+        int(r["Id"]) for r in changed_invoices if r.get("Id")
     ]
 
     async with RunTracker("nexudus", "coworker_invoice_lines", "bronze", metadata=str(run_id)) as run:
@@ -355,13 +360,13 @@ async def _sync_coworker_invoice_lines(
         run.rows_skipped = errors
         if all_lines:
             blob_path = blob_writer.write_snapshot("coworker_invoice_lines", all_lines, run_id)
-            run.rows_written = writer.write_coworker_invoice_lines(all_lines)
+            _changed, run.rows_written = writer.write_coworker_invoice_lines(all_lines)
         else:
             blob_path = "none"
             run.rows_written = 0
 
         logger.info(
-            "Coworker invoice lines: %s invoices queried, %s lines fetched, "
+            "Coworker invoice lines: %s changed invoices queried, %s lines fetched, "
             "%s written to bronze, %s errors [blob=%s]",
             len(invoice_source_ids),
             len(all_lines),

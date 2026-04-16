@@ -120,7 +120,7 @@ async def main() -> None:
             total_coworker_ids.update(new_ids)
 
             if not args.dry_run:
-                written = bronze.write_coworker_invoices(page)
+                _changed, written = bronze.write_coworker_invoices(page)
                 print(f"  invoices page: {len(page)} fetched, {written} written (total so far: {total_invoices})")
             else:
                 print(f"  invoices page: {len(page)} fetched [dry-run] (total so far: {total_invoices})")
@@ -147,7 +147,7 @@ async def main() -> None:
 
             if len(batch_records) >= COWORKER_BATCH:
                 if not args.dry_run:
-                    bronze.write_coworkers(batch_records)
+                    bronze.write_coworkers(batch_records)  # returns (changed, written) — ignored here
                 coworkers_written += len(batch_records)
                 batch_records = []
 

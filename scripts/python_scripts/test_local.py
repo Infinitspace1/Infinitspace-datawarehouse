@@ -105,7 +105,7 @@ async def test_locations(token: str, dry_run: bool, limit: int, run_id: uuid.UUI
     written = 0
     if not dry_run and records:
         writer = BronzeWriter(run_id)
-        written = writer.write_locations(records)
+        _changed, written = writer.write_locations(records)
 
     _print_result(len(records), written, dry_run)
     return records
@@ -144,7 +144,7 @@ async def test_products(token: str, dry_run: bool, limit: int, run_id: uuid.UUID
     written = 0
     if not dry_run and records:
         writer = BronzeWriter(run_id)
-        written = writer.write_products(records)
+        _changed, written = writer.write_products(records)
 
     _print_result(len(records), written, dry_run)
     return records
@@ -175,7 +175,7 @@ async def test_contracts(token: str, dry_run: bool, limit: int, run_id: uuid.UUI
     written = 0
     if not dry_run and records:
         writer = BronzeWriter(run_id)
-        written = writer.write_contracts(records)
+        _changed, written = writer.write_contracts(records)
 
     _print_result(len(records), written, dry_run)
     return records
@@ -241,7 +241,8 @@ async def test_resources(token: str, dry_run: bool, limit: int, run_id: uuid.UUI
     if not dry_run and records:
         writer = BronzeWriter(run_id)
         for record in records:
-            written += writer.write_resources([record])
+            _changed, w = writer.write_resources([record])
+            written += w
 
     _print_result(len(records), written, dry_run)
     return records
@@ -274,7 +275,7 @@ async def test_extra_services(token: str, dry_run: bool, limit: int, run_id: uui
     written = 0
     if not dry_run and records:
         writer = BronzeWriter(run_id)
-        written = writer.write_extra_services(records)
+        _changed, written = writer.write_extra_services(records)
 
     _print_result(len(records), written, dry_run)
     return records

@@ -69,10 +69,17 @@ class SilverCoworkerInvoiceLinesWriter:
                 logger.warning("Failed source_id=%s: %s", raw.get("Id"), exc)
                 errors += 1
 
-        if params_list:
-            self.sql.execute_many(_MERGE_SQL, params_list)
+        batch_size = 500
+        ok = 0
+        for i in range(0, len(params_list), batch_size):
+            batch = params_list[i : i + batch_size]
+            self.sql.execute_many(_MERGE_SQL, batch)
+            ok += len(batch)
+            logger.info("Silver coworker invoice lines: batch %s/%s (%s rows)",
+                         i // batch_size + 1,
+                         (len(params_list) + batch_size - 1) // batch_size,
+                         ok)
 
-        ok = len(params_list)
         logger.info("Silver coworker invoice lines: %s upserted, %s errors", ok, errors)
         return {"coworker_invoice_lines": ok, "errors": errors}
 

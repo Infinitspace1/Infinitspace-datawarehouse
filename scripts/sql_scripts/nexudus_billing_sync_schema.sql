@@ -14,6 +14,7 @@ BEGIN
         location_id     BIGINT              NULL,
         coworker_id     BIGINT              NULL,
         raw_json        NVARCHAR(MAX)       NOT NULL,
+        payload_hash    CHAR(64)            NULL,
         synced_at       DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
         CONSTRAINT uq_bronze_nexudus_coworker_invoices_source UNIQUE (source_id)
     );
@@ -50,6 +51,7 @@ BEGIN
         source_id       BIGINT              NOT NULL,
         location_id     BIGINT              NULL,
         raw_json        NVARCHAR(MAX)       NOT NULL,
+        payload_hash    CHAR(64)            NULL,
         synced_at       DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
         CONSTRAINT uq_bronze_nexudus_coworkers_source UNIQUE (source_id)
     );

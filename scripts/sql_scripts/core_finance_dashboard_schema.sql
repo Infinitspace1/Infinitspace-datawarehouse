@@ -414,3 +414,9 @@ ORDER BY location_name, job_title, employee_name;
 
 
 select * from bronze.nexudus_coworker_invoices
+
+SELECT * FROM gold.finance_dashboard_invoice_worklist
+
+SELECT * FROM silver.nexudus_coworker_invoice_lines
+
+DROP TABLE IF EXISTS ava.website_conversations;

@@ -10,7 +10,11 @@ Design:
   - A small number of denormalised columns (source_id, location_id, etc.)
     are extracted for indexing — everything else lives in raw_json.
   - Uses batch inserts for performance.
+  - SHA-256 payload hashing: each record's raw_json is hashed and compared
+    against the stored hash for the same source_id. Unchanged records are
+    skipped to avoid unnecessary writes and downstream processing.
 """
+import hashlib
 import json
 import logging
 import uuid
@@ -20,6 +24,7 @@ from shared.azure_clients.sql_client import get_sql_client
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 100  # rows per upsert batch
+HASH_LOOKUP_BATCH = 500  # source_ids per hash lookup query
 
 
 class BronzeWriter:
@@ -29,8 +34,7 @@ class BronzeWriter:
     Usage:
         run_id = uuid.uuid4()
         writer = BronzeWriter(run_id)
-        writer.write_locations(records)
-        writer.write_products(records)
+        changed, written = writer.write_locations(records)
         ...
     """
 
@@ -42,6 +46,40 @@ class BronzeWriter:
 
     def _to_json(self, record: dict) -> str:
         return json.dumps(record, default=str, ensure_ascii=False)
+
+    def _compute_hash(self, raw_json: str) -> str:
+        return hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+
+    def _load_existing_hashes(self, table: str, source_ids: list[int]) -> dict[int, str]:
+        """Load the latest payload_hash per source_id from a bronze table."""
+        if not source_ids:
+            return {}
+
+        result: dict[int, str] = {}
+        for i in range(0, len(source_ids), HASH_LOOKUP_BATCH):
+            batch_ids = source_ids[i : i + HASH_LOOKUP_BATCH]
+            placeholders = ",".join("?" * len(batch_ids))
+            rows = self.sql.execute_query(
+                f"""
+                SELECT source_id, payload_hash
+                FROM (
+                    SELECT source_id, payload_hash,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY source_id
+                               ORDER BY synced_at DESC, id DESC
+                           ) AS rn
+                    FROM {table}
+                    WHERE source_id IN ({placeholders})
+                ) sub
+                WHERE rn = 1
+                """,
+                tuple(batch_ids),
+            )
+            for row in rows:
+                if row.get("payload_hash"):
+                    result[int(row["source_id"])] = row["payload_hash"]
+
+        return result
 
     def _build_merge_sql(self, table: str, columns: list[str], update_columns: list[str]) -> str:
         source_projection = ", ".join([f"? AS {c}" for c in columns])
@@ -73,14 +111,7 @@ class BronzeWriter:
         update_columns: list[str],
         rows: list[tuple],
     ) -> int:
-        """Upsert rows in batches. Returns total rows processed.
-
-        Uses execute_many so that each batch of BATCH_SIZE rows is sent over a
-        single connection instead of opening a new connection per row.  For
-        1 000+ products this reduces ~1 000 TCP connect/auth round-trips to
-        ~10, eliminating the HYT00 login-timeout that occurs when Azure SQL
-        serverless is hit with rapid successive connections.
-        """
+        """Upsert rows in batches. Returns total rows processed."""
         if not rows:
             return 0
 
@@ -96,175 +127,247 @@ class BronzeWriter:
         return processed
 
     # ── Entity writers ───────────────────────────────────────
+    # Each returns (changed_records, rows_written) where changed_records
+    # is the list of original API dicts that were new or modified.
 
-    def write_locations(self, records: list[dict]) -> int:
-        """
-        bronze.nexudus_locations
-        source_id = record["Id"]
-        """
+    def write_locations(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_locations"""
+        table = "bronze.nexudus_locations"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
         rows = []
         for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
             rows.append((
                 self.sync_run_id,
-                r.get("Id"),
-                self._to_json(r),
+                sid,
+                raw,
+                h,
             ))
-        return self._batch_upsert(
-            "bronze.nexudus_locations",
-            ["sync_run_id", "source_id", "raw_json"],
-            ["sync_run_id", "raw_json"],
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "raw_json", "payload_hash"],
             rows,
         )
+        return changed, written
 
-    def write_products(self, records: list[dict]) -> int:
-        """
-        bronze.nexudus_products
-        source_id   = FloorPlanDesk Id
-        location_id = FloorPlanBusinessId
-        item_type   = ItemType
-        """
+    def write_products(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_products"""
+        table = "bronze.nexudus_products"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
         rows = []
         for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
             rows.append((
                 self.sync_run_id,
-                r.get("Id"),
+                sid,
                 r.get("FloorPlanBusinessId"),
                 r.get("ItemType"),
-                self._to_json(r),
+                raw,
+                h,
             ))
-        return self._batch_upsert(
-            "bronze.nexudus_products",
-            ["sync_run_id", "source_id", "location_id", "item_type", "raw_json"],
-            ["sync_run_id", "location_id", "item_type", "raw_json"],
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "item_type", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "item_type", "raw_json", "payload_hash"],
             rows,
         )
+        return changed, written
 
-    def write_contracts(self, records: list[dict], product_id: int = None, location_id: int = None) -> int:
-        """
-        bronze.nexudus_contracts
-        source_id   = CoworkerContract Id
-        product_id  = FloorPlanDesk Id (passed in, not in the contract record itself)
-        location_id = FloorPlanBusinessId (passed in)
-        """
+    def write_contracts(self, records: list[dict], product_id: int = None, location_id: int = None) -> tuple[list[dict], int]:
+        """bronze.nexudus_contracts"""
+        table = "bronze.nexudus_contracts"
+        source_ids = [int(r.get("id") or r.get("Id")) for r in records if r.get("id") or r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
         rows = []
         for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("id") or r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
             rows.append((
                 self.sync_run_id,
-                r.get("id") or r.get("Id"),
+                sid,
                 product_id,
                 location_id,
-                self._to_json(r),
+                raw,
+                h,
             ))
-        return self._batch_upsert(
-            "bronze.nexudus_contracts",
-            ["sync_run_id", "source_id", "product_id", "location_id", "raw_json"],
-            ["sync_run_id", "product_id", "location_id", "raw_json"],
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "product_id", "location_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "product_id", "location_id", "raw_json", "payload_hash"],
             rows,
         )
+        return changed, written
 
-    def write_resources(self, records: list[dict], location_id: int = None) -> int:
-        """
-        bronze.nexudus_resources
-        source_id   = Resource Id
-        location_id = BusinessId
-        """
+    def write_resources(self, records: list[dict], location_id: int = None) -> tuple[list[dict], int]:
+        """bronze.nexudus_resources"""
+        table = "bronze.nexudus_resources"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
         rows = []
         for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
             rows.append((
                 self.sync_run_id,
-                r.get("Id"),
+                sid,
                 location_id,
-                self._to_json(r),
+                raw,
+                h,
             ))
-        return self._batch_upsert(
-            "bronze.nexudus_resources",
-            ["sync_run_id", "source_id", "location_id", "raw_json"],
-            ["sync_run_id", "location_id", "raw_json"],
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "raw_json", "payload_hash"],
             rows,
         )
+        return changed, written
 
-    def write_extra_services(self, records: list[dict]) -> int:
-        """
-        bronze.nexudus_extra_services
-        source_id   = ExtraService Id
-        location_id = BusinessId
-        """
+    def write_extra_services(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_extra_services"""
+        table = "bronze.nexudus_extra_services"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
         rows = []
         for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
             rows.append((
                 self.sync_run_id,
-                r.get("Id"),
+                sid,
                 r.get("BusinessId"),
-                self._to_json(r),
+                raw,
+                h,
             ))
-        return self._batch_upsert(
-            "bronze.nexudus_extra_services",
-            ["sync_run_id", "source_id", "location_id", "raw_json"],
-            ["sync_run_id", "location_id", "raw_json"],
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "raw_json", "payload_hash"],
             rows,
         )
+        return changed, written
 
-    def write_coworker_invoices(self, records: list[dict]) -> int:
-        """
-        bronze.nexudus_coworker_invoices
-        source_id   = CoworkerInvoice Id
-        location_id = BusinessId
-        coworker_id = CoworkerId
-        """
+    def write_coworker_invoices(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_coworker_invoices"""
+        table = "bronze.nexudus_coworker_invoices"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
         rows = []
         for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
             rows.append((
                 self.sync_run_id,
-                r.get("Id"),
+                sid,
                 r.get("BusinessId"),
                 r.get("CoworkerId"),
-                self._to_json(r),
+                raw,
+                h,
             ))
-        return self._batch_upsert(
-            "bronze.nexudus_coworker_invoices",
-            ["sync_run_id", "source_id", "location_id", "coworker_id", "raw_json"],
-            ["sync_run_id", "location_id", "coworker_id", "raw_json"],
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "coworker_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "coworker_id", "raw_json", "payload_hash"],
             rows,
         )
+        return changed, written
 
-    def write_coworker_invoice_lines(self, records: list[dict]) -> int:
-        """
-        bronze.nexudus_coworker_invoice_lines
-        source_id           = CoworkerInvoiceLine Id
-        invoice_source_id   = CoworkerInvoiceId
-        """
+    def write_coworker_invoice_lines(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_coworker_invoice_lines"""
+        table = "bronze.nexudus_coworker_invoice_lines"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
         rows = []
         for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
             rows.append((
                 self.sync_run_id,
-                r.get("Id"),
+                sid,
                 r.get("CoworkerInvoiceId"),
-                self._to_json(r),
+                raw,
+                h,
             ))
-        return self._batch_upsert(
-            "bronze.nexudus_coworker_invoice_lines",
-            ["sync_run_id", "source_id", "invoice_source_id", "raw_json"],
-            ["sync_run_id", "invoice_source_id", "raw_json"],
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "invoice_source_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "invoice_source_id", "raw_json", "payload_hash"],
             rows,
         )
+        return changed, written
 
-    def write_coworkers(self, records: list[dict]) -> int:
-        """
-        bronze.nexudus_coworkers
-        source_id   = Coworker Id
-        location_id = InvoicingBusinessId
-        """
+    def write_coworkers(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_coworkers"""
+        table = "bronze.nexudus_coworkers"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
         rows = []
         for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
             rows.append((
                 self.sync_run_id,
-                r.get("Id"),
+                sid,
                 r.get("InvoicingBusinessId"),
-                self._to_json(r),
+                raw,
+                h,
             ))
-        return self._batch_upsert(
-            "bronze.nexudus_coworkers",
-            ["sync_run_id", "source_id", "location_id", "raw_json"],
-            ["sync_run_id", "location_id", "raw_json"],
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "raw_json", "payload_hash"],
             rows,
         )
+        return changed, written

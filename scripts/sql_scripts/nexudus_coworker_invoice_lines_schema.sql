@@ -18,6 +18,7 @@ BEGIN
         source_id           BIGINT              NOT NULL,
         invoice_source_id   BIGINT              NULL,
         raw_json            NVARCHAR(MAX)       NOT NULL,
+        payload_hash        CHAR(64)            NULL,
         synced_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
         CONSTRAINT uq_bronze_nexudus_coworker_invoice_lines_source UNIQUE (source_id)
     );

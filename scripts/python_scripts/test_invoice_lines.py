@@ -99,7 +99,7 @@ async def main(dry_run: bool = False, limit: int | None = None, batch_size: int 
             # Write batch to bronze periodically
             if len(batch_lines) >= batch_size or i == len(remaining_ids):
                 if batch_lines:
-                    writer.write_coworker_invoice_lines(batch_lines)
+                    _changed, _written = writer.write_coworker_invoice_lines(batch_lines)
                     total_lines += len(batch_lines)
                     batch_lines = []
 

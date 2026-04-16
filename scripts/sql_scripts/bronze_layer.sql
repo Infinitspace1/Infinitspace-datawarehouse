@@ -21,6 +21,7 @@ CREATE TABLE bronze.nexudus_locations (
     sync_run_id     UNIQUEIDENTIFIER NOT NULL,
     source_id       BIGINT          NOT NULL,       -- Nexudus Id field
     raw_json        NVARCHAR(MAX)   NOT NULL,
+    payload_hash    CHAR(64)        NULL,           -- SHA-256 of raw_json for change detection
     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
 );
 
@@ -40,6 +41,7 @@ CREATE TABLE bronze.nexudus_products (
     location_id     BIGINT          NULL,           -- FloorPlanBusinessId (denorm for easy filtering)
     item_type       INT             NULL,           -- ItemType (1=PrivateOffice, 2=HotDesk, etc.)
     raw_json        NVARCHAR(MAX)   NOT NULL,
+    payload_hash    CHAR(64)        NULL,           -- SHA-256 of raw_json for change detection
     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
 );
 
@@ -56,6 +58,7 @@ CREATE TABLE bronze.nexudus_contracts (
     product_id      BIGINT          NULL,           -- FloorPlanDesk Id (denorm)
     location_id     BIGINT          NULL,           -- FloorPlanBusinessId (denorm)
     raw_json        NVARCHAR(MAX)   NOT NULL,
+    payload_hash    CHAR(64)        NULL,           -- SHA-256 of raw_json for change detection
     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
 );
 
@@ -76,6 +79,7 @@ CREATE TABLE bronze.nexudus_resources (
     source_id       BIGINT          NOT NULL,       -- Resource Id
     location_id     BIGINT          NULL,           -- BusinessId (denorm)
     raw_json        NVARCHAR(MAX)   NOT NULL,
+    payload_hash    CHAR(64)        NULL,           -- SHA-256 of raw_json for change detection
     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
 );
 
@@ -94,6 +98,7 @@ CREATE TABLE bronze.nexudus_extra_services (
     source_id       BIGINT          NOT NULL,       -- ExtraService Id
     location_id     BIGINT          NULL,           -- BusinessId (denorm)
     raw_json        NVARCHAR(MAX)   NOT NULL,
+    payload_hash    CHAR(64)        NULL,           -- SHA-256 of raw_json for change detection
     synced_at       DATETIME2       NOT NULL DEFAULT GETUTCDATE()
 );
 
