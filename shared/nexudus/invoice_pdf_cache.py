@@ -22,9 +22,15 @@ PDF_FETCH_THROTTLE_SECONDS = 0.5
 async def cache_missing_nexudus_pdfs(
     client: NexudusClient,
     limit: int | None = None,
+    lookback_days: int = 2,
 ) -> dict[str, Any]:
     """
-    Fetch and cache PDFs for all Nexudus invoices missing a pdf_blob_path.
+    Fetch and cache PDFs for recent Nexudus invoices missing a pdf_blob_path.
+
+    Only processes invoices from the last ``lookback_days`` days to avoid
+    hitting the entire backlog every run.  Invoices that return a server
+    error from Nexudus are marked with a sentinel path so they are not
+    retried on the next run.
 
     Returns stats dict: {pdfs_cached, pdfs_failed, pdfs_skipped, pdfs_total}.
     """
@@ -40,7 +46,8 @@ async def cache_missing_nexudus_pdfs(
             invoice_number
         FROM silver.nexudus_coworker_invoices
         WHERE pdf_blob_path IS NULL
-        ORDER BY due_date DESC
+          AND updated_on >= DATEADD(DAY, -{lookback_days}, GETUTCDATE())
+        ORDER BY updated_on DESC
         """
     )
 
@@ -94,9 +101,29 @@ async def cache_missing_nexudus_pdfs(
             logger.info(
                 "PDF cached for invoice %s [blob=%s]", invoice_number, blob_path
             )
-        except Exception:
+        except Exception as exc:
             failed += 1
             logger.exception("Failed to cache PDF for invoice %s", invoice_number)
+
+            # Mark server-side errors with a sentinel so we don't retry forever
+            is_server_error = (
+                hasattr(exc, "status") and exc.status in (500, 502, 503)
+            )
+            if is_server_error:
+                sql.execute_non_query(
+                    """
+                    UPDATE silver.nexudus_coworker_invoices
+                    SET pdf_blob_path = '__unavailable__',
+                        pdf_cached_at = GETUTCDATE()
+                    WHERE source_id = ?
+                    """,
+                    (invoice_id,),
+                )
+                logger.info(
+                    "Marked invoice %s as PDF unavailable (server error %s)",
+                    invoice_number,
+                    getattr(exc, "status", "unknown"),
+                )
 
         await asyncio.sleep(PDF_FETCH_THROTTLE_SECONDS)
 

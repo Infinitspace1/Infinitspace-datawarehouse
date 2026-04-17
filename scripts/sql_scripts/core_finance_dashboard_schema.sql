@@ -191,7 +191,7 @@ BEGIN
     );
 
     -- Step 2: Rebuild user access
-    TRUNCATE TABLE gold.finance_dashboard_user_access;
+    DELETE FROM gold.finance_dashboard_user_access;
 
     WITH cm_roster AS (
         SELECT
@@ -268,7 +268,7 @@ BEGIN
         ON loc.source_id = map.location_source_id;
 
     -- Step 3: Rebuild invoice worklist (Nexudus-only)
-    TRUNCATE TABLE gold.finance_dashboard_invoice_worklist;
+    DELETE FROM gold.finance_dashboard_invoice_worklist;
 
     WITH unpaid_nexudus_invoices AS (
         SELECT
@@ -402,21 +402,3 @@ GO
 
 EXEC gold.sp_refresh_finance_dashboard;
 GO
-
--- Example queries
-SELECT TOP 20 *
-FROM gold.finance_dashboard_invoice_worklist
-ORDER BY due_date ASC, invoice_number ASC;
-
-SELECT *
-FROM gold.finance_dashboard_user_access
-ORDER BY location_name, job_title, employee_name;
-
-
-select * from bronze.nexudus_coworker_invoices
-
-SELECT * FROM gold.finance_dashboard_invoice_worklist
-
-SELECT * FROM silver.nexudus_coworker_invoice_lines
-
-DROP TABLE IF EXISTS ava.website_conversations;

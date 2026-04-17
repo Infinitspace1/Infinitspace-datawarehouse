@@ -85,9 +85,10 @@ bronze_to_silver
   -> silver.nexudus_coworker_invoice_lines
 
 nexudus_invoice_pdf_cache (timer, 03:30 UTC)
-  -> downloads PDFs from Nexudus API for invoices missing pdf_blob_path
+  -> downloads PDFs from Nexudus API for recent invoices missing pdf_blob_path (last 2 days)
   -> uploads to Azure Blob: nexudus-invoice-pdfs container
   -> updates silver.nexudus_coworker_invoices.pdf_blob_path
+  -> marks invoices returning server errors with '__unavailable__' sentinel to avoid retries
 
 refresh_ava_availability
   -> EXEC ava.sp_refresh_product_availability
@@ -421,7 +422,8 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
   - coworkers (per-ID from invoices — no `UpdatedSince`)
   - resources (per-ID from products — no `UpdatedSince`)
   - extra_services (incremental via `UpdatedSince` watermark)
-  - coworker_invoice_lines (fetches lines only for invoices updated in current run)
+  - coworker_invoices (2-day lookback via `from_CoworkerInvoice_UpdatedOn` — no watermark)
+  - coworker_invoice_lines (per-invoice via `CoworkerInvoiceLine_CoworkerInvoice` for invoices from above)
 - all paginated entities use `UpdatedSince` watermark from `meta.sync_runs.finished_at` on subsequent runs; first run does full fetch
 - each entity writes a `RunTracker` row
 - each entity also writes a blob snapshot
@@ -465,7 +467,8 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - container: `nexudus-invoice-pdfs` on `staccinfinitspaceprod001`
 - blob path format: `{location_source_id}/{yyyy}/{mm}/{invoice_source_id}.pdf`
 - `silver.nexudus_coworker_invoices.pdf_blob_path` holds the reference
-- `pdf_blob_path IS NULL` is the natural watermark — only invoices still missing a cached PDF are fetched each run
+- `pdf_blob_path IS NULL` AND `updated_on >= 2 days ago` is the watermark — only recently-updated invoices missing a cached PDF are fetched each run
+- invoices returning Nexudus server errors (500/502/503) are marked `__unavailable__` to avoid infinite retries
 - timer function: `nexudus_invoice_pdf_cache` at 03:30 UTC
 
 ### Xero PDF Storage
@@ -807,6 +810,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-15 (gold finance dashboard rewritten to Nexudus-only: removed Xero dependency from gold tables; added coworker_invoice_lines bronze+silver entity; added Nexudus invoice PDF caching; workflow_type classification now uses Nexudus financial_account_name; user access table simplified to BambooHR+Nexudus only)
+Last updated: 2026-04-17 (coworker_invoices uses 2-day lookback via from_CoworkerInvoice_UpdatedOn; invoice lines fetched per-invoice from that set only; PDF cache scoped to due_date last 2 days with __unavailable__ sentinel; finance dashboard SP changed TRUNCATE to DELETE; timeout 45 min)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

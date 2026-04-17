@@ -12,19 +12,23 @@ Entities pulled (in order):
   5. coworkers              -- GET /spaces/coworkers/{id}
   6. resources              -- GET /spaces/resources/{id}
   7. extra_services         -- GET /billing/extraservices
-  8. coworker_invoice_lines -- GET /billing/coworkerinvoicelines (per invoice)
+  8. coworker_invoice_lines -- GET /billing/coworkerinvoicelines
 
 Incremental sync:
-  Paginated entities (locations, products, contracts, extra_services,
-  coworker_invoices) use the UpdatedSince watermark from meta.sync_runs.
-  First run does a full fetch; subsequent runs only fetch records updated
-  since the last successful bronze run for that entity.
+  Paginated entities (locations, products, contracts, extra_services)
+  use the UpdatedSince watermark from meta.sync_runs.  First run does
+  a full fetch; subsequent runs only fetch records updated since the
+  last successful bronze run for that entity.
+
+  coworker_invoices uses from_CoworkerInvoice_UpdatedOn with a 3-day
+  lookback window — no watermark dependency.
+
+  coworker_invoice_lines fetches lines only for invoices returned by
+  the coworker_invoices step (using CoworkerInvoiceLine_CoworkerInvoice
+  filter per invoice).
 
   Per-record entities (resources, coworkers) are driven by their parent
   entity and cannot use UpdatedSince directly.
-
-  coworker_invoice_lines fetches lines only for invoices updated in the
-  current run (from coworker_invoices).
 
 Change detection:
   All entity writers compare SHA-256 hashes of incoming payloads against
@@ -35,6 +39,7 @@ Change detection:
 Each entity gets its own RunTracker entry in meta.sync_runs.
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import uuid
@@ -275,15 +280,21 @@ async def _sync_coworker_invoices(
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
+    lookback_days: int = 2,
 ) -> tuple[list[dict], list[int]]:
-    extra_params = _incremental_params("coworker_invoices")
+    # Use Nexudus API filter: invoices updated in the last N days
+    since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    extra_params = {"from_CoworkerInvoice_UpdatedOn": since}
+    logger.info("Coworker invoices: fetching updated since %s", since)
+
     async with RunTracker("nexudus", "coworker_invoices", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("billing/coworkerinvoices", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("coworker_invoices", records, run_id)
         changed, run.rows_written = writer.write_coworker_invoices(records)
         run.rows_skipped = len(records) - len(changed)
-        # Only derive coworker IDs from changed invoices
         coworker_ids = sorted({int(r["CoworkerId"]) for r in changed if r.get("CoworkerId")})
         logger.info(
             "Coworker invoices: %s fetched, %s changed, %s skipped, %s written to bronze. "
@@ -335,21 +346,28 @@ async def _sync_coworker_invoice_lines(
     run_id: uuid.UUID,
     changed_invoices: list[dict],
 ) -> None:
-    """Fetch line items only for invoices that actually changed in the current run."""
+    """
+    Fetch line items for invoices that changed in the current run.
+
+    Uses Nexudus filter CoworkerInvoiceLine_CoworkerInvoice={id} per invoice.
+    Since changed_invoices is already scoped to the last N days by
+    _sync_coworker_invoices, this only touches recent data.
+    """
     if not changed_invoices:
         logger.info("Coworker invoice lines: no changed invoices, skipping")
         return
 
-    invoice_source_ids = [
-        int(r["Id"]) for r in changed_invoices if r.get("Id")
-    ]
+    invoice_ids = [int(r["Id"]) for r in changed_invoices if r.get("Id")]
+    logger.info(
+        "Coworker invoice lines: fetching lines for %s changed invoices",
+        len(invoice_ids),
+    )
 
     async with RunTracker("nexudus", "coworker_invoice_lines", "bronze", metadata=str(run_id)) as run:
-        run.rows_read = len(invoice_source_ids)
         all_lines: list[dict] = []
         errors = 0
 
-        for invoice_id in invoice_source_ids:
+        for invoice_id in invoice_ids:
             try:
                 lines = await client.get_coworker_invoice_lines(invoice_id)
                 all_lines.extend(lines)
@@ -357,18 +375,23 @@ async def _sync_coworker_invoice_lines(
                 logger.warning("Invoice lines for %s failed: %s", invoice_id, exc)
                 errors += 1
 
+        run.rows_read = len(invoice_ids)
         run.rows_skipped = errors
         if all_lines:
-            blob_path = blob_writer.write_snapshot("coworker_invoice_lines", all_lines, run_id)
-            _changed, run.rows_written = writer.write_coworker_invoice_lines(all_lines)
+            blob_path = blob_writer.write_snapshot(
+                "coworker_invoice_lines", all_lines, run_id
+            )
+            _changed, run.rows_written = writer.write_coworker_invoice_lines(
+                all_lines
+            )
         else:
             blob_path = "none"
             run.rows_written = 0
 
         logger.info(
-            "Coworker invoice lines: %s changed invoices queried, %s lines fetched, "
+            "Coworker invoice lines: %s invoices queried, %s lines fetched, "
             "%s written to bronze, %s errors [blob=%s]",
-            len(invoice_source_ids),
+            len(invoice_ids),
             len(all_lines),
             run.rows_written,
             errors,

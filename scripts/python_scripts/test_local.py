@@ -282,6 +282,108 @@ async def test_extra_services(token: str, dry_run: bool, limit: int, run_id: uui
 
 
 # ──────────────────────────────────────────────────────────────
+# Step 7 — Coworker Invoice Lines (bulk UpdatedSince)
+# ──────────────────────────────────────────────────────────────
+
+async def test_invoice_lines(token: str, dry_run: bool, limit: int, run_id: uuid.UUID):
+    _print_section("STEP: invoice_lines (via changed invoices)")
+    import time
+    from datetime import datetime, timedelta, timezone
+    from shared.nexudus.client import NexudusClient
+    from shared.azure_clients.bronze_writer import BronzeWriter
+
+    lookback_days = 2
+    since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+
+    # Step 1: fetch invoices updated in last 3 days
+    print(f"\n  Step 1: Fetching invoices updated since {since}...")
+    t0 = time.perf_counter()
+    async with NexudusClient(token) as client:
+        invoices = await client.get_all(
+            "billing/coworkerinvoices",
+            extra_params={"from_CoworkerInvoice_UpdatedOn": since},
+        )
+        t1 = time.perf_counter()
+        print(f"  Invoices fetched: {len(invoices)} in {t1 - t0:.1f}s")
+
+        # Step 2: fetch lines for those invoices
+        invoice_ids = [int(r["Id"]) for r in invoices if r.get("Id")]
+        if limit:
+            invoice_ids = invoice_ids[:limit]
+
+        print(f"\n  Step 2: Fetching lines for {len(invoice_ids)} invoices...")
+        all_lines = []
+        errors = 0
+        for inv_id in invoice_ids:
+            try:
+                lines = await client.get_coworker_invoice_lines(inv_id)
+                all_lines.extend(lines)
+            except Exception as exc:
+                print(f"  ⚠️  Invoice {inv_id}: {exc}")
+                errors += 1
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n  Fetched: {len(all_lines)} invoice lines from {len(invoice_ids)} invoices in {elapsed:.1f}s")
+    if errors:
+        print(f"  Errors: {errors}")
+    _print_record_sample(all_lines)
+
+    written = 0
+    if not dry_run and all_lines:
+        writer = BronzeWriter(run_id)
+        _changed, written = writer.write_coworker_invoice_lines(all_lines)
+
+    _print_result(len(all_lines), written, dry_run)
+    return all_lines
+
+
+# ──────────────────────────────────────────────────────────────
+# Step 8 — PDF Cache Query (check how many invoices match)
+# ──────────────────────────────────────────────────────────────
+
+def test_pdf_cache_query():
+    _print_section("STEP: pdf_cache_query (check scope)")
+    from shared.azure_clients.sql_client import get_sql_client
+
+    sql = get_sql_client()
+
+    # Old query (all missing)
+    old_count = sql.execute_scalar(
+        """
+        SELECT COUNT(*)
+        FROM silver.nexudus_coworker_invoices
+        WHERE pdf_blob_path IS NULL
+        """
+    )
+
+    # New query (updated_on last 2 days only)
+    new_count = sql.execute_scalar(
+        """
+        SELECT COUNT(*)
+        FROM silver.nexudus_coworker_invoices
+        WHERE pdf_blob_path IS NULL
+          AND updated_on >= DATEADD(DAY, -2, GETUTCDATE())
+        """
+    )
+
+    # Unavailable sentinel count
+    unavailable = sql.execute_scalar(
+        """
+        SELECT COUNT(*)
+        FROM silver.nexudus_coworker_invoices
+        WHERE pdf_blob_path = '__unavailable__'
+        """
+    )
+
+    print(f"\n  Old query (all NULL pdf_blob_path):        {old_count}")
+    print(f"  New query (NULL + last 2 days):             {new_count}")
+    print(f"  Already marked __unavailable__:             {unavailable}")
+    print(f"  Reduction: {old_count} -> {new_count} ({100 * (1 - (new_count or 0) / max(old_count or 1, 1)):.0f}% fewer)")
+
+
+# ──────────────────────────────────────────────────────────────
 # SQL connectivity check
 # ──────────────────────────────────────────────────────────────
 
@@ -318,7 +420,7 @@ def test_sql():
 # Entry point
 # ──────────────────────────────────────────────────────────────
 
-STEPS = ["auth", "sql", "locations", "products", "contracts", "resources", "extra_services"]
+STEPS = ["auth", "sql", "locations", "products", "contracts", "resources", "extra_services", "invoice_lines", "pdf_cache_query"]
 
 async def main():
     parser = argparse.ArgumentParser(description="Test Nexudus → Bronze pipeline locally")
@@ -375,6 +477,10 @@ async def main():
             await test_resources(token, dry_run, limit, run_id)
         elif s == "extra_services":
             await test_extra_services(token, dry_run, limit, run_id)
+        elif s == "invoice_lines":
+            await test_invoice_lines(token, dry_run, limit, run_id)
+        elif s == "pdf_cache_query":
+            test_pdf_cache_query()
 
     print(f"\n{'─'*60}")
     print(f"  Done. Run ID: {run_id}")
