@@ -39,15 +39,17 @@ Current deployment docs target:
 
 Default ETL execution order in UTC:
 
-1. `02:00` `nexudus_to_bronze`
-2. `02:30` `bronze_to_silver`
-3. queue fanout via `silver_entity_worker`
-4. `03:00` `refresh_ava_availability`
-5. `03:30` `nexudus_invoice_pdf_cache` (caches PDFs for invoices missing `pdf_blob_path`)
-6. `04:00` `xero_invoice_sync` (includes PDF caching for invoices missing `pdf_blob_path`)
-7. `05:00` `bamboohr_sync`
-8. `05:30` `replyio_stats_sync`
-9. `05:30` `refresh_finance_dashboard`
+1. `Sun 01:00` `nexudus_silver_reconcile` (weekly soft-delete sweep for non-invoice silver tables)
+2. `02:00` `nexudus_to_bronze`
+3. `02:30` `bronze_to_silver`
+4. queue fanout via `silver_entity_worker`
+5. `03:00` `refresh_ava_availability`
+6. `03:30` `nexudus_invoice_pdf_cache` (caches PDFs for invoices missing `pdf_blob_path`)
+7. `04:00` `xero_invoice_sync` (includes PDF caching for invoices missing `pdf_blob_path`)
+8. `05:00` `bamboohr_sync` (includes daily employee roster reconcile)
+9. `05:15` `nexudus_invoice_reconcile` (daily soft-delete of removed invoices + cascaded lines)
+10. `05:30` `replyio_stats_sync`
+11. `05:30` `refresh_finance_dashboard`
 
 Important operational caveat:
 
@@ -180,6 +182,8 @@ Infinitspace-datawarehouse/
     silver_worker.py
     ava_refresh.py
     nexudus_invoice_pdf_cache.py
+    nexudus_invoice_reconcile.py
+    nexudus_silver_reconcile.py
     xero_sync.py
     finance_dashboard_refresh.py
     integrations_admin.py
@@ -277,6 +281,7 @@ Infinitspace-datawarehouse/
       silver_nexudus_resources_schema.sql
       silver_nexudus_extra_services_schema.sql
       silver_gmaps_locations_schema.sql
+      silver_soft_delete_migration.sql
       ava_product_availability_schema.sql
       ava_sp_refresh_product_availability.sql
       integrations_nexudus_xero_schema.sql
@@ -320,6 +325,8 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `costar_extraction_worker` | `functions/real_estate_costar_worker.py` | queue | `costar-extraction-tasks` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — does the actual extraction |
 | `bamboohr_sync` | `functions/bamboohr_sync.py` | timer | `0 0 5 * * *` | syncs all BambooHR employees to bronze + silver; join key: `work_email` |
 | `nexudus_invoice_pdf_cache` | `functions/nexudus_invoice_pdf_cache.py` | timer | `0 30 3 * * *` | caches Nexudus invoice PDFs to blob for invoices missing `pdf_blob_path` |
+| `nexudus_invoice_reconcile` | `functions/nexudus_invoice_reconcile.py` | timer | `0 15 5 * * *` | daily soft-delete pass for `silver.nexudus_coworker_invoices` + cascaded lines; 365-day due_date window |
+| `nexudus_silver_reconcile` | `functions/nexudus_silver_reconcile.py` | timer | `0 0 1 * * 0` | weekly soft-delete sweep for locations, products, contracts, extra_services, resources, coworkers |
 | `replyio_stats_sync` | `functions/replyio_sync.py` | timer | `0 30 5 * * *` | syncs Reply.io sequence steps + daily step performance stats to bronze |
 
 ---
@@ -353,6 +360,10 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 
 ### Silver
 
+All Nexudus silver tables below carry `is_deleted BIT NOT NULL DEFAULT 0`
+and `deleted_at DATETIME2 NULL`, maintained by the reconcile jobs. Gold
+tables and downstream reads must filter `WHERE is_deleted = 0`.
+
 - `silver.nexudus_locations`
 - `silver.nexudus_location_hours`
 - `silver.nexudus_products`
@@ -369,7 +380,7 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - `silver.location_transit_stations`
 - `silver.location_neighborhoods`
 - `silver.xero_overdue_invoice_contacts` — view joining overdue Xero invoices to Nexudus customer email data
-- `silver.bamboohr_employees` — join key: `work_email` → `silver.nexudus_coworkers.email`
+- `silver.bamboohr_employees` — join key: `work_email` → `silver.nexudus_coworkers.email`; carries `is_deleted`/`deleted_at` reconciled daily by `bamboohr_sync`
 
 ### AVA
 
@@ -490,6 +501,50 @@ Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only h
 - rows with `match_reason = 'unmatched'` have no Nexudus record; `recipient_email` will be NULL
 - current coverage: all 12 Xero tenants connected (Starter tier limit)
 
+### Soft-delete / source reconciliation
+
+The regular bronze/silver sync is upsert-only and cannot observe source-side
+deletions (an incremental `UpdatedSince` response simply stops returning a
+deleted record; per-ID fetches never revisit records whose parent didn't
+change). Silver tables therefore carry `is_deleted BIT NOT NULL DEFAULT 0`
+and `deleted_at DATETIME2 NULL` columns, populated by dedicated reconcile
+jobs that fetch the full current ID set from the source and flag missing
+rows.
+
+Pattern for all reconcile jobs:
+
+1. Fetch every currently-active `source_id` from the source API (scoped to a
+   sensible window where applicable).
+2. Safety floor: abort if the fetched count is below a per-entity threshold
+   (protects against an empty API response wiping silver).
+3. `UPDATE ... SET is_deleted = 1, deleted_at = GETUTCDATE()` for silver rows
+   whose `source_id` is missing from the fetched set.
+4. `UPDATE ... SET is_deleted = 0, deleted_at = NULL` for silver rows whose
+   `source_id` reappears (restore on source-side undelete).
+
+Schedule + cadence per entity:
+
+| Silver table | Reconcile job | Cadence | Deletion lag |
+|---|---|---|---|
+| `nexudus_coworker_invoices` | `nexudus_invoice_reconcile` | daily 05:15 | ≤24h |
+| `nexudus_coworker_invoice_lines` | `nexudus_invoice_reconcile` (cascade) | daily 05:15 | ≤24h |
+| `bamboohr_employees` | embedded in `bamboohr_sync` | daily 05:00 | ≤24h |
+| `nexudus_locations` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `nexudus_products` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `nexudus_contracts` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `nexudus_extra_services` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `nexudus_resources` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `nexudus_coworkers` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `xero_invoices` | none — Xero sets `invoice_status = 'DELETED'`, existing sync picks it up | daily | ≤24h (status-based) |
+
+Invoice reconcile window: default 365 days of `due_date` (configurable via
+`NEXUDUS_INVOICE_RECONCILE_LOOKBACK_DAYS`). Invoices older than the window
+are ignored — the finance dashboard only cares about recent due dates.
+
+Downstream consumers (gold tables, views, reports) MUST filter
+`WHERE is_deleted = 0` on any silver read. `gold.sp_refresh_finance_dashboard`
+already enforces this on every silver join.
+
 ---
 
 ## Logging and Operational Expectations
@@ -605,6 +660,11 @@ AVA_REFRESH_SCHEDULE="0 0 3 * * *"
 XERO_INVOICE_SYNC_SCHEDULE="0 0 4 * * *"
 XERO_INVOICE_SYNC_FORCE_FULL=0
 NEXUDUS_PDF_CACHE_SCHEDULE="0 30 3 * * *"
+NEXUDUS_INVOICE_RECONCILE_SCHEDULE="0 15 5 * * *"
+NEXUDUS_INVOICE_RECONCILE_LOOKBACK_DAYS=365
+NEXUDUS_INVOICE_RECONCILE_MIN_IDS=100
+NEXUDUS_SILVER_RECONCILE_SCHEDULE="0 0 1 * * 0"
+BAMBOOHR_RECONCILE_MIN_IDS=10
 FINANCE_DASHBOARD_REFRESH_SCHEDULE="0 30 5 * * *"
 REPLYIO_SYNC_SCHEDULE="0 30 5 * * *"
 ```
@@ -792,7 +852,8 @@ az functionapp config appsettings set `
 | Reply.io stats sync | done | bronze only; sequence steps + daily step performance; 4 AB test sequences |
 | Nexudus coworker invoice lines | done | bronze + silver; `financial_account_code`/`financial_account_name` per line item |
 | Nexudus invoice PDF caching | done | blob storage (`nexudus-invoice-pdfs`); path in `silver.nexudus_coworker_invoices.pdf_blob_path` |
-| Finance dashboard gold layer | done | Nexudus-only; `gold.finance_dashboard_invoice_worklist` + `gold.finance_dashboard_user_access`; rebuilt by `gold.sp_refresh_finance_dashboard` |
+| Finance dashboard gold layer | done | Nexudus-only; `gold.finance_dashboard_invoice_worklist` + `gold.finance_dashboard_user_access`; rebuilt by `gold.sp_refresh_finance_dashboard`; filters `is_deleted = 0` on all silver reads |
+| Soft-delete / source reconciliation | done | `is_deleted`/`deleted_at` on all Nexudus + BambooHR silver tables; daily `nexudus_invoice_reconcile` (invoices + cascaded lines), daily roster reconcile inside `bamboohr_sync`, weekly `nexudus_silver_reconcile` for other entities |
 
 ---
 
@@ -810,6 +871,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-17 (coworker_invoices uses 2-day lookback via from_CoworkerInvoice_UpdatedOn; invoice lines fetched per-invoice from that set only; PDF cache scoped to due_date last 2 days with __unavailable__ sentinel; finance dashboard SP changed TRUNCATE to DELETE; timeout 45 min)
+Last updated: 2026-04-21 (added soft-delete reconciliation: `is_deleted`/`deleted_at` columns on all Nexudus + BambooHR silver tables via `silver_soft_delete_migration.sql`; daily `nexudus_invoice_reconcile` at 05:15 for invoices + cascaded lines; daily roster reconcile embedded in `bamboohr_sync`; weekly `nexudus_silver_reconcile` Sun 01:00 for locations/products/contracts/extra_services/resources/coworkers; `gold.sp_refresh_finance_dashboard` now filters `is_deleted = 0` on every silver join)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

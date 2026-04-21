@@ -145,6 +145,7 @@ BEGIN
             source_id AS location_source_id,
             name AS location_name
         FROM silver.nexudus_locations
+        WHERE is_deleted = 0
     ) AS source
         ON target.location_source_id = source.location_source_id
     WHEN MATCHED THEN UPDATE SET
@@ -211,6 +212,7 @@ BEGIN
             )) AS bamboohr_location_normalized
         FROM silver.bamboohr_employees
         WHERE job_title IN (N'Community Manager', N'Assistant Community Manager')
+          AND is_deleted = 0
     ),
     location_access_map AS (
         SELECT *
@@ -265,7 +267,8 @@ BEGIN
     INNER JOIN location_access_map map
         ON map.bamboohr_location_normalized = cm.bamboohr_location_normalized
     LEFT JOIN silver.nexudus_locations loc
-        ON loc.source_id = map.location_source_id;
+        ON loc.source_id = map.location_source_id
+       AND loc.is_deleted = 0;
 
     -- Step 3: Rebuild invoice worklist (Nexudus-only)
     DELETE FROM gold.finance_dashboard_invoice_worklist;
@@ -296,6 +299,7 @@ BEGIN
           AND nci.draft = 0
           AND nci.paid = 0
           AND nci.credit_note = 0
+          AND nci.is_deleted = 0
           AND nci.due_date >= '2026-03-01'
     ),
     invoice_account_flags AS (
@@ -311,6 +315,7 @@ BEGIN
         FROM silver.nexudus_coworker_invoice_lines ncil
         INNER JOIN unpaid_nexudus_invoices inv
             ON inv.source_id = ncil.invoice_source_id
+        WHERE ncil.is_deleted = 0
         GROUP BY ncil.invoice_source_id
     )
     INSERT INTO gold.finance_dashboard_invoice_worklist (
@@ -391,8 +396,10 @@ BEGIN
     FROM unpaid_nexudus_invoices inv
     LEFT JOIN silver.nexudus_locations loc
         ON loc.source_id = inv.location_source_id
+       AND loc.is_deleted = 0
     LEFT JOIN silver.nexudus_coworkers nc
         ON nc.source_id = inv.coworker_id
+       AND nc.is_deleted = 0
     LEFT JOIN meta.finance_dashboard_location_settings ls
         ON ls.location_source_id = inv.location_source_id
     LEFT JOIN invoice_account_flags af
@@ -402,3 +409,17 @@ GO
 
 EXEC gold.sp_refresh_finance_dashboard;
 GO
+
+
+
+SELECT location_name, sum(due_amount) as total_due, count(1) as num_inv FROM gold.finance_dashboard_invoice_worklist
+WHERE due_state = 'overdue'GROUP BY location_name
+ORDER BY sum(due_amount) DESC;
+
+SELECT invoice_number, total_amount, due_amount, invoice_date, due_date, days_overdue, workflow_type, due_state FROM gold.finance_dashboard_invoice_worklist
+WHERE due_state = 'overdue' AND location_name = 'London - Holborn - 14 Grays Inn Rd'
+
+SELECT location_name, COUNT(1) FROM gold.finance_dashboard_invoice_worklist
+WHERE due_state = 'upcoming'
+GROUP BY location_name
+ORDER BY COUNT(1) DESC;
