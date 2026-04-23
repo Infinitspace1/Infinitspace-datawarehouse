@@ -495,7 +495,8 @@ BEGIN
             ON mp.location_source_id = l.source_id
         LEFT JOIN silver.nexudus_resources r
             ON  r.resource_type_name = mp.resource_type_names  -- exact match
-            AND r.location_source_id = mp.location_source_id;  -- scoped to same location
+            AND r.location_source_id = mp.location_source_id   -- scoped to same location
+            AND r.is_visible            = 1;                       -- exclude deactivated resources
 
 
         -- ==================================================================
@@ -583,6 +584,3 @@ EXEC ava.sp_refresh_product_availability;
 --7 Quartier Heidestrasse: location_id 1420962233
 --8 Quartier Chaussestrasse: location_id 1420976475
 --9 Foxcourt: location_id 1420976575
-
-SELECT * FROM ava.product_availability
-WHERE location_source_id = 1420951935;
