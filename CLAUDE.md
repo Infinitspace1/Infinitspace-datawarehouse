@@ -50,6 +50,7 @@ Default ETL execution order in UTC:
 9. `05:15` `nexudus_invoice_reconcile` (daily soft-delete of removed invoices + cascaded lines)
 10. `05:30` `replyio_stats_sync`
 11. `05:30` `refresh_finance_dashboard`
+12. `06:00` `sync_health_report` (emails green/red daily report via Microsoft Graph)
 
 Important operational caveat:
 
@@ -191,6 +192,7 @@ Infinitspace-datawarehouse/
     real_estate_costar.py
     real_estate_costar_worker.py
     replyio_sync.py
+    sync_health_report.py
   shared/
     azure_clients/
       sql_client.py
@@ -241,6 +243,9 @@ Infinitspace-datawarehouse/
     real_estate/
       __init__.py
       building_contact_extractor.py   (adapted from AI-REAL-ESTATE repo, uses PyMuPDF)
+    notifications/
+      __init__.py
+      graph_mailer.py   (Microsoft Graph app-only sendMail)
     azure_clients/
       ...
       costar_queue_client.py
@@ -328,6 +333,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `nexudus_invoice_reconcile` | `functions/nexudus_invoice_reconcile.py` | timer | `0 15 5 * * *` | daily soft-delete pass for `silver.nexudus_coworker_invoices` + cascaded lines; 365-day due_date window |
 | `nexudus_silver_reconcile` | `functions/nexudus_silver_reconcile.py` | timer | `0 0 1 * * 0` | weekly soft-delete sweep for locations, products, contracts, extra_services, resources, coworkers |
 | `replyio_stats_sync` | `functions/replyio_sync.py` | timer | `0 30 5 * * *` | syncs Reply.io sequence steps + daily step performance stats to bronze |
+| `sync_health_report` | `functions/sync_health_report.py` | timer | `0 0 6 * * *` | daily health report email via Microsoft Graph; green/red flags per entity from `meta.sync_runs` (last 24h) + record-level error summary from `meta.sync_errors` |
 
 ---
 
@@ -649,6 +655,17 @@ INTEGRATIONS_ENCRYPTION_KEY=...
 # Reply.io
 REPLY_IO_API_KEY=...
 
+# Sync health report (Microsoft Graph sendMail)
+# App registration needs Mail.Send (Application) permission with admin consent
+# on the sender mailbox (GRAPH_SENDER_UPN, e.g. info@infinitspace.com).
+GRAPH_TENANT_ID=...
+GRAPH_CLIENT_ID=...
+GRAPH_CLIENT_SECRET=...
+GRAPH_SENDER_UPN=info@infinitspace.com
+SYNC_REPORT_RECIPIENTS=bryan.swannie@infinitspace.com,baptiste.valentin@infinitspace.com
+SYNC_HEALTH_REPORT_SCHEDULE="0 0 6 * * *"
+SYNC_REPORT_LOOKBACK_HOURS=24
+
 # Function registration
 ENABLE_ETL_FUNCTIONS=1
 ENABLE_ADMIN_FUNCTIONS=0
@@ -854,6 +871,7 @@ az functionapp config appsettings set `
 | Nexudus invoice PDF caching | done | blob storage (`nexudus-invoice-pdfs`); path in `silver.nexudus_coworker_invoices.pdf_blob_path` |
 | Finance dashboard gold layer | done | Nexudus-only; `gold.finance_dashboard_invoice_worklist` + `gold.finance_dashboard_user_access`; rebuilt by `gold.sp_refresh_finance_dashboard`; filters `is_deleted = 0` on all silver reads |
 | Soft-delete / source reconciliation | done | `is_deleted`/`deleted_at` on all Nexudus + BambooHR silver tables; daily `nexudus_invoice_reconcile` (invoices + cascaded lines), daily roster reconcile inside `bamboohr_sync`, weekly `nexudus_silver_reconcile` for other entities |
+| Sync health report email | done | daily 06:00 UTC via Microsoft Graph; subject `[OK]`/`[FAIL]`; green/red table per entity + record-level error summary; sends to `SYNC_REPORT_RECIPIENTS` from `GRAPH_SENDER_UPN` |
 
 ---
 
@@ -871,6 +889,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-21 (added soft-delete reconciliation: `is_deleted`/`deleted_at` columns on all Nexudus + BambooHR silver tables via `silver_soft_delete_migration.sql`; daily `nexudus_invoice_reconcile` at 05:15 for invoices + cascaded lines; daily roster reconcile embedded in `bamboohr_sync`; weekly `nexudus_silver_reconcile` Sun 01:00 for locations/products/contracts/extra_services/resources/coworkers; `gold.sp_refresh_finance_dashboard` now filters `is_deleted = 0` on every silver join)
+Last updated: 2026-04-23 (added `sync_health_report` daily email at 06:00 UTC: queries `meta.sync_runs` + `meta.sync_errors` for the last 24h, renders an HTML green/red flag table per entity with record-level error summary, sends via Microsoft Graph app-only auth from `GRAPH_SENDER_UPN` (info@infinitspace.com) to `SYNC_REPORT_RECIPIENTS`; subject tagged `[OK]` / `[FAIL]` for inbox triage; new module `shared/notifications/graph_mailer.py`; added `msal` to requirements; App Registration needs `Mail.Send` (Application) with admin consent on the sender mailbox)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

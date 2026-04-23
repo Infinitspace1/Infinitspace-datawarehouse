@@ -44,6 +44,7 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     from functions.silver_nexudus import bp as silver_bp
     from functions.silver_worker import bp as silver_worker_bp
     from functions.replyio_sync import bp as replyio_bp
+    from functions.sync_health_report import bp as sync_health_report_bp
     from functions.xero_sync import bp as xero_sync_bp
 
     app.register_functions(bronze_bp)
@@ -57,6 +58,7 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     app.register_functions(bamboohr_bp)
     app.register_functions(finance_dashboard_bp)
     app.register_functions(replyio_bp)
+    app.register_functions(sync_health_report_bp)
 
 
 if _env_flag("ENABLE_ADMIN_FUNCTIONS", False):

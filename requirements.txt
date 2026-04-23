@@ -10,6 +10,7 @@ azure-identity
 azure-storage-blob
 azure-storage-queue
 cryptography
+msal
 
 # Real Estate — CoStar PDF extractor
 anthropic>=0.40.0
