@@ -70,6 +70,10 @@ CREATE TABLE ava.product_availability (
     -- Pricing
     -- -------------------------------------------------------------------------
     price                   DECIMAL(12,2)   NULL,
+        -- Standard / member price. For meeting_room: MIN(price) across tiers.
+    external_price          DECIMAL(12,2)   NULL,
+        -- Non-member price. Populated for meeting_room only (MAX(price) across tiers).
+        -- NULL for all other categories.
     currency_code           NVARCHAR(8)     NULL,
     charge_period           NVARCHAR(32)    NULL,
         -- 'per_month'    for hot_desk, dedicated_desk, private_office

@@ -40,7 +40,7 @@ BEGIN
             product_source_id, resource_source_id, extra_service_source_id,
             item_name,
             capacity,
-            price, currency_code, charge_period,
+            price, external_price, currency_code, charge_period,
             is_available, available_from, occupied_until, next_occupied_from,
             chain_occupied_until, availability_notes,
             last_refreshed_at
@@ -57,6 +57,7 @@ BEGIN
             p.name              AS item_name,
             1                   AS capacity,
             p.price,
+            NULL                AS external_price,
             p.currency_code,
             'per_month'         AS charge_period,
             1                   AS is_available,
@@ -82,7 +83,7 @@ BEGIN
             product_source_id, resource_source_id, extra_service_source_id,
             item_name,
             capacity,
-            price, currency_code, charge_period,
+            price, external_price, currency_code, charge_period,
             is_available, available_from, occupied_until, next_occupied_from,
             chain_occupied_until, availability_notes,
             last_refreshed_at
@@ -99,6 +100,7 @@ BEGIN
             p.name,
             1,
             p.price,
+            NULL,
             p.currency_code,
             'per_month',
             1,
@@ -392,7 +394,7 @@ BEGIN
             product_source_id, resource_source_id, extra_service_source_id,
             item_name,
             capacity,
-            price, currency_code, charge_period,
+            price, external_price, currency_code, charge_period,
             is_available, available_from, occupied_until, next_occupied_from,
             chain_occupied_until, availability_notes,
             last_refreshed_at
@@ -409,6 +411,7 @@ BEGIN
             p.name,
             p.capacity,
             p.price,
+            NULL,
             p.currency_code,
             'per_month',
             oa.is_available,
@@ -442,9 +445,10 @@ BEGIN
             SELECT
                 location_source_id,
                 resource_type_names,
-                MIN(price)         AS min_price,
-                MIN(source_id)     AS min_source_id,   -- representative row for traceability
-                MAX(currency_code) AS currency_code    -- consistent within a location
+                MIN(price)         AS member_price,     -- cheapest tier = member rate
+                MAX(price)         AS external_price,   -- most expensive tier = non-member rate
+                MIN(source_id)     AS min_source_id,    -- representative row for traceability
+                MAX(currency_code) AS currency_code     -- consistent within a location
             FROM silver.nexudus_extra_services
             WHERE resource_type_names IS NOT NULL
               AND LOWER(resource_type_names) NOT LIKE 'hot desk%'
@@ -456,7 +460,7 @@ BEGIN
             product_source_id, resource_source_id, extra_service_source_id,
             item_name,
             capacity,
-            price, currency_code, charge_period,
+            price, external_price, currency_code, charge_period,
             is_available, available_from, occupied_until, next_occupied_from,
             chain_occupied_until, availability_notes,
             last_refreshed_at
@@ -472,7 +476,11 @@ BEGIN
             mp.min_source_id        AS extra_service_source_id,
             mp.resource_type_names  AS item_name,
             r.allocation            AS capacity,            -- NULL if resource join misses
-            mp.min_price            AS price,
+            mp.member_price         AS price,
+            CASE WHEN mp.external_price <> mp.member_price
+                 THEN mp.external_price
+                 ELSE NULL
+            END                     AS external_price,      -- NULL when only one price tier exists
             mp.currency_code,
             'per_booking'           AS charge_period,
             1,
@@ -516,7 +524,7 @@ BEGIN
             product_source_id, resource_source_id, extra_service_source_id,
             item_name,
             capacity,
-            price, currency_code, charge_period,
+            price, external_price, currency_code, charge_period,
             is_available, available_from, occupied_until, next_occupied_from,
             chain_occupied_until, availability_notes,
             last_refreshed_at
@@ -533,6 +541,7 @@ BEGIN
             dp.item_name,
             1,
             dp.min_price,
+            NULL,
             dp.currency_code,
             'per_day',
             1,
@@ -563,18 +572,7 @@ GO
 EXEC ava.sp_refresh_product_availability;
 
 
-SELECT * FROM ava.product_availability
-WHERE item_category = 'private_office'
-AND product_source_id = 1415197104
 
-SELECT COUNT(1) FROM ava.product_availability
-WHERE city = 'Amsterdam'
-AND item_category = 'private_office'
-
-
-SELECT * FROM ava.product_availability
-where city = 'Amsterdam' 
-OR location_id = 6
 
 --1 Aldgate tower: location_id 1376491118
 --2 Kingsbourne House: location_id 1414964752
@@ -586,16 +584,5 @@ OR location_id = 6
 --8 Quartier Chaussestrasse: location_id 1420976475
 --9 Foxcourt: location_id 1420976575
 
-
-SELECT t.tenant_name, COUNT(1)  FROM silver.xero_invoices inv
-INNER JOIN meta.xero_tenants t ON inv.xero_tenant_id = t.xero_tenant_id
-GROUP BY t.tenant_name
-ORDER BY COUNT(1) DESC;
-
-SELECT * FROM meta.xero_tenants
-
-SELECT TOP(3) * FROM silver.xero_invoices
-ORDER BY last_synced_at DESC
-
-"fa8c0a20-a6bb-4591-933c-97e9cfc26d34"
-"17687821-9e30-44e3-b215-731e5ef4b1f5"
+SELECT * FROM ava.product_availability
+WHERE location_source_id = 1420951935;
