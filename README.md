@@ -24,6 +24,7 @@ This project runs scheduled Azure Functions that ingest operational data into Az
   - Timer trigger
   - Default schedule: `02:30 UTC`
   - Enqueues one queue message per entity
+  - Each silver worker now loads only bronze rows changed since the last successful silver run for that entity
 
 - `silver_entity_worker`
   - Queue trigger
@@ -35,6 +36,7 @@ This project runs scheduled Azure Functions that ingest operational data into Az
   - Default schedule: `03:00 UTC`
   - Runs `ava.sp_refresh_product_availability`
   - Rebuilds `ava.product_availability`
+  - Fails fast with a clear prerequisite error if the AVA table or stored procedure is missing
 
 ### Xero
 
@@ -259,7 +261,7 @@ For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settin
 ### Unit Tests
 
 ```powershell
-.\venv\Scripts\python.exe -m unittest tests.test_xero_integration tests.test_xero_tenant_directory tests.test_xero_nexudus_invoice_linking
+.\venv\Scripts\python.exe -m unittest tests.test_ava_refresh tests.test_nexudus_resource_transformer tests.test_silver_sync tests.test_xero_integration tests.test_xero_tenant_directory tests.test_xero_nexudus_invoice_linking
 ```
 
 ## Xero Auth and Refresh
@@ -364,6 +366,7 @@ Important:
 - `bronze_to_silver` is schedule-based, not dependency-aware
 - `refresh_ava_availability` is also schedule-based
 - operationally, bronze should finish before silver starts, and silver workers should finish before AVA starts
+- `rows_written` for Nexudus silver now reflects incremental bronze changes since the last successful silver run, not the full current silver table size
 
 ## What To Monitor
 

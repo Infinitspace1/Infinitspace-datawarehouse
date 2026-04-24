@@ -11,6 +11,7 @@ import logging
 import uuid
 
 from shared.azure_clients.sql_client import get_sql_client
+from shared.azure_clients.silver_sync import load_latest_bronze_rows
 from shared.nexudus.transformers.locations import transform_location, transform_location_hours
 
 logger = logging.getLogger(__name__)
@@ -125,7 +126,11 @@ class SilverLocationsWriter:
         loc_count = len(loc_params)
         hours_count = len(hours_params)
         logger.info(f"Silver upserted: {loc_count} locations, {hours_count} hours rows")
-        return {"locations": loc_count, "location_hours": hours_count}
+        return {
+            "rows_read": len(bronze_rows),
+            "locations": loc_count,
+            "location_hours": hours_count,
+        }
 
     # ── Bronze loader ─────────────────────────────────────────
 
@@ -134,16 +139,12 @@ class SilverLocationsWriter:
         Load the most recent snapshot per source_id.
         (In case bronze has multiple runs — we only want the latest.)
         """
-        return self.sql.execute_query("""
-            SELECT b.id, b.source_id, b.raw_json
-            FROM bronze.nexudus_locations b
-            INNER JOIN (
-                SELECT source_id, MAX(synced_at) AS latest
-                FROM bronze.nexudus_locations
-                GROUP BY source_id
-            ) latest ON b.source_id = latest.source_id
-                    AND b.synced_at = latest.latest
-        """)
+        return load_latest_bronze_rows(
+            "bronze.nexudus_locations",
+            source_name="nexudus",
+            entity="locations",
+            columns="b.id, b.source_id, b.raw_json",
+        )
 
     # ── Param builders ────────────────────────────────────────
 

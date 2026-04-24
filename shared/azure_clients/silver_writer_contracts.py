@@ -9,6 +9,7 @@ import logging
 import uuid
 
 from shared.azure_clients.sql_client import get_sql_client
+from shared.azure_clients.silver_sync import load_latest_bronze_rows
 from shared.nexudus.transformers.contracts import transform_contract
 
 logger = logging.getLogger(__name__)
@@ -105,19 +106,14 @@ class SilverContractsWriter:
 
         ok = len(params_list)
         logger.info(f"Silver contracts: {ok} upserted, {errors} errors")
-        return {"contracts": ok, "errors": errors}
+        return {"rows_read": len(rows), "contracts": ok, "errors": errors}
 
     def _load_latest_bronze(self) -> list[dict]:
-        return self.sql.execute_query("""
-            SELECT b.id, b.raw_json
-            FROM bronze.nexudus_contracts b
-            INNER JOIN (
-                SELECT source_id, MAX(synced_at) AS latest
-                FROM bronze.nexudus_contracts
-                GROUP BY source_id
-            ) latest ON b.source_id = latest.source_id
-                    AND b.synced_at  = latest.latest
-        """)
+        return load_latest_bronze_rows(
+            "bronze.nexudus_contracts",
+            source_name="nexudus",
+            entity="contracts",
+        )
 
     def _make_params(self, c: dict) -> tuple:
         vals = (

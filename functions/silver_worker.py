@@ -138,6 +138,7 @@ async def silver_entity_worker(msg: func.QueueMessage) -> None:
     ) as run:
         writer = writer_cls(sync_run_id)
         result = writer.run()
+        run.rows_read = int(result.get("rows_read") or 0)
         run.rows_written = rows_fn(result)
         logger.info(
             f"Silver worker complete: entity={entity} "

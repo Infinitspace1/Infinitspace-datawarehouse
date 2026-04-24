@@ -58,6 +58,7 @@ Important operational caveat:
 - `refresh_ava_availability` is also schedule-based
 - bronze should finish before silver starts
 - silver workers should finish before AVA starts
+- silver workers now load only bronze rows changed since their last successful silver run, so `rows_written` is incremental rather than full-snapshot
 
 Flow:
 
@@ -200,6 +201,7 @@ Infinitspace-datawarehouse/
       blob_writer.py
       queue_client.py
       run_tracker.py
+      silver_sync.py
       silver_write_locations.py
       silver_writer_products.py
       silver_writer_contracts.py
@@ -284,6 +286,7 @@ Infinitspace-datawarehouse/
       silver_nexudus_products_schema.sql
       silver_nexudus_contracts_schema.sql
       silver_nexudus_resources_schema.sql
+      silver_nexudus_resources_alignment.sql
       silver_nexudus_extra_services_schema.sql
       silver_gmaps_locations_schema.sql
       silver_soft_delete_migration.sql
@@ -296,6 +299,9 @@ Infinitspace-datawarehouse/
       xero_pdf_blob_migration.sql
       test.sql
   tests/
+    test_ava_refresh.py
+    test_nexudus_resource_transformer.py
+    test_silver_sync.py
     test_xero_integration.py
     test_xero_tenant_directory.py
     test_xero_nexudus_invoice_linking.py
@@ -449,6 +455,7 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
 
 - `functions/silver_nexudus.py` only enqueues work
 - `functions/silver_worker.py` performs the actual transformation
+- each writer loads only the latest bronze rows changed since the last successful silver run for that entity
 - queue retries are safe because silver writes are idempotent upserts
 - poison queue: `silver-sync-tasks-poison`
 - entities: locations, products, contracts, coworker_invoices, coworkers, resources, extra_services, coworker_invoice_lines
@@ -457,6 +464,7 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
 
 - `functions/ava_refresh.py`
 - runs `EXEC ava.sp_refresh_product_availability`
+- verifies both `ava.product_availability` and `ava.sp_refresh_product_availability` exist before running
 - logs before and after row count
 
 ### Xero OAuth and Sync
@@ -572,6 +580,10 @@ Expected SQL status fields:
 - `rows_written`
 - `rows_skipped`
 - `error_message`
+
+Operational note:
+
+- for Nexudus silver runs, `rows_read` and `rows_written` now reflect only bronze rows changed since the last successful silver run for that entity, not the full current snapshot size
 
 ### Expected Nexudus logs
 
@@ -889,6 +901,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-23 (added `sync_health_report` daily email at 06:00 UTC: queries `meta.sync_runs` + `meta.sync_errors` for the last 24h, renders an HTML green/red flag table per entity with record-level error summary, sends via Microsoft Graph app-only auth from `GRAPH_SENDER_UPN` (info@infinitspace.com) to `SYNC_REPORT_RECIPIENTS`; subject tagged `[OK]` / `[FAIL]` for inbox triage; new module `shared/notifications/graph_mailer.py`; added `msal` to requirements; App Registration needs `Mail.Send` (Application) with admin consent on the sender mailbox)
+Last updated: 2026-04-24 (aligned silver resources with canonical SQL columns `group_id`/`group_name`/`is_visible`/`allocation`; restored missing `silver_nexudus_resources_schema.sql` and added non-destructive `silver_nexudus_resources_alignment.sql`; Nexudus silver writers now process only bronze rows changed since the last successful silver run, so sync health `rows_written` is incremental; AVA refresh now fails fast with a clear prerequisite error if the AVA table or stored procedure is missing; added tests for AVA preflight, silver watermark loading, and resource transformation)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team
