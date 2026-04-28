@@ -901,6 +901,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-24 (aligned silver resources with canonical SQL columns `group_id`/`group_name`/`is_visible`/`allocation`; restored missing `silver_nexudus_resources_schema.sql` and added non-destructive `silver_nexudus_resources_alignment.sql`; Nexudus silver writers now process only bronze rows changed since the last successful silver run, so sync health `rows_written` is incremental; AVA refresh now fails fast with a clear prerequisite error if the AVA table or stored procedure is missing; added tests for AVA preflight, silver watermark loading, and resource transformation)
+Last updated: 2026-04-28 (two fixes to `ava.sp_refresh_product_availability`: (1) clear-step now uses `DELETE FROM` instead of `TRUNCATE TABLE` so the SP runs with the function app's default DELETE permission instead of the ALTER permission TRUNCATE requires — TRUNCATE silently broke the daily AVA refresh after the 2026-04-23 schema recreate dropped the explicit ALTER grant; (2) `active_per_product` CTE now treats `active=1` contracts whose `contract_term` is in the past with no `cancellation_date` as rolling month-to-month (`end_date = NULL`), matching Nexudus's behavior of keeping `active=1` and a stale initial-term-end date when fixed-term contracts auto-roll — previously these rolled contracts produced misleading `'Occupied until <past date>'` rows in `ava.product_availability`)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

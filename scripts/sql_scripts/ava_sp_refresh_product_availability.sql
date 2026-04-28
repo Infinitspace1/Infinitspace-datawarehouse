@@ -2,7 +2,7 @@
 -- ava.sp_refresh_product_availability
 -- =============================================================================
 -- Purpose  : Rebuild ava.product_availability from scratch every run.
---            Truncates the table then inserts one row per bookable item,
+--            Clears the table then inserts one row per bookable item,
 --            grouped into 5 categories:
 --              1. hot_desk        (silver.nexudus_products item_type = 3)
 --              2. dedicated_desk  (silver.nexudus_products item_type = 2)
@@ -23,9 +23,12 @@ BEGIN
     BEGIN TRY
 
         -- ------------------------------------------------------------------
-        -- Clear previous snapshot
+        -- Clear previous snapshot.
+        -- DELETE (not TRUNCATE) so this runs with the function app's default
+        -- DELETE permission. TRUNCATE requires ALTER, which gets dropped
+        -- whenever the schema script recreates the table.
         -- ------------------------------------------------------------------
-        TRUNCATE TABLE ava.product_availability;
+        DELETE FROM ava.product_availability;
 
 
         -- ==================================================================
@@ -180,11 +183,29 @@ BEGIN
         ),
         active_per_product AS (
             -- The current occupancy: summarise active contract(s) per product.
-            -- end_date = COALESCE(cancellation_date, contract_term); NULL = rolling monthly.
+            --
+            -- end_date semantics (NULL = rolling monthly, no fixed end):
+            --   1. cancellation_date set         → cancellation_date wins (explicit end)
+            --   2. contract_term in the future   → contract_term (real fixed end)
+            --   3. contract_term in the past,
+            --      cancellation_date NULL        → NULL (rolled into month-to-month;
+            --                                            Nexudus keeps active=1 and
+            --                                            leaves contract_term at the
+            --                                            stale initial-term-end date)
+            --
             -- MAX() so that if multiple active rows exist, we take the latest end.
             SELECT
                 product_id,
-                MAX(CAST(COALESCE(cancellation_date, contract_term) AS DATE)) AS end_date
+                MAX(
+                    CASE
+                        WHEN cancellation_date IS NOT NULL
+                            THEN CAST(cancellation_date AS DATE)
+                        WHEN contract_term IS NOT NULL
+                             AND CAST(contract_term AS DATE) >= CAST(GETUTCDATE() AS DATE)
+                            THEN CAST(contract_term AS DATE)
+                        ELSE NULL    -- rolled into month-to-month
+                    END
+                ) AS end_date
             FROM linked_contracts
             WHERE active = 1
             GROUP BY product_id
@@ -574,7 +595,6 @@ EXEC ava.sp_refresh_product_availability;
 
 
 
-
 --1 Aldgate tower: location_id 1376491118
 --2 Kingsbourne House: location_id 1414964752
 --3 Zuidtoren: location_id 1414964753
@@ -584,3 +604,18 @@ EXEC ava.sp_refresh_product_availability;
 --7 Quartier Heidestrasse: location_id 1420962233
 --8 Quartier Chaussestrasse: location_id 1420976475
 --9 Foxcourt: location_id 1420976575
+
+SELECT * FROM ava.product_availability
+WHERE location_source_id = '1415079491'
+AND item_category = 'private_office'
+AND is_available = 1
+
+
+-- SELECT
+--     source_id, name, item_type, capacity,
+--     location_source_id, location_name,
+--     is_available, contract_ids_raw,
+--     is_deleted, deleted_at, last_synced_at
+-- FROM silver.nexudus_products
+-- WHERE source_id = 1415196881;
+
