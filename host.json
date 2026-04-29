@@ -16,6 +16,13 @@
   "extensions": {
     "queues": {
       "messageEncoding": "none"
+    },
+    "durableTask": {
+      "storageProvider": {
+        "connectionStringName": "AzureWebJobsStorage"
+      },
+      "maxConcurrentActivityFunctions": 10,
+      "maxConcurrentOrchestratorFunctions": 5
     }
   }
 }
