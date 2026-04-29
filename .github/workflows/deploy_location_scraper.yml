@@ -1,14 +1,6 @@
 name: Deploy Location Scraper
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "functions/location_scraper.py"
-      - "shared/location_scraper/**"
-      - "requirements.txt"
-      - "host.json"
-      - ".github/workflows/deploy_location_scraper.yml"
   workflow_dispatch:
     inputs:
       environment:
@@ -61,7 +53,6 @@ jobs:
     name: Deploy to Azure Functions
     runs-on: ubuntu-latest
     needs: test
-    environment: ${{ github.event.inputs.environment || 'production' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -82,9 +73,9 @@ jobs:
       - name: Log in to Azure (OIDC)
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_6651F39686B04788AF9A53C78632929F }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_7EF5B56F14DE4AA3A8E58D4A379D1354 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_07D1E39F7A4646E09728B5DAB7EC285D }}
 
       - name: Enable location scraper functions on Function App
         run: |
