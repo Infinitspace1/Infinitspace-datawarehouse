@@ -19,6 +19,7 @@ Primary sources today:
 - Xero API
 - CoStar PDF extractor (Real Estate HTTP function)
 - Google Maps enrichment utilities exist but are not part of the scheduled Function App
+- Location Scraper (HTTP-triggered Durable Functions pipeline — Idealista + Otodom)
 
 Platform:
 
@@ -143,6 +144,7 @@ Default ETL deployment:
 - `ENABLE_ETL_FUNCTIONS=1`
 - `ENABLE_ADMIN_FUNCTIONS=0`
 - `ENABLE_REAL_ESTATE_FUNCTIONS=0`
+- `ENABLE_LOCATION_SCRAPER_FUNCTIONS=0`
 
 Optional admin deployment:
 
@@ -340,6 +342,9 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `nexudus_silver_reconcile` | `functions/nexudus_silver_reconcile.py` | timer | `0 0 1 * * 0` | weekly soft-delete sweep for locations, products, contracts, extra_services, resources, coworkers |
 | `replyio_stats_sync` | `functions/replyio_sync.py` | timer | `0 30 5 * * *` | syncs Reply.io sequence steps + daily step performance stats to bronze |
 | `sync_health_report` | `functions/sync_health_report.py` | timer | `0 0 6 * * *` | daily health report email via Microsoft Graph; green/red flags per entity from `meta.sync_runs` (last 24h) + record-level error summary from `meta.sync_errors` |
+| `location_scraper_http` | `functions/location_scraper.py` | HTTP POST | `/api/scrape` | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — Durable Functions starter; returns 202 |
+| `location_scraper_orch` | `functions/location_scraper.py` | orchestration | — | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — Durable orchestrator |
+| `ls_*` (11 activities) | `functions/location_scraper.py` | activity | — | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — resolve / scrape / enrich / persist / log |
 
 ---
 
@@ -678,6 +683,11 @@ SYNC_REPORT_RECIPIENTS=bryan.swannie@infinitspace.com,baptiste.valentin@infinits
 SYNC_HEALTH_REPORT_SCHEDULE="0 0 6 * * *"
 SYNC_REPORT_LOOKBACK_HOURS=24
 
+# Location Scraper
+APIFY_TOKEN=...
+LUSHA_API_KEY=...
+ENABLE_LOCATION_SCRAPER_FUNCTIONS=0
+
 # Function registration
 ENABLE_ETL_FUNCTIONS=1
 ENABLE_ADMIN_FUNCTIONS=0
@@ -884,6 +894,7 @@ az functionapp config appsettings set `
 | Finance dashboard gold layer | done | Nexudus-only; `gold.finance_dashboard_invoice_worklist` + `gold.finance_dashboard_user_access`; rebuilt by `gold.sp_refresh_finance_dashboard`; filters `is_deleted = 0` on all silver reads |
 | Soft-delete / source reconciliation | done | `is_deleted`/`deleted_at` on all Nexudus + BambooHR silver tables; daily `nexudus_invoice_reconcile` (invoices + cascaded lines), daily roster reconcile inside `bamboohr_sync`, weekly `nexudus_silver_reconcile` for other entities |
 | Sync health report email | done | daily 06:00 UTC via Microsoft Graph; subject `[OK]`/`[FAIL]`; green/red table per entity + record-level error summary; sends to `SYNC_REPORT_RECIPIENTS` from `GRAPH_SENDER_UPN` |
+| Location Scraper (Idealista + Otodom) | done | HTTP-triggered Durable Functions pipeline; `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1`; Idealista (ES/IT) + Otodom (PL); Lusha enrichment via fan-out; bronze schema; see `docs/location_scraper.md` |
 
 ---
 
@@ -901,6 +912,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-28 (two fixes to `ava.sp_refresh_product_availability`: (1) clear-step now uses `DELETE FROM` instead of `TRUNCATE TABLE` so the SP runs with the function app's default DELETE permission instead of the ALTER permission TRUNCATE requires — TRUNCATE silently broke the daily AVA refresh after the 2026-04-23 schema recreate dropped the explicit ALTER grant; (2) `active_per_product` CTE now treats `active=1` contracts whose `contract_term` is in the past with no `cancellation_date` as rolling month-to-month (`end_date = NULL`), matching Nexudus's behavior of keeping `active=1` and a stale initial-term-end date when fixed-term contracts auto-roll — previously these rolled contracts produced misleading `'Occupied until <past date>'` rows in `ava.product_availability`)
+Last updated: 2026-04-29 (two fixes to `ava.sp_refresh_product_availability`: (1) clear-step now uses `DELETE FROM` instead of `TRUNCATE TABLE` so the SP runs with the function app's default DELETE permission instead of the ALTER permission TRUNCATE requires — TRUNCATE silently broke the daily AVA refresh after the 2026-04-23 schema recreate dropped the explicit ALTER grant; (2) `active_per_product` CTE now treats `active=1` contracts whose `contract_term` is in the past with no `cancellation_date` as rolling month-to-month (`end_date = NULL`), matching Nexudus's behavior of keeping `active=1` and a stale initial-term-end date when fixed-term contracts auto-roll — previously these rolled contracts produced misleading `'Occupied until <past date>'` rows in `ava.product_availability`)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

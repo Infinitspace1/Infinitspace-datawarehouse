@@ -7,17 +7,19 @@ Deployment model:
   - Default publish: ETL-only surface (timers + queue worker).
   - Optional admin publish: enable admin/debug HTTP routes with app settings.
   - Optional real-estate publish: enable Real Estate HTTP API routes.
+  - Optional location-scraper publish: enable Durable Functions scrape pipeline.
 
 App settings:
-  - ENABLE_ETL_FUNCTIONS=1          default
-  - ENABLE_ADMIN_FUNCTIONS=0        default
-  - ENABLE_REAL_ESTATE_FUNCTIONS=0  default
+  - ENABLE_ETL_FUNCTIONS=1                  default
+  - ENABLE_ADMIN_FUNCTIONS=0                default
+  - ENABLE_REAL_ESTATE_FUNCTIONS=0          default
+  - ENABLE_LOCATION_SCRAPER_FUNCTIONS=0     default
 """
 from __future__ import annotations
 
 import os
 
-import azure.functions as func
+import azure.durable_functions as df
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,7 +32,9 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-app = func.FunctionApp()
+# DFApp extends FunctionApp and adds orchestration/activity trigger support.
+# All existing func.Blueprint registrations remain fully compatible.
+app = df.DFApp()
 
 
 if _env_flag("ENABLE_ETL_FUNCTIONS", True):
@@ -75,3 +79,9 @@ if _env_flag("ENABLE_REAL_ESTATE_FUNCTIONS", False):
 
     app.register_functions(real_estate_costar_bp)
     app.register_functions(real_estate_costar_worker_bp)
+
+
+if _env_flag("ENABLE_LOCATION_SCRAPER_FUNCTIONS", False):
+    from functions.location_scraper import bp as location_scraper_bp
+
+    app.register_functions(location_scraper_bp)
