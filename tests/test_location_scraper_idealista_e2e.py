@@ -235,6 +235,74 @@ FAKE_LUSHA_ENRICHED = {
 }
 
 
+def test_enrich_agency_individual_fallback_to_company():
+    """If the individual Lusha search returns nothing, the company path should run."""
+    with (
+        patch(
+            "shared.location_scraper.clients.lusha.search_individual",
+            return_value=None,  # individual search finds nothing
+        ),
+        patch(
+            "shared.location_scraper.activities.enrich.apify_client.run_sync",
+            return_value=FAKE_GOOGLE_RESULT,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.search_contacts_by_domain",
+            return_value=FAKE_LUSHA_CONTACTS,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.enrich_contact",
+            return_value=FAKE_LUSHA_ENRICHED,
+        ),
+    ):
+        agency_dict = {
+            "company_name": "Biuro ABC",
+            "first_name": "Jan",
+            "last_name": "Kowalski",
+            "source": "otodom",
+            "contacts": [],
+        }
+        result = enrich_agency(
+            {"agency": agency_dict, "country": "poland", "country_code": "pl"}
+        )
+        # Should have fallen back to company path and found Lusha contacts
+        assert len(result["contacts"]) >= 1
+        assert result["contacts"][0]["email"] == "ana.garcia@savills.es"
+
+
+def test_enrich_agency_individual_no_fallback_when_found():
+    """If the individual path succeeds, the company path must NOT run."""
+    individual_result = {
+        "fullName": "Jan Kowalski",
+        "jobTitle": "Leasing Manager",
+        "primaryEmail": "jan@biuroabc.pl",
+        "primaryEmailConfidence": 0.88,
+        "linkedinProfile": "",
+        "companyName": "Biuro ABC",
+    }
+    with (
+        patch(
+            "shared.location_scraper.clients.lusha.search_individual",
+            return_value=individual_result,
+        ),
+        patch(
+            "shared.location_scraper.activities.enrich.apify_client.run_sync"
+        ) as mock_google,
+    ):
+        agency_dict = {
+            "company_name": "Biuro ABC",
+            "first_name": "Jan",
+            "last_name": "Kowalski",
+            "source": "otodom",
+            "contacts": [],
+        }
+        result = enrich_agency(
+            {"agency": agency_dict, "country": "poland", "country_code": "pl"}
+        )
+        assert result["contacts"][0]["email"] == "jan@biuroabc.pl"
+        mock_google.assert_not_called()  # company path must not have run
+
+
 def test_enrich_agency_company_path():
     with (
         patch(

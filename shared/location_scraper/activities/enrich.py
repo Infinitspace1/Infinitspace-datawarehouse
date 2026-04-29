@@ -127,6 +127,9 @@ def enrich_agency(payload: dict) -> dict:
 
     if agency.is_individual():
         _enrich_individual(agency)
+        # Fall back to company path if the individual search returned nothing.
+        if not agency.contacts:
+            _enrich_company(agency, country, country_code)
     else:
         _enrich_company(agency, country, country_code)
 
