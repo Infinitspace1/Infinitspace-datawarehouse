@@ -2,7 +2,7 @@
 
 Replaces the n8n "Location Scraper" workflow (`jfCPRkxxpDRLC7Rm`).
 
-Scrapes commercial office listings from **Idealista** (Spain / Italy) and **Otodom** (Poland), enriches them with contact data via **Lusha**, and persists everything to Azure SQL under the `bronze` schema.
+Scrapes commercial office listings from **Idealista** (Spain / Italy), **Otodom** (Poland), and **Immobilienscout24** (Germany), enriches them with contact data via **Lusha**, and persists everything to Azure SQL under the `bronze` schema.
 
 ---
 
@@ -112,6 +112,13 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
 | `valencia` | Spain | Idealista |
 | `milan` | Italy | Idealista |
 | `warsaw` | Poland | Otodom |
+| `berlin` | Germany | Immobilienscout24 |
+| `munich` | Germany | Immobilienscout24 |
+| `hamburg` | Germany | Immobilienscout24 |
+| `cologne` | Germany | Immobilienscout24 |
+| `frankfurt` | Germany | Immobilienscout24 |
+| `dusseldorf` | Germany | Immobilienscout24 |
+| `stuttgart` | Germany | Immobilienscout24 |
 
 ---
 

@@ -40,6 +40,53 @@ logger = logging.getLogger(__name__)
 
 bp = df.Blueprint()
 
+
+def _summarize_enrichment_diagnostics(enriched_agencies: list[dict]) -> dict:
+    summary: dict[str, int] = {
+        "agencies_total": 0,
+        "agencies_with_contacts": 0,
+        "path_individual": 0,
+        "path_company": 0,
+        "path_individual_fallback_company": 0,
+        "individual_email_primary": 0,
+        "individual_email_email_addresses": 0,
+        "domains_found_total": 0,
+        "raw_contacts_found_total": 0,
+        "final_contacts_found_total": 0,
+    }
+    reasons: dict[str, int] = {}
+
+    for agency in enriched_agencies:
+        d = agency.get("_diagnostics") or {}
+        summary["agencies_total"] += 1
+        if d.get("has_contact"):
+            summary["agencies_with_contacts"] += 1
+
+        path = d.get("path")
+        if path == "individual":
+            summary["path_individual"] += 1
+        elif path == "company":
+            summary["path_company"] += 1
+        elif path == "individual_fallback_company":
+            summary["path_individual_fallback_company"] += 1
+
+        email_src = d.get("individual_email_source")
+        if email_src == "primaryEmail":
+            summary["individual_email_primary"] += 1
+        elif email_src == "emailAddresses":
+            summary["individual_email_email_addresses"] += 1
+
+        summary["domains_found_total"] += int(d.get("domains_found") or 0)
+        summary["raw_contacts_found_total"] += int(d.get("raw_contacts_found") or 0)
+        summary["final_contacts_found_total"] += int(d.get("final_contacts_found") or 0)
+
+        reason = d.get("reason")
+        if reason:
+            reasons[reason] = reasons.get(reason, 0) + 1
+
+    summary["reasons"] = reasons
+    return summary
+
 # ---------------------------------------------------------------------------
 # HTTP Trigger — POST /api/scrape
 # ---------------------------------------------------------------------------
@@ -144,6 +191,13 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
         for agency in new_agencies
     ]
     enriched_agencies: list[dict] = yield context.task_all(enrich_tasks)
+    enrichment_diag = _summarize_enrichment_diagnostics(enriched_agencies)
+    logger.info(
+        "Location scraper enrichment summary run_id=%s city=%s %s",
+        run_id,
+        source_config["city"],
+        json.dumps(enrichment_diag, sort_keys=True),
+    )
 
     # 9. Consolidate contacts (dedup + top-3 per agency)
     bundles: list[dict] = yield context.call_activity("ls_consolidate_contacts", enriched_agencies)
@@ -153,6 +207,7 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
         "ls_upsert_sql",
         {"listings": listings, "bundles": bundles, "run_id": run_id, "city": source_config["city"]},
     )
+    stats["enrichment_diagnostics"] = enrichment_diag
 
     # 11. Write completion log
     yield context.call_activity("ls_write_logs", stats)

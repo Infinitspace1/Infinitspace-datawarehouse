@@ -4,7 +4,11 @@ from __future__ import annotations
 import pytest
 
 from shared.location_scraper.activities.resolve import resolve_source
-from shared.location_scraper.config import IDEALISTA_ACTOR_ID, OTODOM_ACTOR_ID
+from shared.location_scraper.config import (
+    IDEALISTA_ACTOR_ID,
+    IMMOBILIENSCOUT_ACTOR_ID,
+    OTODOM_ACTOR_ID,
+)
 
 
 class TestResolveSource:
@@ -51,6 +55,20 @@ class TestResolveSource:
         cfg_with = resolve_source("warsaw", "POLYGON", "x")
         cfg_without = resolve_source("warsaw", None, "x")
         assert cfg_with.start_url == cfg_without.start_url
+
+    def test_berlin_immobilienscout(self):
+        cfg = resolve_source("berlin", None, "run-de-1")
+        assert cfg.country == "germany"
+        assert cfg.country_code == "de"
+        assert cfg.actor == "immobilienscout"
+        assert cfg.actor_id == IMMOBILIENSCOUT_ACTOR_ID
+        assert "immobilienscout24.de/Suche/de/berlin/berlin/buero-mieten" in cfg.start_url
+        assert "netfloorspace=1500" in cfg.start_url
+
+    def test_frankfurt_immobilienscout(self):
+        cfg = resolve_source("frankfurt", None, "run-de-2")
+        assert "immobilienscout24.de/Suche/de/hessen/frankfurt-am-main/buero-mieten" in cfg.start_url
+        assert cfg.run_id == "run-de-2"
 
     def test_unknown_city_raises(self):
         with pytest.raises(ValueError, match="not recognised"):

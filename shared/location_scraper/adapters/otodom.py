@@ -99,6 +99,14 @@ class OtodomAdapter:
                 contact_name = individual_names[0]
                 phone = seller_phones[contact_name]
 
+        # Fallbacks for listings where sellerPhones has no per-person key.
+        if not contact_name:
+            contact_name = (
+                raw_item.get("sellerName")
+                or raw_item.get("contactName")
+                or raw_item.get("advertiserName")
+            )
+
         if not phone:
             phone = raw_item.get("sellerPhone")
 

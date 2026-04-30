@@ -11,7 +11,6 @@ Ports these n8n nodes:
 """
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -25,6 +24,26 @@ from shared.location_scraper.config import (
 from shared.location_scraper.models import Agency, ContactBundle, Listing
 
 logger = logging.getLogger(__name__)
+
+
+def _split_contact_name(raw_name: str) -> tuple[str, str]:
+    """
+    Parse a person-like full name into first/last name.
+    Returns empty strings when parsing is not reliable.
+    """
+    name = (raw_name or "").strip()
+    if not name:
+        return "", ""
+
+    # Remove common separators from broker payload variants.
+    for sep in ("|", "-", ","):
+        if sep in name:
+            name = name.split(sep, 1)[0].strip()
+
+    parts = [p for p in name.split() if p]
+    if len(parts) < 2:
+        return "", ""
+    return parts[0], " ".join(parts[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +84,7 @@ def dedupe_agencies(listings: list[dict]) -> list[dict]:
             is_company = any(kw in contact_lower for kw in POLISH_COMPANY_KEYWORDS)
             is_same_as_company = contact.lower() == company_name.lower()
             if not is_company and not is_same_as_company:
-                parts = contact.split()
-                if len(parts) >= 2:
-                    first_name = parts[0]
-                    last_name = " ".join(parts[1:])
+                first_name, last_name = _split_contact_name(contact)
 
         agency = Agency(
             company_name=company_name,
@@ -124,35 +140,68 @@ def enrich_agency(payload: dict) -> dict:
     agency = Agency.from_dict(payload["agency"])
     country = payload["country"]
     country_code = payload["country_code"]
+    diagnostics = {
+        "path": "individual" if agency.is_individual() else "company",
+        "has_contact": False,
+        "reason": "",
+        "individual_email_source": "",
+        "domains_found": 0,
+        "raw_contacts_found": 0,
+        "final_contacts_found": 0,
+    }
 
     if agency.is_individual():
-        _enrich_individual(agency)
+        diagnostics.update(_enrich_individual(agency))
         # Fall back to company path if the individual search returned nothing.
         if not agency.contacts:
-            _enrich_company(agency, country, country_code)
+            company_diag = _enrich_company(agency, country, country_code)
+            diagnostics["path"] = "individual_fallback_company"
+            diagnostics["domains_found"] = company_diag.get("domains_found", 0)
+            diagnostics["raw_contacts_found"] = company_diag.get("raw_contacts_found", 0)
+            diagnostics["final_contacts_found"] = company_diag.get("final_contacts_found", 0)
+            if agency.contacts:
+                diagnostics["reason"] = "fallback_company_success"
+            elif not diagnostics.get("reason"):
+                diagnostics["reason"] = company_diag.get("reason", "fallback_company_no_contact")
     else:
-        _enrich_company(agency, country, country_code)
+        diagnostics.update(_enrich_company(agency, country, country_code))
 
-    return agency.to_dict()
+    diagnostics["has_contact"] = bool(agency.contacts)
+    diagnostics["final_contacts_found"] = len(agency.contacts)
+    out = agency.to_dict()
+    out["_diagnostics"] = diagnostics
+    return out
 
 
-def _enrich_individual(agency: Agency) -> None:
+def _enrich_individual(agency: Agency) -> dict:
     """Port: Filter1 → Lusha Search Individuals → Normalize Individual Result."""
+    diag = {"reason": "", "individual_email_source": ""}
     try:
         person = lusha_client.search_individual(
             agency.first_name, agency.last_name, agency.company_name
         )
         if not person:
-            return
-        primary_email = person.get("primaryEmail", "")
-        if not primary_email:
-            return
+            diag["reason"] = "individual_no_person"
+            return diag
+        best_email, best_confidence = lusha_client.extract_best_email(person)
+        if not best_email:
+            diag["reason"] = "individual_no_email"
+            return diag
+        full_name = (
+            person.get("fullName")
+            or f"{agency.first_name} {agency.last_name}".strip()
+            or agency.company_name
+        )
+        diag["reason"] = "individual_success"
+        diag["individual_email_source"] = (
+            "primaryEmail" if (person.get("primaryEmail") or "").strip() else "emailAddresses"
+        )
         agency.contacts = [
             {
-                "full_name": person.get("fullName", ""),
+                "full_name": full_name,
                 "job_title": person.get("jobTitle", ""),
-                "email": primary_email,
-                "email_confidence": str(person.get("primaryEmailConfidence", "")),
+                "email": best_email,
+                "email_confidence": best_confidence,
                 "linkedin_url": person.get("linkedinProfile", ""),
                 "seniority_rank": 3,  # individuals get highest priority per n8n logic
                 "domain_rank": 1,
@@ -160,26 +209,24 @@ def _enrich_individual(agency: Agency) -> None:
         ]
     except Exception:
         logger.exception("Lusha individual search failed for %s %s", agency.first_name, agency.last_name)
+        diag["reason"] = "individual_exception"
+    return diag
 
 
-def _enrich_company(agency: Agency, country: str, country_code: str) -> None:
+def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
     """
     Port: Build Google Search Queries → Get companies domain →
           Extract Domain from Results → Extract Contact → Filter →
           Enrich Emails → Pick Best Contact by Seniority.
     """
     company = agency.company_name
+    diag = {"reason": "", "domains_found": 0, "raw_contacts_found": 0, "final_contacts_found": 0}
     if not company:
-        return
+        diag["reason"] = "company_missing_name"
+        return diag
 
     # 1. Google Search via Apify to find company domain
     query = f"{company.replace('&', 'and')} real estate official website"
-    apify_input = json.dumps({
-        "queries": query,
-        "countryCode": country_code,
-        "maxPagesPerQuery": 1,
-        "resultsPerPage": 3,
-    })
     try:
         search_results = apify_client.run_sync(
             GOOGLE_SEARCH_ACTOR_ID,
@@ -188,7 +235,8 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> None:
         )
     except Exception:
         logger.exception("Google Search Apify run failed for company=%s", company)
-        return
+        diag["reason"] = "company_google_search_failed"
+        return diag
 
     # 2. Extract up to 3 domains from organic results
     domains_with_rank: list[tuple[str, int]] = []
@@ -200,9 +248,11 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> None:
             match = re.match(r"^https?://(?:www\.)?([^/]+)", url)
             if match:
                 domains_with_rank.append((match.group(1), rank))
+    diag["domains_found"] = len(domains_with_rank)
 
     if not domains_with_rank:
-        return
+        diag["reason"] = "company_no_domain_found"
+        return diag
 
     # 3. Lusha contact search per domain, collect best contacts
     all_contacts: list[dict] = []
@@ -215,6 +265,7 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> None:
             )
             if not raw_contacts:
                 continue
+            diag["raw_contacts_found"] += len(raw_contacts)
 
             # 4. Enrich each contact to get email addresses
             enriched = []
@@ -237,6 +288,9 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> None:
             logger.exception("Lusha search failed for domain=%s", domain)
 
     agency.contacts = all_contacts
+    diag["final_contacts_found"] = len(all_contacts)
+    diag["reason"] = "company_success" if all_contacts else "company_no_contacts"
+    return diag
 
 
 # ---------------------------------------------------------------------------

@@ -146,11 +146,36 @@ def search_individual(
     }
     try:
         data = _post("/v2/person/search", body)
-        return data.get("data")
+        person = data.get("data")
+        if isinstance(person, list):
+            return person[0] if person else None
+        return person
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code in (404, 422):
             return None
         raise
+
+
+def extract_best_email(person: dict[str, Any]) -> tuple[str, str]:
+    """
+    Return best available email and confidence from a Lusha person payload.
+
+    Priority:
+      1) primaryEmail / primaryEmailConfidence
+      2) first entry in emailAddresses[]
+    """
+    primary = (person.get("primaryEmail") or "").strip()
+    if primary:
+        return primary, str(person.get("primaryEmailConfidence", ""))
+
+    email_addresses = person.get("emailAddresses") or []
+    if email_addresses:
+        first = email_addresses[0] or {}
+        email = (first.get("email") or "").strip()
+        if email:
+            return email, str(first.get("emailConfidence", ""))
+
+    return "", ""
 
 
 def pick_best_contacts(
