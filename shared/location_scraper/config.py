@@ -10,6 +10,7 @@ from __future__ import annotations
 # Apify actor IDs
 IDEALISTA_ACTOR_ID = "OTe82JNUGa93aVcRc"
 OTODOM_ACTOR_ID = "ir34sMIv8mrbL0ojO"
+IMMOBILIENSCOUT_ACTOR_ID = "ciTdHfgOkkwfEzTE9"
 GOOGLE_SEARCH_ACTOR_ID = "nFJndFXA5zjCTuudP"
 
 COUNTRY_CONFIG: dict[str, dict] = {
@@ -51,6 +52,25 @@ COUNTRY_CONFIG: dict[str, dict] = {
         # Otodom does not support polygon-based (shape) searches via URL.
         "cities": {
             "warsaw": "mazowieckie/warszawa/warszawa/warszawa",
+        },
+    },
+    "germany": {
+        "domain": "https://www.immobilienscout24.de",
+        "language": "de",
+        "property_path": "buero-mieten",
+        "filter_suffix": "netfloorspace=1500",
+        "actor": "immobilienscout",
+        "actor_id": IMMOBILIENSCOUT_ACTOR_ID,
+        "country_code": "de",
+        # ImmoScout24 rental office market (>=1500 sqm filter in URL).
+        "cities": {
+            "berlin": "berlin/berlin",
+            "munich": "bayern/muenchen",
+            "hamburg": "hamburg/hamburg",
+            "cologne": "nordrhein-westfalen/koeln",
+            "frankfurt": "hessen/frankfurt-am-main",
+            "dusseldorf": "nordrhein-westfalen/duesseldorf",
+            "stuttgart": "baden-wuerttemberg/stuttgart",
         },
     },
 }

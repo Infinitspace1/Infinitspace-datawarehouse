@@ -912,6 +912,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-29 (two fixes to `ava.sp_refresh_product_availability`: (1) clear-step now uses `DELETE FROM` instead of `TRUNCATE TABLE` so the SP runs with the function app's default DELETE permission instead of the ALTER permission TRUNCATE requires — TRUNCATE silently broke the daily AVA refresh after the 2026-04-23 schema recreate dropped the explicit ALTER grant; (2) `active_per_product` CTE now treats `active=1` contracts whose `contract_term` is in the past with no `cancellation_date` as rolling month-to-month (`end_date = NULL`), matching Nexudus's behavior of keeping `active=1` and a stale initial-term-end date when fixed-term contracts auto-roll — previously these rolled contracts produced misleading `'Occupied until <past date>'` rows in `ava.product_availability`)
+Last updated: 2026-04-30 (Location Scraper updates: (1) Otodom contact-enrichment hardening + diagnostics remains in place; (2) added new Germany source `immobilienscout` (Apify actor id `ciTdHfgOkkwfEzTE9`) with city routing for Berlin, Munich, Hamburg, Cologne, Frankfurt, Dusseldorf, and Stuttgart; (3) resolver now builds ImmoScout24 office-rental URLs in the `/Suche/de/.../buero-mieten?netfloorspace=1500` format; (4) added `ImmobilienscoutAdapter` and tests, including a hard in-code guard to skip listings under 1500 sqm)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

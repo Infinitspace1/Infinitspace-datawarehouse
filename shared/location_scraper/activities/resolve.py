@@ -31,6 +31,9 @@ def resolve_source(city: str, shape: str | None, run_id: str) -> SourceConfig:
         if actor == "otodom":
             # Otodom does not support polygon search via URL.
             start_url = f"{domain}/{language}/{property_path}/{city_slug}?{filter_suffix}"
+        elif actor == "immobilienscout":
+            # Immobilienscout expects /Suche/{lang}/{region}/{city}/{property}?query.
+            start_url = f"{domain}/Suche/{language}/{city_slug}/{property_path}?{filter_suffix}"
         elif shape:
             # Idealista shape/polygon search — double-encoded per original n8n logic.
             start_url = (
