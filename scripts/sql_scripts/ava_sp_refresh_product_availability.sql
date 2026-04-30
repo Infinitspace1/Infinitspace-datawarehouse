@@ -73,7 +73,8 @@ BEGIN
         FROM silver.nexudus_products p
         JOIN silver.nexudus_locations l ON p.location_source_id = l.source_id
         WHERE p.item_type = 3
-          AND p.is_available = 1;
+          AND p.is_available = 1
+          AND p.is_deleted   = 0;
 
 
         -- ==================================================================
@@ -116,7 +117,8 @@ BEGIN
         FROM silver.nexudus_products p
         JOIN silver.nexudus_locations l ON p.location_source_id = l.source_id
         WHERE p.item_type = 2
-          AND p.is_available = 1;
+          AND p.is_available = 1
+          AND p.is_deleted   = 0;
 
 
         -- ==================================================================
@@ -167,6 +169,7 @@ BEGIN
             CROSS APPLY STRING_SPLIT(ISNULL(p.contract_ids_raw, ''), ',') s
             WHERE p.item_type = 1
               AND p.is_available = 1
+              AND p.is_deleted   = 0
               AND TRIM(s.value) <> ''
         ),
         linked_contracts AS (
@@ -180,6 +183,7 @@ BEGIN
             FROM product_contracts pc
             JOIN silver.nexudus_contracts c
                 ON CAST(c.source_id AS NVARCHAR(20)) = pc.contract_id_str
+               AND c.is_deleted = 0
         ),
         active_per_product AS (
             -- The current occupancy: summarise active contract(s) per product.
@@ -408,6 +412,7 @@ BEGIN
                                            AND cf.rev_rn = 1
             WHERE p.item_type = 1
               AND p.is_available = 1
+              AND p.is_deleted   = 0
         )
         INSERT INTO ava.product_availability (
             location_source_id, location_name, city, country_name,
@@ -473,6 +478,7 @@ BEGIN
             FROM silver.nexudus_extra_services
             WHERE resource_type_names IS NOT NULL
               AND LOWER(resource_type_names) NOT LIKE 'hot desk%'
+              AND is_deleted = 0
             GROUP BY location_source_id, resource_type_names
         )
         INSERT INTO ava.product_availability (
@@ -538,6 +544,7 @@ BEGIN
                 MIN(name)          AS item_name    -- name of the cheapest pass for display
             FROM silver.nexudus_extra_services
             WHERE LOWER(resource_type_names) LIKE 'hot desk%'
+              AND is_deleted = 0
             GROUP BY location_source_id
         )
         INSERT INTO ava.product_availability (
