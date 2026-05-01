@@ -912,6 +912,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-04-30 (Location Scraper updates: (1) Otodom contact-enrichment hardening + diagnostics remains in place; (2) added new Germany source `immobilienscout` (Apify actor id `ciTdHfgOkkwfEzTE9`) with city routing for Berlin, Munich, Hamburg, Cologne, Frankfurt, Dusseldorf, and Stuttgart; (3) resolver now builds ImmoScout24 office-rental URLs in the `/Suche/de/.../buero-mieten?netfloorspace=1500` format; (4) added `ImmobilienscoutAdapter` and tests, including a hard in-code guard to skip listings under 1500 sqm; (5) fixed orchestrator edge case where an empty enrichment fan-out (`task_all([])`) could produce a `NoneType is not iterable` failure by coercing empty/new-agency results to `[]`)
+Last updated: 2026-05-01 (Location Scraper Immobilienscout fix + local simulation test: normalized Apify nested JSON payloads (slash paths traverse dicts/lists) in addition to flat CSV-style keys — previously nested API items could yield `area=None` at normalize time and dropped every row at the 1500 m² gate, explaining 0 listings + empty `source` in run stats; added `tests/test_location_scraper_berlin_simulation.py` to simulate a Berlin run end-to-end with mocked Apify/Lusha boundaries)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

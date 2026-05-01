@@ -70,3 +70,30 @@ def test_normalize_maps_flattened_csv_shape():
     assert listing.contact_name == "Frau Malina Trockel"
     assert listing.company_name == "Savills Immobilien Beratungs-GmbH - Office Agency"
     assert listing.phone == "+49 173 192 42 11"
+
+
+def test_normalize_maps_nested_apify_json_shape():
+    """Dataset from Apify API is nested; CSV export uses flat keys — adapter must support both."""
+    adapter = ImmobilienscoutAdapter()
+    raw = {
+        "header": {"id": "167325674", "publicationState": "active"},
+        "basicInfo": {"id": "167325674"},
+        "normalized": {
+            "listingId": "167325674",
+            "url": "https://www.immobilienscout24.de/expose/167325674",
+            "address": {"city": "München", "latitude": "48.13", "longitude": "11.57", "zip": "80331", "street": "Marienplatz", "houseNumber": "1"},
+            "area": {"livingSpace": "1800"},
+            "price": {"currency": "EUR", "amount": "54000"},
+            "contact": {
+                "name": "Jane Doe",
+                "company": "Munich Office GmbH",
+                "phone": "+49 89 123456",
+            },
+        },
+        "adTargetingParameters": {"obj_rentPerSqM": "30"},
+    }
+    listing = adapter.normalize(raw, "munich")
+    assert listing is not None
+    assert listing.external_id == "167325674"
+    assert listing.available_surface_m2 == 1800.0
+    assert listing.city == "münchen"

@@ -8,16 +8,39 @@ Input source:
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from shared.location_scraper.config import IMMOBILIENSCOUT_ACTOR_ID
 from shared.location_scraper.models import Listing
 
 
+def _dig(obj: Any, path: str):
+    """Traverse slash paths; numeric segments step into lists (Apify nested JSON vs flat CSV export)."""
+    cur: Any = obj
+    for part in path.split("/"):
+        if cur is None:
+            return None
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.isdigit():
+            idx = int(part)
+            cur = cur[idx] if 0 <= idx < len(cur) else None
+        else:
+            return None
+    if cur in ("", None):
+        return None
+    return cur
+
+
 def _pick(obj: dict, *keys: str):
+    """Prefer literal flat keys (Apify CSV / flatten), else nested path traversal."""
     for key in keys:
-        if key in obj and obj[key] not in (None, ""):
+        if isinstance(obj, dict) and key in obj and obj[key] not in (None, ""):
             return obj[key]
+        if "/" in key:
+            val = _dig(obj, key)
+            if val not in (None, ""):
+                return val
     return None
 
 
