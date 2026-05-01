@@ -188,9 +188,12 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
                 "country_code": source_config["country_code"],
             },
         )
-        for agency in new_agencies
+        for agency in (new_agencies or [])
     ]
-    enriched_agencies: list[dict] = yield context.task_all(enrich_tasks)
+    if enrich_tasks:
+        enriched_agencies: list[dict] = (yield context.task_all(enrich_tasks)) or []
+    else:
+        enriched_agencies = []
     enrichment_diag = _summarize_enrichment_diagnostics(enriched_agencies)
     logger.info(
         "Location scraper enrichment summary run_id=%s city=%s %s",
