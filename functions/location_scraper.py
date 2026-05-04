@@ -8,6 +8,7 @@ Functions registered here:
   - ls_start_apify_run      (activity)
   - ls_check_apify_run      (activity)
   - ls_fetch_dataset        (activity)
+  - ls_persist_raw          (activity — full Apify JSON per row)
   - ls_normalize            (activity)
   - ls_dedupe_agencies      (activity)
   - ls_filter_new_agencies  (activity)
@@ -33,8 +34,10 @@ import azure.functions as func
 from shared.location_scraper.activities import enrich as enrich_act
 from shared.location_scraper.activities import log_run as log_act
 from shared.location_scraper.activities import persist as persist_act
+from shared.location_scraper.activities import raw_payload as raw_act
 from shared.location_scraper.activities import resolve as resolve_act
 from shared.location_scraper.activities import scrape as scrape_act
+from shared.location_scraper.run_quality import compute_run_quality_payload
 
 logger = logging.getLogger(__name__)
 
@@ -137,85 +140,109 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
     city: str = payload["city"]
     shape = payload.get("shape")
     run_id: str = payload["run_id"]
-
-    # 1. Resolve city → SourceConfig
-    source_config: dict = yield context.call_activity(
-        "ls_resolve_source",
-        {"city": city, "shape": shape, "run_id": run_id},
-    )
-
-    # 2. Start Apify actor (async — do NOT block on completion)
-    run_info: dict = yield context.call_activity("ls_start_apify_run", source_config)
-
-    # 3. Poll until Apify run finishes (exponential-ish backoff, max 45 min)
-    poll_delays = [30, 60, 90, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120]
-    for delay_seconds in poll_delays:
-        status: dict = yield context.call_activity("ls_check_apify_run", run_info)
-        if status["finished"]:
-            break
-        deadline = context.current_utc_datetime + timedelta(seconds=delay_seconds)
-        yield context.create_timer(deadline)
-    else:
-        raise RuntimeError(f"Apify run did not finish within timeout. run_id={run_info.get('run_id')}")
-
-    if not status.get("succeeded"):
-        raise RuntimeError(
-            f"Apify run failed with status={status.get('status')} run_id={run_info.get('run_id')}"
+    try:
+        # 1. Resolve city → SourceConfig
+        source_config: dict = yield context.call_activity(
+            "ls_resolve_source",
+            {"city": city, "shape": shape, "run_id": run_id},
         )
 
-    # 4. Download dataset
-    raw_items: list[dict] = yield context.call_activity("ls_fetch_dataset", run_info)
+        # 2. Start Apify actor (async — do NOT block on completion)
+        run_info: dict = yield context.call_activity("ls_start_apify_run", source_config)
 
-    # 5. Normalize via source adapter
-    listings: list[dict] = yield context.call_activity(
-        "ls_normalize",
-        {"actor": source_config["actor"], "items": raw_items, "city": source_config["city"]},
-    )
+        # 3. Poll until Apify run finishes (exponential-ish backoff, max 45 min)
+        poll_delays = [30, 60, 90, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120]
+        for delay_seconds in poll_delays:
+            status: dict = yield context.call_activity("ls_check_apify_run", run_info)
+            if status["finished"]:
+                break
+            deadline = context.current_utc_datetime + timedelta(seconds=delay_seconds)
+            yield context.create_timer(deadline)
+        else:
+            raise RuntimeError(f"Apify run did not finish within timeout. run_id={run_info.get('run_id')}")
 
-    # 6. Dedupe agencies
-    agencies: list[dict] = yield context.call_activity("ls_dedupe_agencies", listings)
+        if not status.get("succeeded"):
+            raise RuntimeError(
+                f"Apify run failed with status={status.get('status')} run_id={run_info.get('run_id')}"
+            )
 
-    # 7. Filter out agencies already enriched in SQL
-    new_agencies: list[dict] = yield context.call_activity("ls_filter_new_agencies", agencies)
+        # 4. Download dataset
+        raw_items: list[dict] = yield context.call_activity("ls_fetch_dataset", run_info)
 
-    # 8. Fan-out: enrich each agency in parallel
-    enrich_tasks = [
-        context.call_activity(
-            "ls_enrich_agency",
+        # 4b. Persist full raw payloads (bronze.location_scraper_raw)
+        yield context.call_activity(
+            "ls_persist_raw",
             {
-                "agency": agency,
-                "country": source_config["country"],
-                "country_code": source_config["country_code"],
+                "run_id": run_id,
+                "source": source_config["actor"],
+                "city": source_config["city"],
+                "items": raw_items,
             },
         )
-        for agency in (new_agencies or [])
-    ]
-    if enrich_tasks:
-        enriched_agencies: list[dict] = (yield context.task_all(enrich_tasks)) or []
-    else:
-        enriched_agencies = []
-    enrichment_diag = _summarize_enrichment_diagnostics(enriched_agencies)
-    logger.info(
-        "Location scraper enrichment summary run_id=%s city=%s %s",
-        run_id,
-        source_config["city"],
-        json.dumps(enrichment_diag, sort_keys=True),
-    )
 
-    # 9. Consolidate contacts (dedup + top-3 per agency)
-    bundles: list[dict] = yield context.call_activity("ls_consolidate_contacts", enriched_agencies)
+        # 5. Normalize via source adapter
+        listings: list[dict] = yield context.call_activity(
+            "ls_normalize",
+            {"actor": source_config["actor"], "items": raw_items, "city": source_config["city"]},
+        )
 
-    # 10. Upsert buildings, listings, contacts to SQL
-    stats: dict = yield context.call_activity(
-        "ls_upsert_sql",
-        {"listings": listings, "bundles": bundles, "run_id": run_id, "city": source_config["city"]},
-    )
-    stats["enrichment_diagnostics"] = enrichment_diag
+        # 6. Dedupe agencies
+        agencies: list[dict] = yield context.call_activity("ls_dedupe_agencies", listings)
 
-    # 11. Write completion log
-    yield context.call_activity("ls_write_logs", stats)
+        # 7. Filter out agencies already enriched in SQL
+        new_agencies: list[dict] = yield context.call_activity("ls_filter_new_agencies", agencies)
 
-    return stats
+        # 8. Fan-out: enrich each agency in parallel
+        enrich_tasks = [
+            context.call_activity(
+                "ls_enrich_agency",
+                {
+                    "agency": agency,
+                    "country": source_config["country"],
+                    "country_code": source_config["country_code"],
+                },
+            )
+            for agency in (new_agencies or [])
+        ]
+        if enrich_tasks:
+            enriched_agencies: list[dict] = (yield context.task_all(enrich_tasks)) or []
+        else:
+            enriched_agencies = []
+        enrichment_diag = _summarize_enrichment_diagnostics(enriched_agencies)
+        logger.info(
+            "Location scraper enrichment summary run_id=%s city=%s %s",
+            run_id,
+            source_config["city"],
+            json.dumps(enrichment_diag, sort_keys=True),
+        )
+
+        # 9. Consolidate contacts (dedup + top-3 per agency)
+        bundles: list[dict] = yield context.call_activity("ls_consolidate_contacts", enriched_agencies)
+
+        # 10. Upsert buildings, listings, contacts to SQL
+        stats: dict = yield context.call_activity(
+            "ls_upsert_sql",
+            {"listings": listings, "bundles": bundles, "run_id": run_id, "city": source_config["city"]},
+        )
+        stats["enrichment_diagnostics"] = enrichment_diag
+        stats.update(
+            compute_run_quality_payload(
+                raw_item_count=len(raw_items or []),
+                listings=listings,
+                bundles=bundles,
+                enrichment_diag=enrichment_diag,
+            )
+        )
+
+        # 11. Write completion log
+        yield context.call_activity("ls_write_logs", stats)
+        return stats
+    except Exception as exc:
+        yield context.call_activity(
+            "ls_mark_run_failed",
+            {"run_id": run_id, "error": str(exc)},
+        )
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +272,11 @@ def ls_check_apify_run(run_info: dict) -> dict:
 @bp.activity_trigger(input_name="run_info")
 def ls_fetch_dataset(run_info: dict) -> list:
     return scrape_act.fetch_dataset(run_info)
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_persist_raw(payload: dict) -> dict:
+    return raw_act.persist_raw_items(payload)
 
 
 @bp.activity_trigger(input_name="payload")
@@ -280,3 +312,11 @@ def ls_upsert_sql(payload: dict) -> dict:
 @bp.activity_trigger(input_name="stats")
 def ls_write_logs(stats: dict) -> None:
     log_act.write_logs(stats)
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_mark_run_failed(payload: dict) -> None:
+    run_id = payload.get("run_id")
+    if not run_id:
+        return
+    log_act.mark_run_failed(run_id, payload.get("error", "unknown error"))

@@ -29,6 +29,7 @@ sequenceDiagram
         O->>A: check run status
     end
     O->>A: fetch dataset items
+    O->>S: INSERT raw rows (full JSON per item, bronze.location_scraper_raw)
     O->>O: normalize via source adapter
     O->>O: dedupe agencies
     O->>S: query existing lusha contacts
@@ -50,6 +51,7 @@ sequenceDiagram
 | 2 | `ls_start_apify_run` | Fires Apify actor (async, no wait) |
 | 3 | `ls_check_apify_run` | Polls status with timer loop (max ~40 min) |
 | 4 | `ls_fetch_dataset` | Downloads all dataset items |
+| 4b | `ls_persist_raw` | Writes each Apify row to `bronze.location_scraper_raw` (`payload_json`) |
 | 5 | `ls_normalize` | Dispatches to source adapter |
 | 6 | `ls_dedupe_agencies` | Extracts unique agency names |
 | 7 | `ls_filter_new_agencies` | Removes agencies already in SQL with Lusha |
@@ -219,6 +221,19 @@ CREATE TABLE bronze.n8n_location_scraper_logs (
     updated_at        DATETIME2     DEFAULT GETUTCDATE()
 );
 ```
+
+Also run `scripts/sql_scripts/location_scraper_raw_and_quality.sql` to create:
+
+- `bronze.location_scraper_raw` — one row per Apify dataset item (`payload_json` = full JSON).
+- `bronze.location_scraper_run_quality` — one row per completed run (counts for monitoring contact/extract quality).
+
+For raw JSON field discovery (before building/changing a globe view), run:
+
+- `scripts/sql_scripts/location_scraper_raw_schema_discovery.sql`
+- it returns:
+  - recent run quality snapshots
+  - discovered JSON paths with observed types + row coverage
+  - candidate globe-field fill rates per JSON path
 
 ---
 

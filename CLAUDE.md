@@ -912,6 +912,6 @@ After any material project change:
 
 ---
 
-Last updated: 2026-05-01 (Location Scraper Immobilienscout fix + local simulation test: normalized Apify nested JSON payloads (slash paths traverse dicts/lists) in addition to flat CSV-style keys — previously nested API items could yield `area=None` at normalize time and dropped every row at the 1500 m² gate, explaining 0 listings + empty `source` in run stats; added `tests/test_location_scraper_berlin_simulation.py` to simulate a Berlin run end-to-end with mocked Apify/Lusha boundaries)
+Last updated: 2026-05-04 (Location Scraper: added JSON schema discovery script `scripts/sql_scripts/location_scraper_raw_schema_discovery.sql` to profile `payload_json` paths/types/coverage for future globe view mapping; docs updated accordingly. Orchestrator now marks failed runs via new `ls_mark_run_failed` activity calling `mark_run_failed`, preventing stale `running` status on errors.)
 Current branch: `main`
 Maintainer: InfinitSpace Data Engineering Team

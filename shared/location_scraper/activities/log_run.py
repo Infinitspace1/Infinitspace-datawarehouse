@@ -45,6 +45,18 @@ def init_run_log(run_id: str, city: str) -> None:
     )
 
 
+_DELETE_RUN_QUALITY = "DELETE FROM bronze.location_scraper_run_quality WHERE run_id = ?"
+
+_INSERT_RUN_QUALITY = """
+INSERT INTO bronze.location_scraper_run_quality (
+    run_id, source, city,
+    raw_item_count, normalized_count, with_coords_count, with_phone_count, with_name_or_company_count,
+    lusha_email_slots, buildings_found, buildings_new, buildings_updated,
+    agencies_total, agencies_with_contacts, enrichment_diagnostics_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
 def write_logs(stats: dict) -> None:
     """
     Mark the run as completed and persist stats to SQL.
@@ -75,6 +87,35 @@ def write_logs(stats: dict) -> None:
         run_id, stats.get("city"), source,
         buildings_found, buildings_new, buildings_updated,
     )
+
+    if "raw_item_count" in stats:
+        try:
+            sql.execute_non_query(_DELETE_RUN_QUALITY, (run_id,))
+            sql.execute_non_query(
+                _INSERT_RUN_QUALITY,
+                (
+                    run_id,
+                    source,
+                    stats.get("city", ""),
+                    int(stats.get("raw_item_count", 0)),
+                    int(stats.get("normalized_count", 0)),
+                    int(stats.get("with_coords_count", 0)),
+                    int(stats.get("with_phone_count", 0)),
+                    int(stats.get("with_name_or_company_count", 0)),
+                    int(stats.get("lusha_email_slots", 0)),
+                    int(buildings_found),
+                    int(buildings_new),
+                    int(buildings_updated),
+                    int(stats.get("agencies_total", 0)),
+                    int(stats.get("agencies_with_contacts", 0)),
+                    stats.get("enrichment_diagnostics_json") or "",
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Could not write bronze.location_scraper_run_quality (table missing?). run_id=%s",
+                run_id,
+            )
 
     _emit_app_insights(stats)
 
