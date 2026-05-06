@@ -34,83 +34,119 @@ ORDER BY q.finished_at DESC;
 
 -- 2) JSON path profile
 --    Shows every observed path, type consistency, coverage, and sample scalar value.
-WITH sample_rows AS (
-    SELECT TOP (@sample_rows)
-        r.id,
-        r.run_id,
-        r.source,
-        r.city,
-        r.payload_json
-    FROM bronze.location_scraper_raw AS r
-    WHERE (@source IS NULL OR r.source = @source)
-      AND (@city IS NULL OR r.city = @city)
-      AND (@run_id IS NULL OR r.run_id = @run_id)
-    ORDER BY r.inserted_at DESC, r.item_index DESC
-),
-seed AS (
-    SELECT
-        s.id,
-        CAST('$' AS NVARCHAR(4000)) AS json_path,
-        CAST(s.payload_json AS NVARCHAR(MAX)) AS json_value,
-        CAST(5 AS INT) AS json_type,
-        CAST(0 AS INT) AS depth
-    FROM sample_rows AS s
-),
-json_nodes AS (
-    SELECT
-        se.id,
-        se.json_path,
-        se.json_value,
-        se.json_type,
-        se.depth
-    FROM seed AS se
+IF OBJECT_ID('tempdb..#sample_rows') IS NOT NULL DROP TABLE #sample_rows;
+IF OBJECT_ID('tempdb..#json_nodes') IS NOT NULL DROP TABLE #json_nodes;
 
-    UNION ALL
+CREATE TABLE #sample_rows (
+    id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+    payload_json NVARCHAR(MAX) NOT NULL
+);
 
+INSERT INTO #sample_rows (id, payload_json)
+SELECT TOP (@sample_rows)
+    r.id,
+    r.payload_json
+FROM bronze.location_scraper_raw AS r
+WHERE (@source IS NULL OR r.source = @source)
+  AND (@city IS NULL OR r.city = @city)
+  AND (@run_id IS NULL OR r.run_id = @run_id)
+ORDER BY r.inserted_at DESC, r.item_index DESC;
+
+CREATE TABLE #json_nodes (
+    id UNIQUEIDENTIFIER NOT NULL,
+    json_path NVARCHAR(4000) NOT NULL,
+    json_value NVARCHAR(MAX) NULL,
+    json_type INT NOT NULL,
+    depth INT NOT NULL,
+    processed BIT NOT NULL DEFAULT(0)
+);
+
+INSERT INTO #json_nodes (id, json_path, json_value, json_type, depth, processed)
+SELECT
+    s.id,
+    N'$',
+    s.payload_json,
+    5,
+    0,
+    0
+FROM #sample_rows AS s;
+
+WHILE 1 = 1
+BEGIN
+    INSERT INTO #json_nodes (id, json_path, json_value, json_type, depth, processed)
     SELECT
         n.id,
-        CAST(
+        LEFT(
             CASE
-                WHEN n.json_type = 4 THEN CONCAT(n.json_path, '[', j.[key], ']')
-                ELSE CONCAT(n.json_path, '.', j.[key])
-            END
-            AS NVARCHAR(4000)
+                WHEN n.json_type = 4
+                    THEN n.json_path + N'[' + CAST(j.[key] AS NVARCHAR(100)) + N']'
+                ELSE
+                    n.json_path + N'.' + CAST(j.[key] AS NVARCHAR(4000))
+            END,
+            4000
         ) AS json_path,
         CAST(j.[value] AS NVARCHAR(MAX)) AS json_value,
-        j.[type] AS json_type,
-        n.depth + 1 AS depth
-    FROM json_nodes AS n
+        CAST(j.[type] AS INT) AS json_type,
+        n.depth + 1 AS depth,
+        0
+    FROM #json_nodes AS n
     CROSS APPLY OPENJSON(n.json_value) AS j
-    WHERE n.json_type IN (4, 5)    -- array or object
-      AND n.depth < @max_depth
+    WHERE n.processed = 0
+      AND n.json_type IN (4, 5)
+      AND n.depth < @max_depth;
+
+    IF @@ROWCOUNT = 0 BREAK;
+
+    UPDATE n
+    SET n.processed = 1
+    FROM #json_nodes AS n
+    WHERE n.processed = 0
+      AND n.json_type IN (4, 5)
+      AND n.depth < @max_depth;
+END;
+
+;WITH path_stats AS (
+    SELECT
+        n.json_path,
+        COUNT(*) AS path_occurrences,
+        COUNT(DISTINCT n.id) AS distinct_rows_with_path,
+        CAST(
+            100.0 * COUNT(DISTINCT n.id)
+            / NULLIF((SELECT COUNT(*) FROM #sample_rows), 0)
+            AS DECIMAL(5,2)
+        ) AS row_coverage_pct,
+        MAX(CASE WHEN n.json_type NOT IN (4, 5) THEN LEFT(n.json_value, 200) END) AS sample_scalar_value
+    FROM #json_nodes AS n
+    WHERE n.depth > 0
+    GROUP BY n.json_path
 )
 SELECT
-    n.json_path,
-    STRING_AGG(
-        DISTINCT CASE n.json_type
-            WHEN 0 THEN 'null'
-            WHEN 1 THEN 'string'
-            WHEN 2 THEN 'number'
-            WHEN 3 THEN 'boolean'
-            WHEN 4 THEN 'array'
-            WHEN 5 THEN 'object'
-            ELSE CONCAT('type_', n.json_type)
-        END,
-        ', '
-    ) AS observed_types,
-    COUNT(*) AS path_occurrences,
-    COUNT(DISTINCT n.id) AS distinct_rows_with_path,
-    CAST(
-        100.0 * COUNT(DISTINCT n.id)
-        / NULLIF((SELECT COUNT(*) FROM sample_rows), 0)
-        AS DECIMAL(5,2)
-    ) AS row_coverage_pct,
-    MAX(CASE WHEN n.json_type NOT IN (4, 5) THEN LEFT(n.json_value, 200) END) AS sample_scalar_value
-FROM json_nodes AS n
-WHERE n.depth > 0
-GROUP BY n.json_path
-ORDER BY distinct_rows_with_path DESC, n.json_path
-OPTION (MAXRECURSION 32767);
+    ps.json_path,
+    STUFF((
+        SELECT DISTINCT
+            N', ' + CASE n2.json_type
+                WHEN 0 THEN N'null'
+                WHEN 1 THEN N'string'
+                WHEN 2 THEN N'number'
+                WHEN 3 THEN N'boolean'
+                WHEN 4 THEN N'array'
+                WHEN 5 THEN N'object'
+                ELSE N'type_' + CAST(n2.json_type AS NVARCHAR(20))
+            END
+        FROM #json_nodes AS n2
+        WHERE n2.json_path = ps.json_path
+          AND n2.depth > 0
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, N'') AS observed_types,
+    ps.path_occurrences,
+    ps.distinct_rows_with_path,
+    ps.row_coverage_pct,
+    ps.sample_scalar_value
+FROM path_stats AS ps
+ORDER BY ps.distinct_rows_with_path DESC, ps.json_path;
+
+DROP TABLE #json_nodes;
+DROP TABLE #sample_rows;
 
 -- 3) Candidate globe-field coverage (quick health check)
 --    These paths come from current adapters and typical Apify outputs.

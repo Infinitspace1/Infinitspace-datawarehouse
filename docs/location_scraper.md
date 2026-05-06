@@ -243,6 +243,7 @@ For raw JSON field discovery (before building/changing a globe view), run:
 |----------|----------|-------------|
 | `APIFY_TOKEN` | Yes | Apify API token |
 | `LUSHA_API_KEY` | Yes | Lusha API key (sent as `api_key` header) |
+| `LOCATION_SCRAPER_MAX_ITEMS` | No | Common max items cap applied to all scraper actors (`idealista`, `otodom`, `immobilienscout`). If unset, actor defaults are used (100 / 200 / 100). |
 | `AZURE_SQL_CONNECTION_STRING` | Yes | Full ODBC connection string (or use SERVER+DATABASE+UID+PWD) |
 | `AzureWebJobsStorage` | Yes | Storage account connection string (Durable Functions state) |
 | `ENABLE_LOCATION_SCRAPER_FUNCTIONS` | Yes | Set to `1` to register functions |

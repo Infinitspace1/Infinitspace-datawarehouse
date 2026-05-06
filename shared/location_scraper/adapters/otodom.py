@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from shared.location_scraper.config import OTODOM_ACTOR_ID
+from shared.location_scraper.config import OTODOM_ACTOR_ID, get_actor_max_items
 from shared.location_scraper.models import Listing
 
 
@@ -39,7 +39,7 @@ class OtodomAdapter:
     def build_input(self, start_url: str) -> dict:
         return {
             "startUrls": [{"url": start_url}],
-            "maxItems": 200,
+            "maxItems": get_actor_max_items(default=200),
             "extractDetails": True,
             "proxyConfiguration": {
                 "useApifyProxy": True,

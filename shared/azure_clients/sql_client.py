@@ -103,16 +103,21 @@ class SQLClient:
         Retrying after a short wait is the correct fix.
         """
         conn = None
+        transient_sqlstates = {
+            "HYT00",  # login timeout (serverless resume / transient auth delay)
+            "08001",  # client unable to establish connection
+            "08S01",  # communication link failure
+        }
         for attempt in range(1, retries + 1):
             try:
                 conn = self._open_connection()
                 break
             except pyodbc.OperationalError as e:
                 sqlstate = e.args[0] if e.args else ""
-                if sqlstate == "HYT00" and attempt < retries:
+                if sqlstate in transient_sqlstates and attempt < retries:
                     logger.warning(
-                        f"SQL login timeout on attempt {attempt}/{retries} "
-                        f"(DB may be resuming from auto-pause). "
+                        f"SQL connection transient failure (sqlstate={sqlstate}) "
+                        f"on attempt {attempt}/{retries}. "
                         f"Retrying in {retry_delay}s..."
                     )
                     time.sleep(retry_delay)

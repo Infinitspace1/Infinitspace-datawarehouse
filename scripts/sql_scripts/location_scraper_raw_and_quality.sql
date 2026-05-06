@@ -46,3 +46,48 @@ BEGIN
         ON bronze.location_scraper_run_quality (city, source);
 END
 GO
+
+IF OBJECT_ID(N'bronze.location_scraper_lusha_diagnostics', N'U') IS NULL
+BEGIN
+    CREATE TABLE bronze.location_scraper_lusha_diagnostics (
+        id                          UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
+        run_id                      NVARCHAR(100)    NOT NULL,
+        source                      NVARCHAR(50)     NOT NULL,
+        city                        NVARCHAR(100)    NOT NULL,
+        agency_name                 NVARCHAR(255)    NULL,
+        first_name                  NVARCHAR(255)    NULL,
+        last_name                   NVARCHAR(255)    NULL,
+        path                        NVARCHAR(100)    NULL,
+        allow_company_fallback      BIT              NULL,
+        has_contact                 BIT              NOT NULL DEFAULT 0,
+        reason                      NVARCHAR(255)    NULL,
+        individual_email_source     NVARCHAR(100)    NULL,
+        company_name_cleaned        NVARCHAR(255)    NULL,
+        lusha_search_mode           NVARCHAR(100)    NULL,
+        domain_used                 NVARCHAR(255)    NULL,
+        domains_found               INT              NOT NULL DEFAULT 0,
+        google_domains_json         NVARCHAR(MAX)    NULL,
+        raw_contacts_found          INT              NOT NULL DEFAULT 0,
+        final_contacts_found        INT              NOT NULL DEFAULT 0,
+        created_at                  DATETIME2        NOT NULL DEFAULT GETUTCDATE()
+    );
+
+    CREATE INDEX IX_location_scraper_lusha_diag_run
+        ON bronze.location_scraper_lusha_diagnostics (run_id, source, city);
+
+    CREATE INDEX IX_location_scraper_lusha_diag_reason
+        ON bronze.location_scraper_lusha_diagnostics (source, city, reason)
+        INCLUDE (run_id, agency_name, path, raw_contacts_found, final_contacts_found);
+END
+GO
+
+IF OBJECT_ID(N'bronze.location_scraper_lusha_diagnostics', N'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH(N'bronze.location_scraper_lusha_diagnostics', N'company_name_cleaned') IS NULL
+        ALTER TABLE bronze.location_scraper_lusha_diagnostics ADD company_name_cleaned NVARCHAR(255) NULL;
+    IF COL_LENGTH(N'bronze.location_scraper_lusha_diagnostics', N'lusha_search_mode') IS NULL
+        ALTER TABLE bronze.location_scraper_lusha_diagnostics ADD lusha_search_mode NVARCHAR(100) NULL;
+    IF COL_LENGTH(N'bronze.location_scraper_lusha_diagnostics', N'domain_used') IS NULL
+        ALTER TABLE bronze.location_scraper_lusha_diagnostics ADD domain_used NVARCHAR(255) NULL;
+END
+GO

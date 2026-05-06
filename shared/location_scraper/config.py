@@ -7,6 +7,8 @@ Adding a new country/source: add a new top-level key and implement a matching ad
 """
 from __future__ import annotations
 
+import os
+
 # Apify actor IDs
 IDEALISTA_ACTOR_ID = "OTe82JNUGa93aVcRc"
 OTODOM_ACTOR_ID = "ir34sMIv8mrbL0ojO"
@@ -89,6 +91,21 @@ LUSHA_JOB_TITLES: list[str] = [
     "Commercial Real Estate Director",
     "Office Leasing Director",
     "Head of Offices",
+    "Real Estate Agent",
+    "Real Estate Advisor",
+    "Real Estate Consultant",
+    "Property Consultant",
+    "Commercial Real Estate Agent",
+    "Commercial Real Estate Broker",
+    "Commercial Real Estate Advisor",
+    "Office Consultant",
+    "Office Broker",
+    "Broker",
+    "Agent nieruchomości",
+    "Doradca ds. nieruchomości",
+    "Doradca nieruchomości",
+    "Pośrednik nieruchomości",
+    "Konsultant nieruchomości",
 ]
 
 # Polish tokens that indicate a name is a company, not a person
@@ -96,9 +113,43 @@ POLISH_COMPANY_KEYWORDS: tuple[str, ...] = (
     "biuro",
     "kancelaria",
     "group",
+    "property",
+    "agency",
+    "estate",
     "sp.",
     "sa",
     "s.a.",
     "spółka",
     "nieruchomości",
 )
+
+OTODOM_MAX_INDIVIDUAL_CANDIDATES_PER_AGENCY = 5
+LUSHA_MAX_REVEALS_PER_AGENCY = 5
+
+
+def get_actor_max_items(*, default: int) -> int:
+    """
+    Resolve common max-items cap for all scraper actors.
+
+    Env override:
+      LOCATION_SCRAPER_MAX_ITEMS=<int>
+    """
+    raw = (os.environ.get("LOCATION_SCRAPER_MAX_ITEMS") or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def get_country_code_for_city(city: str | None) -> str | None:
+    """Return the configured ISO country code for a supported scraper city."""
+    city_lower = (city or "").lower().strip()
+    if not city_lower:
+        return None
+    for cfg in COUNTRY_CONFIG.values():
+        if city_lower in cfg["cities"]:
+            return str(cfg["country_code"]).upper()
+    return None

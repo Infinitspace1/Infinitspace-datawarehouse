@@ -111,6 +111,7 @@ class Agency:
     first_name: str = ""
     last_name: str = ""
     source: str = ""
+    allow_company_fallback: bool = True
     contacts: list[Contact] = field(default_factory=list)
 
     def is_individual(self) -> bool:
@@ -122,6 +123,7 @@ class Agency:
             "first_name": self.first_name,
             "last_name": self.last_name,
             "source": self.source,
+            "allow_company_fallback": self.allow_company_fallback,
             "contacts": [
                 c if isinstance(c, dict) else c.to_dict() for c in self.contacts
             ],
@@ -135,6 +137,7 @@ class Agency:
             first_name=d.get("first_name", ""),
             last_name=d.get("last_name", ""),
             source=d.get("source", ""),
+            allow_company_fallback=d.get("allow_company_fallback", True),
             contacts=contacts,
         )
 

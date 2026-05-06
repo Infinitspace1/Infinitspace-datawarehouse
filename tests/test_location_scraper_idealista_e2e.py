@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from shared.location_scraper.activities.enrich import (
+    _clean_company_name_for_lusha,
     consolidate_contacts,
     dedupe_agencies,
     enrich_agency,
@@ -164,7 +165,7 @@ def test_dedupe_agencies_idealista():
 
 
 def test_dedupe_agencies_otodom_individual():
-    """Otodom items with a distinct individual contact_name should have first/last extracted."""
+    """Otodom uses company-first enrichment even when a broker name is present."""
     otodom_listing = {
         "source": "otodom",
         "city": "warsaw",
@@ -199,8 +200,139 @@ def test_dedupe_agencies_otodom_individual():
     agencies = dedupe_agencies([otodom_listing])
     assert len(agencies) == 1
     assert agencies[0]["company_name"] == "Biuro Nieruchomości ABC"
-    assert agencies[0]["first_name"] == "Jan"
-    assert agencies[0]["last_name"] == "Kowalski"
+    assert agencies[0]["first_name"] == ""
+    assert agencies[0]["last_name"] == ""
+
+
+def test_dedupe_agencies_otodom_skips_private_sellers():
+    """Private Otodom sellers are low-value for B2B Lusha enrichment."""
+    otodom_listing = {
+        "source": "otodom",
+        "city": "warsaw",
+        "contact_name": "Marek",
+        "company_name": "Marek Property",
+        "external_id": "1",
+        "web_link": None,
+        "link_to_gmap": None,
+        "latitude": None,
+        "longitude": None,
+        "district": None,
+        "postal_code": None,
+        "address": None,
+        "available_surface_m2": None,
+        "floor": None,
+        "status": None,
+        "is_exterior": None,
+        "has_lift": None,
+        "has_air_conditioning": None,
+        "price_monthly": None,
+        "price_per_m2": None,
+        "currency": None,
+        "energy_class": None,
+        "first_listed_date": None,
+        "last_updated_date": None,
+        "days_on_market": None,
+        "phone": None,
+        "contact_type": "private",
+        "email": "",
+        "agency_comment": None,
+    }
+    assert dedupe_agencies([otodom_listing]) == []
+
+
+def test_dedupe_agencies_otodom_prefers_later_individual_contact():
+    """Otodom dedupes to one company candidate regardless of listing broker names."""
+    base = {
+        "source": "otodom",
+        "city": "warsaw",
+        "company_name": "MAXON Nieruchomości",
+        "external_id": "1",
+        "web_link": None,
+        "link_to_gmap": None,
+        "latitude": None,
+        "longitude": None,
+        "district": None,
+        "postal_code": None,
+        "address": None,
+        "available_surface_m2": None,
+        "floor": None,
+        "status": None,
+        "is_exterior": None,
+        "has_lift": None,
+        "has_air_conditioning": None,
+        "price_monthly": None,
+        "price_per_m2": None,
+        "currency": None,
+        "energy_class": None,
+        "first_listed_date": None,
+        "last_updated_date": None,
+        "days_on_market": None,
+        "phone": None,
+        "contact_type": None,
+        "email": "",
+        "agency_comment": None,
+    }
+    company_only = {**base, "contact_name": "MAXON Nieruchomości"}
+    with_person = {**base, "external_id": "2", "contact_name": "Ewa Hołopiak"}
+
+    agencies = dedupe_agencies([company_only, with_person])
+
+    assert len(agencies) == 1
+    assert agencies[0]["company_name"] == "MAXON Nieruchomości"
+    assert agencies[0]["first_name"] == ""
+    assert agencies[0]["last_name"] == ""
+
+
+def test_dedupe_agencies_otodom_keeps_multiple_individual_candidates_per_company():
+    """Multiple broker names for one Otodom agency still produce one company candidate."""
+    base = {
+        "source": "otodom",
+        "city": "warsaw",
+        "company_name": "MAXON Nieruchomości",
+        "external_id": "1",
+        "web_link": None,
+        "link_to_gmap": None,
+        "latitude": None,
+        "longitude": None,
+        "district": None,
+        "postal_code": None,
+        "address": None,
+        "available_surface_m2": None,
+        "floor": None,
+        "status": None,
+        "is_exterior": None,
+        "has_lift": None,
+        "has_air_conditioning": None,
+        "price_monthly": None,
+        "price_per_m2": None,
+        "currency": None,
+        "energy_class": None,
+        "first_listed_date": None,
+        "last_updated_date": None,
+        "days_on_market": None,
+        "phone": None,
+        "contact_type": None,
+        "email": "",
+        "agency_comment": None,
+    }
+    agencies = dedupe_agencies(
+        [
+            {**base, "external_id": "1", "contact_name": "Ewa Hołopiak"},
+            {**base, "external_id": "2", "contact_name": "Marcin Nowak"},
+            {**base, "external_id": "3", "contact_name": "MAXON Nieruchomości"},
+        ]
+    )
+
+    assert len(agencies) == 1
+    assert agencies[0]["first_name"] == ""
+    assert agencies[0]["last_name"] == ""
+    assert {a["company_name"] for a in agencies} == {"MAXON Nieruchomości"}
+
+
+def test_clean_company_name_for_lusha_removes_polish_legal_suffixes():
+    assert _clean_company_name_for_lusha("CBRE Sp.z o.o.") == "CBRE"
+    assert _clean_company_name_for_lusha("Vertigo Property Group sp. j.") == "Vertigo"
+    assert _clean_company_name_for_lusha("Polski Holding Nieruchomości S.A.") == "Polski Holding"
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +466,93 @@ def test_enrich_agency_company_path():
         assert top["email"] == "ana.garcia@savills.es"
         assert top["full_name"] == "Ana García"
         assert top["job_title"] == "Leasing Director"
+
+
+def test_enrich_agency_company_path_falls_back_to_global_lusha_search():
+    calls = []
+
+    def fake_search(domain, country=None, job_titles=None, company_name=None, limit=5):
+        calls.append((domain, country, bool(job_titles), company_name, limit))
+        if country is None and job_titles:
+            return FAKE_LUSHA_CONTACTS
+        return []
+
+    with (
+        patch(
+            "shared.location_scraper.activities.enrich.apify_client.run_sync",
+            return_value=FAKE_GOOGLE_RESULT,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.search_contacts_by_domain",
+            side_effect=fake_search,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.enrich_contact",
+            return_value=FAKE_LUSHA_ENRICHED,
+        ),
+    ):
+        agency_dict = {
+            "company_name": "CBRE Sp.z o.o.",
+            "first_name": "",
+            "last_name": "",
+            "source": "otodom",
+            "contacts": [],
+        }
+        result = enrich_agency(
+            {"agency": agency_dict, "country": "poland", "country_code": "pl"}
+        )
+
+    assert result["contacts"][0]["email"] == "ana.garcia@savills.es"
+    assert result["_diagnostics"]["lusha_search_mode"] == "company_job_titles_global"
+    assert calls[:2] == [
+        ("savills.es", "poland", True, "CBRE", 5),
+        ("savills.es", None, True, "CBRE", 5),
+    ]
+
+
+def test_enrich_agency_company_path_skips_blocked_domains():
+    google_result = [
+        {
+            "organicResults": [
+                {"url": "https://www.facebook.com/example"},
+                {"url": "https://www.linkedin.com/company/example"},
+                {"url": "https://example-realestate.pl"},
+            ],
+        }
+    ]
+    calls = []
+
+    def fake_search(domain, country=None, job_titles=None, company_name=None, limit=5):
+        calls.append(domain)
+        return FAKE_LUSHA_CONTACTS
+
+    with (
+        patch(
+            "shared.location_scraper.activities.enrich.apify_client.run_sync",
+            return_value=google_result,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.search_contacts_by_domain",
+            side_effect=fake_search,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.enrich_contact",
+            return_value=FAKE_LUSHA_ENRICHED,
+        ),
+    ):
+        agency_dict = {
+            "company_name": "Example Real Estate",
+            "first_name": "",
+            "last_name": "",
+            "source": "otodom",
+            "contacts": [],
+        }
+        result = enrich_agency(
+            {"agency": agency_dict, "country": "poland", "country_code": "pl"}
+        )
+
+    assert calls[0] == "example-realestate.pl"
+    assert result["_diagnostics"]["domain_used"] == "example-realestate.pl"
 
 
 # ---------------------------------------------------------------------------

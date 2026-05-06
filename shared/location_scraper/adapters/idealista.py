@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from shared.location_scraper.config import IDEALISTA_ACTOR_ID
+from shared.location_scraper.config import IDEALISTA_ACTOR_ID, get_actor_max_items
 from shared.location_scraper.models import Listing
 
 
@@ -48,7 +48,7 @@ class IdealistaAdapter:
 
     def build_input(self, start_url: str) -> dict:
         return {
-            "maxItems": 100,
+            "maxItems": get_actor_max_items(default=100),
             "monitoringMode": False,
             "proxy": {
                 "useApifyProxy": True,

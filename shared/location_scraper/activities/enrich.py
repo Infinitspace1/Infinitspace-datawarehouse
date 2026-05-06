@@ -12,18 +12,29 @@ Ports these n8n nodes:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from shared.location_scraper.clients import apify as apify_client
 from shared.location_scraper.clients import lusha as lusha_client
 from shared.location_scraper.config import (
     GOOGLE_SEARCH_ACTOR_ID,
+    LUSHA_MAX_REVEALS_PER_AGENCY,
     LUSHA_JOB_TITLES,
     POLISH_COMPANY_KEYWORDS,
 )
 from shared.location_scraper.models import Agency, ContactBundle, Listing
 
 logger = logging.getLogger(__name__)
+
+_BLOCKED_DOMAIN_SUFFIXES = (
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "youtube.com",
+    "otodom.pl",
+    "realtor.com",
+)
 
 
 def _split_contact_name(raw_name: str) -> tuple[str, str]:
@@ -46,6 +57,63 @@ def _split_contact_name(raw_name: str) -> tuple[str, str]:
     return parts[0], " ".join(parts[1:])
 
 
+def _otodom_individual_name_parts(company_name: str, contact_name: str | None) -> tuple[str, str]:
+    contact = (contact_name or "").strip()
+    if not contact:
+        return "", ""
+    contact_lower = contact.lower()
+    is_company = any(kw in contact_lower for kw in POLISH_COMPANY_KEYWORDS)
+    is_same_as_company = contact_lower == company_name.lower()
+    if is_company or is_same_as_company:
+        return "", ""
+    return _split_contact_name(contact)
+
+
+def _clean_company_name_for_lusha(company_name: str) -> str:
+    """Remove legal suffixes/noise that can make Lusha person search too strict."""
+    cleaned = f" {company_name or ''} "
+    replacements = [
+        r"\bsp\.?\s*z\.?\s*o\.?\s*o\.?\b",
+        r"\bspółka\s*z\s*ograniczoną\s*odpowiedzialnością\b",
+        r"\bsp\.?\s*j\.?\b",
+        r"\bsp\.?\s*k\.?\b",
+        r"\bs\.?\s*a\.?\b",
+        r"\bsa\b",
+        r"\bllc\b",
+        r"\bltd\b",
+        r"\blimited\b",
+        r"\bgmbh\b",
+        r"\bdeweloper\b",
+        r"\bproperty\b",
+        r"\bgroup\b",
+        r"\bnieruchomości\b",
+    ]
+    for pattern in replacements:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[\"'“”‘’,;:.()]+", " ", cleaned)
+    cleaned = re.sub(r"\s*[-|]\s*", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or company_name
+
+
+def _is_low_value_otodom_agency_name(company_name: str) -> bool:
+    cleaned = (company_name or "").strip()
+    if not cleaned:
+        return True
+    lower = cleaned.lower()
+    if any(kw in lower for kw in POLISH_COMPANY_KEYWORDS):
+        return False
+    if any(ch in cleaned for ch in (".", "-", "&")):
+        return False
+    words = [w for w in cleaned.split() if w]
+    return len(words) <= 2
+
+
+def _is_blocked_domain(domain: str) -> bool:
+    value = (domain or "").lower().strip()
+    return any(value == suffix or value.endswith(f".{suffix}") for suffix in _BLOCKED_DOMAIN_SUFFIXES)
+
+
 # ---------------------------------------------------------------------------
 # Dedupe agencies (port: "Distinct Agency Name" node)
 # ---------------------------------------------------------------------------
@@ -54,46 +122,55 @@ def dedupe_agencies(listings: list[dict]) -> list[dict]:
     """
     Extract unique agencies from normalized listings.
     For Otodom: agency = company_name; for others: agency = contact_name.
-    Attempts to split Otodom individual contact names into first/last name
-    unless the name contains company keywords.
+    Otodom enrichment is company-first because Warsaw run diagnostics showed
+    individual person searches consistently return no contacts.
 
     Returns list of Agency.to_dict().
     """
     seen: set[str] = set()
+    otodom_candidates: dict[str, dict] = {}
     results: list[dict] = []
 
     for raw in listings:
         listing = Listing.from_dict(raw)
         source = listing.source
+        if source == "otodom" and (listing.contact_type or "").lower() == "private":
+            continue
 
-        company_name = (
-            listing.company_name if source == "otodom" else listing.contact_name
-        )
+        company_name = listing.company_name if source == "otodom" else listing.contact_name
         if not company_name or not company_name.strip():
             continue
+        company_name = company_name.strip()
+        if source == "otodom" and _is_low_value_otodom_agency_name(company_name):
+            continue
+
+        if source == "otodom":
+            first_name, last_name = _otodom_individual_name_parts(company_name, listing.contact_name)
+            bucket = otodom_candidates.setdefault(
+                company_name,
+                {"individuals": [], "seen": set()},
+            )
+            if first_name and last_name:
+                key = (first_name.lower(), last_name.lower())
+                if key not in bucket["seen"]:
+                    bucket["seen"].add(key)
+                    bucket["individuals"].append((first_name, last_name))
+            continue
+
         if company_name in seen:
             continue
         seen.add(company_name)
 
-        first_name = ""
-        last_name = ""
-
-        if source == "otodom" and listing.contact_name:
-            contact = listing.contact_name.strip()
-            contact_lower = contact.lower()
-            is_company = any(kw in contact_lower for kw in POLISH_COMPANY_KEYWORDS)
-            is_same_as_company = contact.lower() == company_name.lower()
-            if not is_company and not is_same_as_company:
-                first_name, last_name = _split_contact_name(contact)
-
         agency = Agency(
             company_name=company_name,
-            first_name=first_name,
-            last_name=last_name,
+            first_name="",
+            last_name="",
             source=source,
         )
         results.append(agency.to_dict())
 
+    for company_name, bucket in otodom_candidates.items():
+        results.append(Agency(company_name=company_name, source="otodom").to_dict())
     return results
 
 
@@ -146,6 +223,10 @@ def enrich_agency(payload: dict) -> dict:
         "reason": "",
         "individual_email_source": "",
         "domains_found": 0,
+        "google_domains": [],
+        "company_name_cleaned": _clean_company_name_for_lusha(agency.company_name),
+        "lusha_search_mode": "",
+        "domain_used": "",
         "raw_contacts_found": 0,
         "final_contacts_found": 0,
     }
@@ -153,10 +234,16 @@ def enrich_agency(payload: dict) -> dict:
     if agency.is_individual():
         diagnostics.update(_enrich_individual(agency))
         # Fall back to company path if the individual search returned nothing.
-        if not agency.contacts:
+        if not agency.contacts and agency.allow_company_fallback:
             company_diag = _enrich_company(agency, country, country_code)
             diagnostics["path"] = "individual_fallback_company"
             diagnostics["domains_found"] = company_diag.get("domains_found", 0)
+            diagnostics["google_domains"] = company_diag.get("google_domains", [])
+            diagnostics["lusha_search_mode"] = (
+                f"{diagnostics.get('lusha_search_mode') or 'individual_exact'}+"
+                f"{company_diag.get('lusha_search_mode') or 'company'}"
+            )
+            diagnostics["domain_used"] = company_diag.get("domain_used", "")
             diagnostics["raw_contacts_found"] = company_diag.get("raw_contacts_found", 0)
             diagnostics["final_contacts_found"] = company_diag.get("final_contacts_found", 0)
             if agency.contacts:
@@ -175,11 +262,22 @@ def enrich_agency(payload: dict) -> dict:
 
 def _enrich_individual(agency: Agency) -> dict:
     """Port: Filter1 → Lusha Search Individuals → Normalize Individual Result."""
-    diag = {"reason": "", "individual_email_source": ""}
+    cleaned_company = _clean_company_name_for_lusha(agency.company_name)
+    diag = {
+        "reason": "",
+        "individual_email_source": "",
+        "company_name_cleaned": cleaned_company,
+        "lusha_search_mode": "individual_exact",
+    }
     try:
         person = lusha_client.search_individual(
             agency.first_name, agency.last_name, agency.company_name
         )
+        if not person and cleaned_company and cleaned_company.lower() != agency.company_name.lower():
+            diag["lusha_search_mode"] = "individual_cleaned"
+            person = lusha_client.search_individual(
+                agency.first_name, agency.last_name, cleaned_company
+            )
         if not person:
             diag["reason"] = "individual_no_person"
             return diag
@@ -220,7 +318,16 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
           Enrich Emails → Pick Best Contact by Seniority.
     """
     company = agency.company_name
-    diag = {"reason": "", "domains_found": 0, "raw_contacts_found": 0, "final_contacts_found": 0}
+    diag = {
+        "reason": "",
+        "domains_found": 0,
+        "google_domains": [],
+        "company_name_cleaned": _clean_company_name_for_lusha(company),
+        "lusha_search_mode": "",
+        "domain_used": "",
+        "raw_contacts_found": 0,
+        "final_contacts_found": 0,
+    }
     if not company:
         diag["reason"] = "company_missing_name"
         return diag
@@ -247,8 +354,14 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
             import re
             match = re.match(r"^https?://(?:www\.)?([^/]+)", url)
             if match:
-                domains_with_rank.append((match.group(1), rank))
+                domain = match.group(1)
+                if not _is_blocked_domain(domain):
+                    domains_with_rank.append((domain, rank))
     diag["domains_found"] = len(domains_with_rank)
+    diag["google_domains"] = [
+        {"domain": domain, "rank": rank}
+        for domain, rank in domains_with_rank
+    ]
 
     if not domains_with_rank:
         diag["reason"] = "company_no_domain_found"
@@ -256,20 +369,44 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
 
     # 3. Lusha contact search per domain, collect best contacts
     all_contacts: list[dict] = []
+    last_domain_tried = ""
+    last_mode_when_empty = ""
     for domain, domain_rank in domains_with_rank:
-        try:
-            raw_contacts = lusha_client.search_contacts_by_domain(
-                domain=domain,
-                country=country,
-                job_titles=LUSHA_JOB_TITLES,
-            )
-            if not raw_contacts:
+        last_domain_tried = domain
+        modes = [
+            ("company_job_titles_country", country, LUSHA_JOB_TITLES),
+            ("company_job_titles_global", None, LUSHA_JOB_TITLES),
+            ("company_domain_only_country", country, None),
+            ("company_domain_only_global", None, None),
+        ]
+        for mode, search_country, job_titles in modes:
+            try:
+                raw_contacts = lusha_client.search_contacts_by_domain(
+                    domain=domain,
+                    country=search_country,
+                    job_titles=job_titles,
+                    company_name=diag["company_name_cleaned"],
+                    limit=LUSHA_MAX_REVEALS_PER_AGENCY,
+                )
+            except Exception:
+                logger.exception("Lusha search failed for domain=%s mode=%s", domain, mode)
+                last_mode_when_empty = f"{mode}_exception"
                 continue
+
+            diag["lusha_search_mode"] = mode
+            diag["domain_used"] = domain
+            if not raw_contacts:
+                last_mode_when_empty = f"{mode}_no_raw"
+                continue
+
             diag["raw_contacts_found"] += len(raw_contacts)
 
             # 4. Enrich each contact to get email addresses
             enriched = []
             for rc in raw_contacts:
+                if rc.get("_already_enriched"):
+                    enriched.append(rc)
+                    continue
                 contact_id = rc.get("contactId") or rc.get("id")
                 if not contact_id:
                     # Some search endpoints return full data directly
@@ -284,12 +421,22 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
 
             best = lusha_client.pick_best_contacts(enriched, domain_rank)
             all_contacts.extend(best)
-        except Exception:
-            logger.exception("Lusha search failed for domain=%s", domain)
+            if best:
+                break
+            last_mode_when_empty = f"{mode}_no_email"
+
+        if all_contacts:
+            break
 
     agency.contacts = all_contacts
     diag["final_contacts_found"] = len(all_contacts)
-    diag["reason"] = "company_success" if all_contacts else "company_no_contacts"
+    if all_contacts:
+        diag["reason"] = "company_success"
+    else:
+        diag["reason"] = "company_no_contacts"
+        if last_domain_tried and not diag.get("domain_used"):
+            diag["domain_used"] = last_domain_tried
+            diag["lusha_search_mode"] = last_mode_when_empty or "company_exhausted"
     return diag
 
 

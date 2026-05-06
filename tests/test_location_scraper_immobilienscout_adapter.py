@@ -1,6 +1,21 @@
 from __future__ import annotations
 
+from shared.location_scraper.adapters.idealista import IdealistaAdapter
 from shared.location_scraper.adapters.immobilienscout import ImmobilienscoutAdapter
+from shared.location_scraper.adapters.otodom import OtodomAdapter
+
+
+def test_build_input_caps_max_items():
+    adapter = ImmobilienscoutAdapter()
+    payload = adapter.build_input("https://www.immobilienscout24.de/Suche/de/berlin/berlin/buero-mieten?netfloorspace=1500")
+    assert payload["maxItems"] == 100
+
+
+def test_build_input_common_env_max_items_applies_to_all_actors(monkeypatch):
+    monkeypatch.setenv("LOCATION_SCRAPER_MAX_ITEMS", "42")
+    assert ImmobilienscoutAdapter().build_input("https://immobilienscout24.de")["maxItems"] == 42
+    assert IdealistaAdapter().build_input("https://idealista.com")["maxItems"] == 42
+    assert OtodomAdapter().build_input("https://otodom.pl")["maxItems"] == 42
 
 
 def test_normalize_skips_small_surface():

@@ -32,10 +32,13 @@ from tenacity import (
     wait_exponential,
 )
 
+from shared.location_scraper.config import LUSHA_MAX_REVEALS_PER_AGENCY
+
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.lusha.com"
 _API_KEY = os.environ.get("LUSHA_API_KEY", "")
+_PROSPECTING_PAGE_SIZE = 20
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -73,6 +76,171 @@ def _post(path: str, body: dict) -> dict:
     return resp.json()
 
 
+def _full_name(contact: dict[str, Any]) -> str:
+    return (
+        contact.get("fullName")
+        or contact.get("name")
+        or " ".join(
+            p for p in (contact.get("firstName"), contact.get("lastName")) if p
+        )
+        or ""
+    )
+
+
+def _contact_id(contact: dict[str, Any]) -> str:
+    return str(contact.get("contactId") or contact.get("id") or "").strip()
+
+
+def _company_id(contact: dict[str, Any]) -> str:
+    return str(contact.get("companyId") or contact.get("organizationId") or "").strip()
+
+
+def _contact_domain(contact: dict[str, Any], fallback: str) -> str:
+    return (
+        contact.get("fqdn")
+        or contact.get("domain")
+        or contact.get("companyDomain")
+        or fallback
+        or ""
+    )
+
+
+def _email_addresses(contact: dict[str, Any]) -> list[dict[str, Any]]:
+    emails = contact.get("emailAddresses") or []
+    if emails:
+        return emails
+    email = contact.get("email") or contact.get("workEmail")
+    if email:
+        return [{"email": email, "emailConfidence": contact.get("emailConfidence", "")}]
+    data = contact.get("data") or {}
+    emails = data.get("emailAddresses") or []
+    if emails:
+        return emails
+    email = data.get("email") or data.get("workEmail")
+    if email:
+        return [{"email": email, "emailConfidence": data.get("emailConfidence", "")}]
+    return []
+
+
+def _normalize_prospect_contact(contact: dict[str, Any], fallback_domain: str) -> dict[str, Any]:
+    data = contact.get("data") if isinstance(contact.get("data"), dict) else contact
+    social_links = data.get("socialLinks") or contact.get("socialLinks") or {}
+    linkedin = (
+        data.get("linkedinUrl")
+        or data.get("linkedinProfile")
+        or contact.get("linkedinUrl")
+        or contact.get("linkedinProfile")
+        or social_links.get("linkedin")
+        or ""
+    )
+    return {
+        "contactId": _contact_id(contact) or _contact_id(data),
+        "fullName": _full_name(data) or _full_name(contact),
+        "jobTitle": data.get("jobTitle") or contact.get("jobTitle") or "",
+        "emailAddresses": _email_addresses(data) or _email_addresses(contact),
+        "linkedinUrl": linkedin,
+        "companyName": data.get("companyName") or contact.get("companyName") or "",
+        "domain": _contact_domain(data, fallback_domain) or _contact_domain(contact, fallback_domain),
+        "_already_enriched": True,
+    }
+
+
+def _prospecting_search_contacts(
+    *,
+    company_name: str,
+    domain: str,
+    country: str | None,
+    job_titles: list[str] | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    filters: dict[str, Any] = {
+        "contacts": {
+            "include": {"existing_data_points": ["work_email"]},
+            "exclude": {},
+        },
+        "companies": {
+            "include": {"names": [company_name]},
+            "exclude": {},
+        },
+    }
+    if job_titles:
+        filters["contacts"]["include"]["jobTitles"] = job_titles
+    if country:
+        filters["contacts"]["include"]["locations"] = [{"country": country.capitalize()}]
+
+    data = _post(
+        "/prospecting/contact/search",
+        {
+            "pages": {"page": 0, "size": _PROSPECTING_PAGE_SIZE},
+            "filters": filters,
+        },
+    )
+    request_id = data.get("requestId") or ""
+    contacts = data.get("contacts")
+    if contacts is None:
+        contacts = data.get("data") or []
+    normalized = []
+    for contact in contacts:
+        contact_id = _contact_id(contact)
+        if not contact_id:
+            continue
+        normalized.append(
+            {
+                "contactId": contact_id,
+                "fullName": _full_name(contact),
+                "companyName": contact.get("companyName") or company_name,
+                "companyId": _company_id(contact),
+                "jobTitle": contact.get("jobTitle") or "",
+                "domain": _contact_domain(contact, domain),
+                "hasWorkEmail": bool(contact.get("hasWorkEmail", True)),
+            }
+        )
+    return request_id, normalized
+
+
+def _prospecting_enrich_contacts(
+    *,
+    request_id: str,
+    contacts: list[dict[str, Any]],
+    domain: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    contact_ids = [
+        contact["contactId"]
+        for contact in contacts
+        if contact.get("contactId") and contact.get("hasWorkEmail", True)
+    ]
+    if not request_id or not contact_ids:
+        return []
+
+    by_id = {str(contact.get("contactId")): contact for contact in contacts}
+    results = []
+    for start in range(0, len(contact_ids), limit):
+        batch_ids = contact_ids[start : start + limit]
+        data = _post(
+            "/prospecting/contact/enrich",
+            {
+                "requestId": request_id,
+                "contactIds": batch_ids,
+                "revealEmails": True,
+                "revealPhones": False,
+            },
+        )
+        enriched_items = data.get("contacts") or []
+        if isinstance(enriched_items, dict):
+            iterable = enriched_items.items()
+        else:
+            iterable = ((_contact_id(item), item) for item in enriched_items)
+        for contact_id, enriched in iterable:
+            base = by_id.get(str(contact_id), {})
+            merged = {**base, **(enriched or {})}
+            normalized = _normalize_prospect_contact(merged, domain)
+            if normalized["emailAddresses"]:
+                results.append(normalized)
+                if len(results) >= limit:
+                    return results
+    return results
+
+
 def _seniority_rank(title: str) -> int:
     """Port of the seniorityRank() function from n8n 'Pick Best Contact by Seniority' node."""
     if not title:
@@ -90,8 +258,10 @@ def _seniority_rank(title: str) -> int:
 @_retry_decorator()
 def search_contacts_by_domain(
     domain: str,
-    country: str,
-    job_titles: list[str],
+    country: str | None = None,
+    job_titles: list[str] | None = None,
+    company_name: str | None = None,
+    limit: int = LUSHA_MAX_REVEALS_PER_AGENCY,
 ) -> list[dict[str, Any]]:
     """
     Search for contacts at a company domain with matching job titles.
@@ -99,14 +269,31 @@ def search_contacts_by_domain(
 
     Maps to n8n "Extract Contact" node (operation: searchContacts).
     """
-    body = {
-        "companyDomain": domain,
-        "jobTitles": job_titles,
-        "countries": [country.capitalize()],
-    }
+    company = (company_name or "").strip() or domain.split(".", 1)[0].replace("-", " ").strip()
+    request_id, prospects = _prospecting_search_contacts(
+        company_name=company,
+        domain=domain,
+        country=country,
+        job_titles=job_titles,
+    )
+    enriched = _prospecting_enrich_contacts(
+        request_id=request_id,
+        contacts=prospects,
+        domain=domain,
+        limit=limit,
+    )
+    if enriched:
+        return enriched
+
+    # Backward-compatible fallback for older Lusha accounts/endpoints.
+    body = {"companyDomain": domain}
+    if country:
+        body["countries"] = [country.capitalize()]
+    if job_titles:
+        body["jobTitles"] = job_titles
     try:
         data = _post("/v2/contacts/search", body)
-        return data.get("data", [])
+        return (data.get("data", []) or [])[:limit]
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 404:
             return []

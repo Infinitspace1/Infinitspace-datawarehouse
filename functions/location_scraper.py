@@ -15,7 +15,10 @@ Functions registered here:
   - ls_enrich_agency        (activity — one per agency, fan-out target)
   - ls_consolidate_contacts (activity)
   - ls_upsert_sql           (activity)
+  - ls_write_lusha_diagnostics (activity)
   - ls_write_logs           (activity)
+  - ls_materialize_globe    (activity)
+  - ls_refresh_globe_quality (activity)
 
 Trigger: POST /api/scrape
 Body: {"City": str, "shape": str|null, "run_id": str}
@@ -33,6 +36,7 @@ import azure.functions as func
 
 from shared.location_scraper.activities import enrich as enrich_act
 from shared.location_scraper.activities import log_run as log_act
+from shared.location_scraper.activities import materialize_globe as materialize_act
 from shared.location_scraper.activities import persist as persist_act
 from shared.location_scraper.activities import raw_payload as raw_act
 from shared.location_scraper.activities import resolve as resolve_act
@@ -42,6 +46,15 @@ from shared.location_scraper.run_quality import compute_run_quality_payload
 logger = logging.getLogger(__name__)
 
 bp = df.Blueprint()
+
+
+def _safe_mark_run_failed(run_id: str | None, error: str) -> None:
+    if not run_id:
+        return
+    try:
+        log_act.mark_run_failed(run_id, error)
+    except Exception:
+        logger.exception("Could not mark location scraper run failed. run_id=%s", run_id)
 
 
 def _summarize_enrichment_diagnostics(enriched_agencies: list[dict]) -> dict:
@@ -98,7 +111,7 @@ def _summarize_enrichment_diagnostics(enriched_agencies: list[dict]) -> dict:
 @bp.durable_client_input(client_name="client")
 async def location_scraper_http(
     req: func.HttpRequest,
-    client: df.DurableOrchestrationClient,
+    client,
 ) -> func.HttpResponse:
     try:
         body = req.get_json()
@@ -215,6 +228,15 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             source_config["city"],
             json.dumps(enrichment_diag, sort_keys=True),
         )
+        yield context.call_activity(
+            "ls_write_lusha_diagnostics",
+            {
+                "run_id": run_id,
+                "source": source_config["actor"],
+                "city": source_config["city"],
+                "enriched_agencies": enriched_agencies,
+            },
+        )
 
         # 9. Consolidate contacts (dedup + top-3 per agency)
         bundles: list[dict] = yield context.call_activity("ls_consolidate_contacts", enriched_agencies)
@@ -236,6 +258,8 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
 
         # 11. Write completion log
         yield context.call_activity("ls_write_logs", stats)
+        yield context.call_activity("ls_materialize_globe", {"run_id": run_id})
+        yield context.call_activity("ls_refresh_globe_quality", {"run_id": run_id})
         return stats
     except Exception as exc:
         yield context.call_activity(
@@ -276,7 +300,11 @@ def ls_fetch_dataset(run_info: dict) -> list:
 
 @bp.activity_trigger(input_name="payload")
 def ls_persist_raw(payload: dict) -> dict:
-    return raw_act.persist_raw_items(payload)
+    try:
+        return raw_act.persist_raw_items(payload)
+    except Exception as exc:
+        _safe_mark_run_failed(payload.get("run_id"), f"ls_persist_raw failed: {exc}")
+        raise
 
 
 @bp.activity_trigger(input_name="payload")
@@ -305,13 +333,30 @@ def ls_consolidate_contacts(agencies: list) -> list:
 
 
 @bp.activity_trigger(input_name="payload")
+def ls_write_lusha_diagnostics(payload: dict) -> dict:
+    try:
+        return log_act.write_lusha_diagnostics(payload)
+    except Exception as exc:
+        _safe_mark_run_failed(payload.get("run_id"), f"ls_write_lusha_diagnostics failed: {exc}")
+        raise
+
+
+@bp.activity_trigger(input_name="payload")
 def ls_upsert_sql(payload: dict) -> dict:
-    return persist_act.upsert_sql(payload)
+    try:
+        return persist_act.upsert_sql(payload)
+    except Exception as exc:
+        _safe_mark_run_failed(payload.get("run_id"), f"ls_upsert_sql failed: {exc}")
+        raise
 
 
 @bp.activity_trigger(input_name="stats")
 def ls_write_logs(stats: dict) -> None:
-    log_act.write_logs(stats)
+    try:
+        log_act.write_logs(stats)
+    except Exception as exc:
+        _safe_mark_run_failed(stats.get("run_id"), f"ls_write_logs failed: {exc}")
+        raise
 
 
 @bp.activity_trigger(input_name="payload")
@@ -319,4 +364,22 @@ def ls_mark_run_failed(payload: dict) -> None:
     run_id = payload.get("run_id")
     if not run_id:
         return
-    log_act.mark_run_failed(run_id, payload.get("error", "unknown error"))
+    _safe_mark_run_failed(run_id, payload.get("error", "unknown error"))
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_materialize_globe(payload: dict) -> dict:
+    try:
+        return materialize_act.materialize_globe_run(payload)
+    except Exception as exc:
+        _safe_mark_run_failed(payload.get("run_id"), f"ls_materialize_globe failed: {exc}")
+        raise
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_refresh_globe_quality(payload: dict) -> dict:
+    try:
+        return materialize_act.refresh_globe_quality(payload)
+    except Exception as exc:
+        _safe_mark_run_failed(payload.get("run_id"), f"ls_refresh_globe_quality failed: {exc}")
+        raise

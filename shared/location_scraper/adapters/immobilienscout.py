@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from shared.location_scraper.config import IMMOBILIENSCOUT_ACTOR_ID
+from shared.location_scraper.config import IMMOBILIENSCOUT_ACTOR_ID, get_actor_max_items
 from shared.location_scraper.models import Listing
 
 
@@ -89,6 +89,7 @@ class ImmobilienscoutAdapter:
     def build_input(self, start_url: str) -> dict:
         return {
             "startUrls": [{"url": start_url}],
+            "maxItems": get_actor_max_items(default=100),
             "maxConcurrency": 10,
             "minConcurrency": 1,
             "maxRequestRetries": 100,
