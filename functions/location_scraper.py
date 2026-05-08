@@ -203,7 +203,10 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
         agencies: list[dict] = yield context.call_activity("ls_dedupe_agencies", listings)
 
         # 7. Filter out agencies already enriched in SQL
-        new_agencies: list[dict] = yield context.call_activity("ls_filter_new_agencies", agencies)
+        new_agencies: list[dict] = yield context.call_activity(
+            "ls_filter_new_agencies",
+            {"agencies": agencies, "listings": listings},
+        )
 
         # 8. Fan-out: enrich each agency in parallel
         enrich_tasks = [

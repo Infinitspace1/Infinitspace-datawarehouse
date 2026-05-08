@@ -39,7 +39,7 @@ class Listing:
 
     def matching_name(self) -> Optional[str]:
         """Agency identifier used to join listings with enriched contacts."""
-        return self.company_name if self.source == "otodom" else self.contact_name
+        return self.company_name if self.source in ("otodom", "immobilienscout") else self.contact_name
 
     def to_dict(self) -> dict:
         return {

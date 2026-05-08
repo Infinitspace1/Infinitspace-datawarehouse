@@ -22,9 +22,11 @@ import pytest
 
 from shared.location_scraper.activities.enrich import (
     _clean_company_name_for_lusha,
+    _company_name_variants_for_lusha,
     consolidate_contacts,
     dedupe_agencies,
     enrich_agency,
+    filter_new_agencies,
 )
 from shared.location_scraper.activities.resolve import resolve_source
 from shared.location_scraper.activities.scrape import normalize_listings
@@ -335,6 +337,104 @@ def test_clean_company_name_for_lusha_removes_polish_legal_suffixes():
     assert _clean_company_name_for_lusha("Polski Holding Nieruchomości S.A.") == "Polski Holding"
 
 
+def test_idealista_company_name_variants_remove_listing_descriptors():
+    assert _company_name_variants_for_lusha(
+        "Knight Frank Oficinas y Locales",
+        "idealista",
+    ) == ["Knight Frank Oficinas y Locales", "Knight Frank"]
+    assert _company_name_variants_for_lusha(
+        "Nirvana - Especialistas en oficinas",
+        "idealista",
+    ) == ["Nirvana - Especialistas en oficinas", "Nirvana Especialistas en oficinas", "Nirvana"]
+    # City qualifier + "Commercial" suffix — Engel & Völkers Barcelona pattern
+    assert _company_name_variants_for_lusha(
+        "Engel & Völkers Commercial Barcelona",
+        "idealista",
+    ) == ["Engel & Völkers Commercial Barcelona", "Engel & Völkers"]
+    # Italian city variant
+    assert _company_name_variants_for_lusha(
+        "Cushman & Wakefield Commercial Milano",
+        "idealista",
+    ) == ["Cushman & Wakefield Commercial Milano", "Cushman & Wakefield"]
+
+
+def test_filter_new_agencies_skips_previously_successful_agency(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.execute_query.side_effect = [
+        [],
+        [{"agency_name": "CBRE Sp.z o.o."}],
+    ]
+    monkeypatch.setattr("shared.azure_clients.sql_client.get_sql_client", lambda: mock_client)
+
+    agencies = [
+        {"company_name": "CBRE Sp.z o.o.", "first_name": "", "last_name": "", "source": "otodom", "contacts": []},
+        {"company_name": "MAXON Nieruchomo>ci", "first_name": "", "last_name": "", "source": "otodom", "contacts": []},
+    ]
+
+    assert [a["company_name"] for a in filter_new_agencies(agencies)] == ["MAXON Nieruchomo>ci"]
+
+
+def test_filter_new_agencies_skips_existing_exact_contact(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.execute_query.side_effect = [
+        [{"name": "Jan Kowalski"}],
+        [],
+    ]
+    monkeypatch.setattr("shared.azure_clients.sql_client.get_sql_client", lambda: mock_client)
+
+    agencies = [
+        {"company_name": "Biuro ABC", "first_name": "Jan", "last_name": "Kowalski", "source": "otodom", "contacts": []},
+        {"company_name": "Biuro XYZ", "first_name": "Anna", "last_name": "Nowak", "source": "otodom", "contacts": []},
+    ]
+
+    assert [a["company_name"] for a in filter_new_agencies(agencies)] == ["Biuro XYZ"]
+
+
+def test_filter_new_agencies_skips_building_that_already_has_lusha_contact(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.execute_query.side_effect = [
+        [],
+        [],
+        [{"latitude": 52.12345, "longitude": 21.98765, "floor": 3}],
+    ]
+    monkeypatch.setattr("shared.azure_clients.sql_client.get_sql_client", lambda: mock_client)
+
+    agency = {"company_name": "CBRE Sp.z o.o.", "first_name": "", "last_name": "", "source": "otodom", "contacts": []}
+    listing = {
+        "source": "otodom",
+        "city": "warsaw",
+        "external_id": "1",
+        "web_link": None,
+        "link_to_gmap": None,
+        "latitude": 52.12345,
+        "longitude": 21.98765,
+        "district": None,
+        "postal_code": None,
+        "address": None,
+        "available_surface_m2": None,
+        "floor": "3",
+        "status": None,
+        "is_exterior": None,
+        "has_lift": None,
+        "has_air_conditioning": None,
+        "price_monthly": None,
+        "price_per_m2": None,
+        "currency": None,
+        "energy_class": None,
+        "first_listed_date": None,
+        "last_updated_date": None,
+        "days_on_market": None,
+        "contact_name": "CBRE Sp.z o.o.",
+        "company_name": "CBRE Sp.z o.o.",
+        "phone": None,
+        "contact_type": "business",
+        "email": "",
+        "agency_comment": None,
+    }
+
+    assert filter_new_agencies({"agencies": [agency], "listings": [listing]}) == []
+
+
 # ---------------------------------------------------------------------------
 # Step 4: enrich_agency — company path with mocked Apify + Lusha
 # ---------------------------------------------------------------------------
@@ -553,6 +653,282 @@ def test_enrich_agency_company_path_skips_blocked_domains():
 
     assert calls[0] == "example-realestate.pl"
     assert result["_diagnostics"]["domain_used"] == "example-realestate.pl"
+
+
+def test_enrich_agency_idealista_retries_with_cleaned_company_variant():
+    calls = []
+
+    def fake_search(domain, country=None, job_titles=None, company_name=None, limit=5):
+        calls.append((domain, country, bool(job_titles), company_name, limit))
+        if company_name == "Knight Frank" and country == "spain" and job_titles:
+            return FAKE_LUSHA_CONTACTS
+        return []
+
+    google_result = [
+        {
+            "organicResults": [
+                {"url": "https://www.knightfrank.com"},
+                {"url": "https://www.knightfrank.es"},
+                {"url": "https://www.knightfrank.es/oficinas"},
+            ],
+        }
+    ]
+
+    with (
+        patch(
+            "shared.location_scraper.activities.enrich.apify_client.run_sync",
+            return_value=google_result,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.search_contacts_by_domain",
+            side_effect=fake_search,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.enrich_contact",
+            return_value=FAKE_LUSHA_ENRICHED,
+        ),
+    ):
+        agency_dict = {
+            "company_name": "Knight Frank Oficinas y Locales",
+            "first_name": "",
+            "last_name": "",
+            "source": "idealista",
+            "contacts": [],
+        }
+        result = enrich_agency(
+            {"agency": agency_dict, "country": "spain", "country_code": "es"}
+        )
+
+    assert result["contacts"][0]["email"] == "ana.garcia@savills.es"
+    assert result["_diagnostics"]["company_name_cleaned"] == "Knight Frank"
+    assert result["_diagnostics"]["lusha_search_mode"] == "company_job_titles_country"
+    assert [call[0] for call in calls].count("knightfrank.com") == 5
+    assert "knightfrank.es" not in [call[0] for call in calls]
+
+
+# ---------------------------------------------------------------------------
+# Website scrape fallback
+# ---------------------------------------------------------------------------
+
+
+def test_website_scraper_extracts_emails_from_homepage():
+    from shared.location_scraper.clients.website_scraper import scrape_emails_from_domain
+    from unittest.mock import patch, MagicMock
+
+    html = """
+    <html><body>
+      <p>Contact us at info@chrysol.es or hello@chrysol.es</p>
+      <a href="mailto:noreply@chrysol.es">unsubscribe</a>
+    </body></html>
+    """
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.content = b"x"
+    mock_resp.text = html
+
+    with patch("shared.location_scraper.clients.website_scraper.requests.get", return_value=mock_resp):
+        emails = scrape_emails_from_domain("chrysol.es")
+
+    assert "info@chrysol.es" in emails
+    assert "hello@chrysol.es" in emails
+    assert "noreply@chrysol.es" not in emails
+
+
+def test_website_scraper_stops_after_first_page_with_emails():
+    from shared.location_scraper.clients.website_scraper import scrape_emails_from_domain
+    from unittest.mock import patch, MagicMock
+
+    call_count = 0
+
+    def fake_get(url, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        mock = MagicMock()
+        if url == "https://gralen.es":
+            mock.ok = True
+            mock.content = b"x"
+            mock.text = "<p>info@gralen.es</p>"
+        else:
+            mock.ok = False
+            mock.content = b""
+        return mock
+
+    with patch("shared.location_scraper.clients.website_scraper.requests.get", side_effect=fake_get):
+        emails = scrape_emails_from_domain("gralen.es")
+
+    assert emails == ["info@gralen.es"]
+    assert call_count == 1  # stopped after homepage
+
+
+def test_website_scraper_filters_system_emails():
+    from shared.location_scraper.clients.website_scraper import scrape_emails_from_domain
+    from unittest.mock import patch, MagicMock
+
+    html = "<p>noreply@x.es bounce@x.es postmaster@x.es contact@x.es</p>"
+    mock = MagicMock()
+    mock.ok = True
+    mock.content = b"x"
+    mock.text = html
+
+    with patch("shared.location_scraper.clients.website_scraper.requests.get", return_value=mock):
+        emails = scrape_emails_from_domain("x.es")
+
+    assert emails == ["contact@x.es"]
+
+
+def test_website_scraper_decodes_html_entities():
+    from shared.location_scraper.clients.website_scraper import scrape_emails_from_domain
+    from unittest.mock import patch, MagicMock
+
+    # &#64; is the HTML entity for @
+    html = "<p>info&#64;gralen.es</p>"
+    mock = MagicMock()
+    mock.ok = True
+    mock.content = b"x"
+    mock.text = html
+
+    with patch("shared.location_scraper.clients.website_scraper.requests.get", return_value=mock):
+        emails = scrape_emails_from_domain("gralen.es")
+
+    assert "info@gralen.es" in emails
+
+
+def test_website_scraper_handles_at_obfuscation():
+    from shared.location_scraper.clients.website_scraper import scrape_emails_from_domain
+    from unittest.mock import patch, MagicMock
+
+    html = "<p>info [at] gralen.es</p>"
+    mock = MagicMock()
+    mock.ok = True
+    mock.content = b"x"
+    mock.text = html
+
+    with patch("shared.location_scraper.clients.website_scraper.requests.get", return_value=mock):
+        emails = scrape_emails_from_domain("gralen.es")
+
+    assert "info@gralen.es" in emails
+
+
+def test_website_scraper_extracts_email_from_jsonld():
+    from shared.location_scraper.clients.website_scraper import scrape_emails_from_domain
+    from unittest.mock import patch, MagicMock
+
+    # Email only in JSON-LD, not in visible HTML — typical SPA pattern
+    html = """
+    <html>
+    <head>
+    <script type="application/ld+json">
+    {"@type": "LocalBusiness", "name": "Gralen", "email": "info@gralen.es"}
+    </script>
+    </head>
+    <body><p>Contáctenos</p></body>
+    </html>
+    """
+    mock = MagicMock()
+    mock.ok = True
+    mock.content = b"x"
+    mock.text = html
+
+    with patch("shared.location_scraper.clients.website_scraper.requests.get", return_value=mock):
+        emails = scrape_emails_from_domain("gralen.es")
+
+    assert "info@gralen.es" in emails
+
+
+def test_website_scraper_tries_www_prefix_if_bare_domain_empty():
+    from shared.location_scraper.clients.website_scraper import scrape_emails_from_domain
+    from unittest.mock import patch, MagicMock
+
+    def fake_get(url, **kwargs):
+        mock = MagicMock()
+        if "www.gralen.es" in url:
+            mock.ok = True
+            mock.content = b"x"
+            mock.text = "<p>info@gralen.es</p>"
+        else:
+            mock.ok = False
+            mock.content = b""
+        return mock
+
+    with patch("shared.location_scraper.clients.website_scraper.requests.get", side_effect=fake_get):
+        emails = scrape_emails_from_domain("gralen.es")
+
+    assert "info@gralen.es" in emails
+
+
+def test_enrich_agency_falls_back_to_website_when_lusha_empty():
+    google_result = [
+        {"organicResults": [{"url": "https://www.chrysol.es"}]}
+    ]
+
+    html_with_email = "<p>Llámanos o escríbenos a info@chrysol.es</p>"
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.content = b"x"
+    mock_resp.text = html_with_email
+
+    with (
+        patch(
+            "shared.location_scraper.activities.enrich.apify_client.run_sync",
+            return_value=google_result,
+        ),
+        patch(
+            "shared.location_scraper.clients.lusha.search_contacts_by_domain",
+            return_value=[],
+        ),
+        patch(
+            "shared.location_scraper.clients.website_scraper.requests.get",
+            return_value=mock_resp,
+        ),
+    ):
+        result = enrich_agency(
+            {
+                "agency": {
+                    "company_name": "Chrysol Value Real Estate",
+                    "first_name": "",
+                    "last_name": "",
+                    "source": "idealista",
+                    "contacts": [],
+                },
+                "country": "spain",
+                "country_code": "es",
+            }
+        )
+
+    assert result["contacts"][0]["email"] == "info@chrysol.es"
+    assert result["contacts"][0]["email_confidence"] == "website"
+    assert result["_diagnostics"]["reason"] == "website_success"
+    assert result["_diagnostics"]["lusha_search_mode"] == "website_scrape"
+    assert result["_diagnostics"]["has_contact"] is True
+
+
+def test_enrich_agency_no_website_fallback_when_no_domain():
+    """If Google search finds no domain, website fallback must not be attempted."""
+    with (
+        patch(
+            "shared.location_scraper.activities.enrich.apify_client.run_sync",
+            return_value=[{"organicResults": []}],
+        ),
+        patch(
+            "shared.location_scraper.clients.website_scraper.requests.get",
+        ) as mock_get,
+    ):
+        result = enrich_agency(
+            {
+                "agency": {
+                    "company_name": "Unknown Agency",
+                    "first_name": "",
+                    "last_name": "",
+                    "source": "idealista",
+                    "contacts": [],
+                },
+                "country": "spain",
+                "country_code": "es",
+            }
+        )
+
+    mock_get.assert_not_called()
+    assert result["_diagnostics"]["reason"] == "company_no_domain_found"
 
 
 # ---------------------------------------------------------------------------

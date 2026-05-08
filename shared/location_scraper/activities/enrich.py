@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from typing import Any
 
 from shared.location_scraper.clients import apify as apify_client
 from shared.location_scraper.clients import lusha as lusha_client
+from shared.location_scraper.clients import website_scraper
 from shared.location_scraper.config import (
     GOOGLE_SEARCH_ACTOR_ID,
     LUSHA_MAX_REVEALS_PER_AGENCY,
@@ -34,6 +36,9 @@ _BLOCKED_DOMAIN_SUFFIXES = (
     "youtube.com",
     "otodom.pl",
     "realtor.com",
+    "immobilienscout24.de",
+    "yelp.com",
+    "yelp.de",
 )
 
 
@@ -96,6 +101,131 @@ def _clean_company_name_for_lusha(company_name: str) -> str:
     return cleaned or company_name
 
 
+def _strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _clean_idealista_company_name_for_lusha(company_name: str) -> str:
+    """Remove Idealista agency-label noise while keeping the brand name."""
+    cleaned = _clean_company_name_for_lusha(company_name)
+    cleaned = re.split(r"\s+[-|]\s+", cleaned, maxsplit=1)[0].strip()
+
+    normalized = _strip_accents(cleaned).lower()
+    # Strip city names that commonly appear as trailing qualifiers on Idealista listings
+    _SPANISH_CITIES = [
+        "barcelona", "madrid", "valencia", "sevilla", "bilbao", "zaragoza",
+        "malaga", "granada", "alicante", "murcia", "pamplona", "san sebastian",
+    ]
+    _ITALIAN_CITIES = [
+        "milano", "milan", "roma", "rome", "torino", "napoli", "firenze",
+        "bologna", "venezia", "genova", "palermo", "bari",
+    ]
+    _TRAILING_CITIES = _SPANISH_CITIES + _ITALIAN_CITIES
+
+    # First: strip trailing city name so "Engel & Völkers Commercial Barcelona"
+    # becomes "Engel & Völkers Commercial" before suffix stripping below.
+    for city in _TRAILING_CITIES:
+        if normalized.endswith(f" {city}"):
+            cleaned = cleaned[: len(cleaned) - len(city)].strip(" -|,.;")
+            normalized = _strip_accents(cleaned).lower()
+            break
+
+    suffixes = [
+        "oficinas y locales",
+        "especialistas en oficinas",
+        "consultores inmobiliarios",
+        "consultores inmobiliarias",
+        "consultoria inmobiliaria",
+        "commercial",
+        "consultores",
+        "inmobiliarios",
+        "inmobiliaria",
+        "inmobiliario",
+        "real estate",
+        "properties",
+        "property",
+    ]
+    for suffix in suffixes:
+        if normalized.endswith(f" {suffix}"):
+            cleaned = cleaned[: len(cleaned) - len(suffix)].strip(" -|,.;")
+            normalized = _strip_accents(cleaned).lower()
+
+    return cleaned or company_name
+
+
+def _clean_immobilienscout_company_name_for_lusha(company_name: str) -> str:
+    """Remove German city/descriptor noise while keeping the brand name."""
+    cleaned = _clean_company_name_for_lusha(company_name)
+    cleaned = re.split(r"\s+[-|]\s+", cleaned, maxsplit=1)[0].strip()
+
+    normalized = _strip_accents(cleaned).lower()
+    _GERMAN_CITIES = [
+        "berlin", "munich", "munchen", "münchen", "hamburg", "cologne", "koln", "köln",
+        "frankfurt", "dusseldorf", "dusseldorf", "düsseldorf", "stuttgart", "dortmund",
+        "essen", "leipzig", "bremen", "dresden", "hannover", "nuremberg", "nurnberg",
+        "duisburg", "bochum", "wuppertal", "bielefeld", "mannheim", "augsburg",
+    ]
+    for city in _GERMAN_CITIES:
+        if normalized.endswith(f" {city}"):
+            cleaned = cleaned[: len(cleaned) - len(city)].strip(" -|,.;")
+            normalized = _strip_accents(cleaned).lower()
+            break
+
+    suffixes = [
+        "gewerbeimmobilien",
+        "immobiliengesellschaft",
+        "immobilienmakler",
+        "immobilien",
+        "transactions",
+        "transaction",
+        "vermietung",
+        "verwaltung",
+        "beratung",
+        "real estate",
+        "property",
+    ]
+    for suffix in suffixes:
+        if normalized.endswith(f" {suffix}"):
+            cleaned = cleaned[: len(cleaned) - len(suffix)].strip(" -|,.;")
+            normalized = _strip_accents(cleaned).lower()
+
+    # Remove consecutive duplicate tokens (e.g. "HSC HSC GmbH" → "HSC")
+    tokens = cleaned.split()
+    deduped = []
+    for tok in tokens:
+        if not deduped or tok.lower() != deduped[-1].lower():
+            deduped.append(tok)
+    cleaned = " ".join(deduped).strip()
+
+    return cleaned or company_name
+
+
+def _company_name_variants_for_lusha(company_name: str, source: str) -> list[str]:
+    """Return ordered company-name variants to try against Lusha."""
+    variants: list[str] = []
+    base_values = (
+        (company_name, _clean_company_name_for_lusha(company_name))
+        if source == "idealista"
+        else (_clean_company_name_for_lusha(company_name), company_name)
+    )
+    for value in base_values:
+        cleaned = (value or "").strip()
+        if cleaned and cleaned.casefold() not in {v.casefold() for v in variants}:
+            variants.append(cleaned)
+
+    if source == "idealista":
+        cleaned = _clean_idealista_company_name_for_lusha(company_name)
+        if cleaned and cleaned.casefold() not in {v.casefold() for v in variants}:
+            variants.append(cleaned)
+    elif source == "immobilienscout":
+        cleaned = _clean_immobilienscout_company_name_for_lusha(company_name)
+        if cleaned and cleaned.casefold() not in {v.casefold() for v in variants}:
+            variants.append(cleaned)
+
+    return variants or [company_name]
+
+
 def _is_low_value_otodom_agency_name(company_name: str) -> bool:
     cleaned = (company_name or "").strip()
     if not cleaned:
@@ -112,6 +242,17 @@ def _is_low_value_otodom_agency_name(company_name: str) -> bool:
 def _is_blocked_domain(domain: str) -> bool:
     value = (domain or "").lower().strip()
     return any(value == suffix or value.endswith(f".{suffix}") for suffix in _BLOCKED_DOMAIN_SUFFIXES)
+
+
+def _building_key(lat: float | None, lon: float | None, floor: str | None) -> str | None:
+    if lat is None or lon is None:
+        return None
+    floor_key = floor if floor is not None else "null"
+    return f"{lat:.4f}_{lon:.4f}_{floor_key}"
+
+
+def _agency_key(value: str | None) -> str:
+    return (value or "").strip().casefold()
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +278,11 @@ def dedupe_agencies(listings: list[dict]) -> list[dict]:
         if source == "otodom" and (listing.contact_type or "").lower() == "private":
             continue
 
-        company_name = listing.company_name if source == "otodom" else listing.contact_name
+        company_name = (
+            listing.company_name
+            if source in ("otodom", "immobilienscout")
+            else listing.contact_name
+        )
         if not company_name or not company_name.strip():
             continue
         company_name = company_name.strip()
@@ -178,25 +323,105 @@ def dedupe_agencies(listings: list[dict]) -> list[dict]:
 # Filter agencies already in SQL (port: "Filter agencies without Lusha" node)
 # ---------------------------------------------------------------------------
 
-def filter_new_agencies(agencies: list[dict]) -> list[dict]:
+def filter_new_agencies(payload: list[dict] | dict) -> list[dict]:
     """
-    Remove agencies that already have Lusha contacts in SQL.
-    Queries bronze.n8n_location_scraper_contacts for existing lusha names.
+    Remove agencies that should not trigger Lusha again.
+
+    Skips an agency when:
+      - the agency already produced Lusha contacts in prior diagnostics
+      - the exact person/contact name already exists in Lusha contacts
+      - every listing for that agency is on a building that already has a
+        Lusha contact linked
     """
     from shared.azure_clients.sql_client import get_sql_client
 
+    if isinstance(payload, dict):
+        agencies = payload.get("agencies") or []
+        listings = [Listing.from_dict(d) for d in payload.get("listings") or []]
+    else:
+        agencies = payload
+        listings = []
+
     sql = get_sql_client()
     try:
-        rows = sql.execute_query(
+        contact_rows = sql.execute_query(
             "SELECT DISTINCT name FROM bronze.n8n_location_scraper_contacts "
             "WHERE source = 'lusha' AND name IS NOT NULL"
         )
-        existing: set[str] = {r["name"] for r in rows}
+        existing_contacts: set[str] = {
+            _agency_key(r["name"]) for r in contact_rows if r.get("name")
+        }
     except Exception:
         logger.exception("Could not query existing lusha agencies; proceeding with all")
-        existing = set()
+        existing_contacts = set()
 
-    return [a for a in agencies if a["company_name"] not in existing]
+    try:
+        agency_rows = sql.execute_query(
+            "SELECT DISTINCT agency_name FROM bronze.location_scraper_lusha_diagnostics "
+            "WHERE has_contact = 1 AND agency_name IS NOT NULL"
+        )
+        existing_agencies: set[str] = {
+            _agency_key(r["agency_name"]) for r in agency_rows if r.get("agency_name")
+        }
+    except Exception:
+        logger.exception("Could not query existing Lusha diagnostics; proceeding without agency history")
+        existing_agencies = set()
+
+    agency_has_unsourced_listing: dict[str, bool] = {}
+    if listings:
+        cities = sorted({L.city for L in listings if L.city})
+        existing_lusha_buildings: set[str] = set()
+        try:
+            for city in cities:
+                rows = sql.execute_query(
+                    """
+                    SELECT DISTINCT b.latitude, b.longitude, b.floor
+                    FROM bronze.n8n_location_scraper_buildings AS b
+                    JOIN bronze.n8n_location_scraper_listings AS l
+                        ON l.building_id = b.id
+                    JOIN bronze.n8n_location_scraper_listing_contacts AS lc
+                        ON lc.listing_id = l.id
+                    JOIN bronze.n8n_location_scraper_contacts AS c
+                        ON c.id = lc.contact_id
+                    WHERE b.city = ? AND c.source = 'lusha'
+                    """,
+                    (city,),
+                )
+                for row in rows:
+                    key = _building_key(
+                        float(row["latitude"]) if row.get("latitude") is not None else None,
+                        float(row["longitude"]) if row.get("longitude") is not None else None,
+                        str(row["floor"]) if row.get("floor") is not None else None,
+                    )
+                    if key:
+                        existing_lusha_buildings.add(key)
+        except Exception:
+            logger.exception("Could not query existing Lusha-linked buildings; treating listings as unsourced")
+            existing_lusha_buildings = set()
+
+        for listing in listings:
+            matching = _agency_key(listing.matching_name())
+            if not matching:
+                continue
+            key = _building_key(listing.latitude, listing.longitude, listing.floor)
+            if not key or key not in existing_lusha_buildings:
+                agency_has_unsourced_listing[matching] = True
+            else:
+                agency_has_unsourced_listing.setdefault(matching, False)
+
+    filtered = []
+    for raw in agencies:
+        agency = Agency.from_dict(raw)
+        agency_name = _agency_key(agency.company_name)
+        person_name = _agency_key(f"{agency.first_name} {agency.last_name}".strip())
+        if agency_name in existing_agencies:
+            continue
+        if person_name and person_name in existing_contacts:
+            continue
+        if listings and not agency_has_unsourced_listing.get(agency_name, False):
+            continue
+        filtered.append(raw)
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +449,7 @@ def enrich_agency(payload: dict) -> dict:
         "individual_email_source": "",
         "domains_found": 0,
         "google_domains": [],
-        "company_name_cleaned": _clean_company_name_for_lusha(agency.company_name),
+        "company_name_cleaned": (_company_name_variants_for_lusha(agency.company_name, agency.source)[-1]),
         "lusha_search_mode": "",
         "domain_used": "",
         "raw_contacts_found": 0,
@@ -251,7 +476,10 @@ def enrich_agency(payload: dict) -> dict:
             elif not diagnostics.get("reason"):
                 diagnostics["reason"] = company_diag.get("reason", "fallback_company_no_contact")
     else:
-        diagnostics.update(_enrich_company(agency, country, country_code))
+        company_diag = _enrich_company(agency, country, country_code)
+        diagnostics.update(company_diag)
+        if not agency.contacts and company_diag.get("domain_used"):
+            _enrich_via_website(agency, company_diag["domain_used"], diagnostics)
 
     diagnostics["has_contact"] = bool(agency.contacts)
     diagnostics["final_contacts_found"] = len(agency.contacts)
@@ -262,7 +490,7 @@ def enrich_agency(payload: dict) -> dict:
 
 def _enrich_individual(agency: Agency) -> dict:
     """Port: Filter1 → Lusha Search Individuals → Normalize Individual Result."""
-    cleaned_company = _clean_company_name_for_lusha(agency.company_name)
+    cleaned_company = _company_name_variants_for_lusha(agency.company_name, agency.source)[-1]
     diag = {
         "reason": "",
         "individual_email_source": "",
@@ -322,7 +550,7 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
         "reason": "",
         "domains_found": 0,
         "google_domains": [],
-        "company_name_cleaned": _clean_company_name_for_lusha(company),
+        "company_name_cleaned": (_company_name_variants_for_lusha(company, agency.source)[-1] if company else ""),
         "lusha_search_mode": "",
         "domain_used": "",
         "raw_contacts_found": 0,
@@ -347,6 +575,7 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
 
     # 2. Extract up to 3 domains from organic results
     domains_with_rank: list[tuple[str, int]] = []
+    seen_domains: set[str] = set()
     for result in search_results:
         organic = result.get("organicResults") or []
         for rank, hit in enumerate(organic[:3], start=1):
@@ -354,8 +583,9 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
             import re
             match = re.match(r"^https?://(?:www\.)?([^/]+)", url)
             if match:
-                domain = match.group(1)
-                if not _is_blocked_domain(domain):
+                domain = match.group(1).lower().strip()
+                if domain and domain not in seen_domains and not _is_blocked_domain(domain):
+                    seen_domains.add(domain)
                     domains_with_rank.append((domain, rank))
     diag["domains_found"] = len(domains_with_rank)
     diag["google_domains"] = [
@@ -371,6 +601,7 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
     all_contacts: list[dict] = []
     last_domain_tried = ""
     last_mode_when_empty = ""
+    company_variants = _company_name_variants_for_lusha(company, agency.source)
     for domain, domain_rank in domains_with_rank:
         last_domain_tried = domain
         modes = [
@@ -379,51 +610,57 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
             ("company_domain_only_country", country, None),
             ("company_domain_only_global", None, None),
         ]
-        for mode, search_country, job_titles in modes:
-            try:
-                raw_contacts = lusha_client.search_contacts_by_domain(
-                    domain=domain,
-                    country=search_country,
-                    job_titles=job_titles,
-                    company_name=diag["company_name_cleaned"],
-                    limit=LUSHA_MAX_REVEALS_PER_AGENCY,
-                )
-            except Exception:
-                logger.exception("Lusha search failed for domain=%s mode=%s", domain, mode)
-                last_mode_when_empty = f"{mode}_exception"
-                continue
-
-            diag["lusha_search_mode"] = mode
-            diag["domain_used"] = domain
-            if not raw_contacts:
-                last_mode_when_empty = f"{mode}_no_raw"
-                continue
-
-            diag["raw_contacts_found"] += len(raw_contacts)
-
-            # 4. Enrich each contact to get email addresses
-            enriched = []
-            for rc in raw_contacts:
-                if rc.get("_already_enriched"):
-                    enriched.append(rc)
-                    continue
-                contact_id = rc.get("contactId") or rc.get("id")
-                if not contact_id:
-                    # Some search endpoints return full data directly
-                    enriched.append(rc)
-                    continue
+        for company_variant in company_variants:
+            for mode, search_country, job_titles in modes:
                 try:
-                    full = lusha_client.enrich_contact(contact_id)
-                    if full:
-                        enriched.append(full)
+                    raw_contacts = lusha_client.search_contacts_by_domain(
+                        domain=domain,
+                        country=search_country,
+                        job_titles=job_titles,
+                        company_name=company_variant,
+                        limit=LUSHA_MAX_REVEALS_PER_AGENCY,
+                    )
                 except Exception:
-                    logger.debug("Enrich failed for contact_id=%s", contact_id)
+                    logger.exception("Lusha search failed for domain=%s mode=%s", domain, mode)
+                    last_mode_when_empty = f"{mode}_exception"
+                    diag["company_name_cleaned"] = company_variant
+                    continue
 
-            best = lusha_client.pick_best_contacts(enriched, domain_rank)
-            all_contacts.extend(best)
-            if best:
+                diag["lusha_search_mode"] = mode
+                diag["domain_used"] = domain
+                diag["company_name_cleaned"] = company_variant
+                if not raw_contacts:
+                    last_mode_when_empty = f"{mode}_no_raw"
+                    continue
+
+                diag["raw_contacts_found"] += len(raw_contacts)
+
+                # 4. Enrich each contact to get email addresses
+                enriched = []
+                for rc in raw_contacts:
+                    if rc.get("_already_enriched"):
+                        enriched.append(rc)
+                        continue
+                    contact_id = rc.get("contactId") or rc.get("id")
+                    if not contact_id:
+                        # Some search endpoints return full data directly
+                        enriched.append(rc)
+                        continue
+                    try:
+                        full = lusha_client.enrich_contact(contact_id)
+                        if full:
+                            enriched.append(full)
+                    except Exception:
+                        logger.debug("Enrich failed for contact_id=%s", contact_id)
+
+                best = lusha_client.pick_best_contacts(enriched, domain_rank)
+                all_contacts.extend(best)
+                if best:
+                    break
+                last_mode_when_empty = f"{mode}_no_email"
+
+            if all_contacts:
                 break
-            last_mode_when_empty = f"{mode}_no_email"
 
         if all_contacts:
             break
@@ -438,6 +675,46 @@ def _enrich_company(agency: Agency, country: str, country_code: str) -> dict:
             diag["domain_used"] = last_domain_tried
             diag["lusha_search_mode"] = last_mode_when_empty or "company_exhausted"
     return diag
+
+
+# ---------------------------------------------------------------------------
+# Website scrape fallback (when Lusha finds a domain but zero contacts)
+# ---------------------------------------------------------------------------
+
+def _enrich_via_website(agency: Agency, domain: str, diagnostics: dict) -> None:
+    """
+    Scrape *domain* for email addresses and populate agency.contacts.
+    Updates *diagnostics* in-place: reason, lusha_search_mode,
+    raw_contacts_found, final_contacts_found.
+    """
+    try:
+        emails = website_scraper.scrape_emails_from_domain(domain)
+    except Exception:
+        logger.exception("Website scrape failed for domain=%s", domain)
+        diagnostics["reason"] = "website_exception"
+        return
+
+    diagnostics["lusha_search_mode"] = "website_scrape"
+    if not emails:
+        diagnostics["reason"] = "website_no_emails"
+        return
+
+    diagnostics["reason"] = "website_success"
+    diagnostics["raw_contacts_found"] = len(emails)
+    contacts = [
+        {
+            "full_name": "",
+            "job_title": "",
+            "email": email,
+            "email_confidence": "website",
+            "linkedin_url": "",
+            "seniority_rank": 0,
+            "domain_rank": 1,
+        }
+        for email in emails[:3]
+    ]
+    agency.contacts = contacts
+    diagnostics["final_contacts_found"] = len(contacts)
 
 
 # ---------------------------------------------------------------------------

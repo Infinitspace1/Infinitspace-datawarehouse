@@ -135,10 +135,14 @@ class ImmobilienscoutAdapter:
                 "lon",
             )
         )
-        city_value = _pick(raw_item, "normalized/address/city", "geo_city", "city") or city
-        district = _pick(raw_item, "geo_quarter", "district", "geo_ot", "normalized/address/region")
+        # normalized/address/region = actual city ("München"); normalized/address/city = neighborhood ("Schwabing-Ost")
+        city_value = _pick(raw_item, "normalized/address/region", "adTargetingParameters/geo_krs", "geo_city", "city") or city
+        district = _pick(raw_item, "normalized/address/city", "geo_quarter", "district", "geo_ot")
         postal_code = _pick(raw_item, "normalized/address/zip", "geo_plz", "postalCode", "zipCode")
         street = _pick(raw_item, "normalized/address/street", "geo_street", "street")
+        # IS24 hides some addresses with a German placeholder text — discard those
+        if street and ("vollständige adresse" in str(street).lower() or "vom anbieter" in str(street).lower()):
+            street = None
         house_number = _pick(raw_item, "normalized/address/houseNumber", "geo_houseNumber", "houseNumber")
         address = f"{street} {house_number}".strip() if street else _pick(raw_item, "address", "location")
         if not address:
