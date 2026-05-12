@@ -75,7 +75,7 @@ def _save_token_cache(access_token: str, refresh_token: str, expires_at: datetim
         }))
         logger.debug("Nexudus token cache updated")
     except Exception as e:
-        logger.warning(f"Could not write token cache: {e}")
+        logger.debug(f"Could not write token cache: {e}")
 
     # Always log the refresh token so it can be set as an Azure app setting
     logger.info(

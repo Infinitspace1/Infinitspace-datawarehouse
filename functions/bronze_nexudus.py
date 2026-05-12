@@ -281,14 +281,16 @@ async def _sync_coworker_invoices(
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
-    lookback_days: int = 2,
+    lookback_days: int | None = None,
 ) -> tuple[list[dict], list[int]]:
-    # Use Nexudus API filter: invoices updated in the last N days
-    since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime(
+    days = lookback_days if lookback_days is not None else int(
+        os.getenv("NEXUDUS_INVOICE_LOOKBACK_DAYS", "2")
+    )
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
         "%Y-%m-%dT%H:%M:%S"
     )
     extra_params = {"from_CoworkerInvoice_UpdatedOn": since}
-    logger.info("Coworker invoices: fetching updated since %s", since)
+    logger.info("Coworker invoices: fetching updated since %s (%s-day window)", since, days)
 
     async with RunTracker("nexudus", "coworker_invoices", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("billing/coworkerinvoices", extra_params=extra_params)
