@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from shared.location_scraper.adapters.idealista import IdealistaAdapter
 from shared.location_scraper.adapters.immobilienscout import ImmobilienscoutAdapter
 from shared.location_scraper.adapters.otodom import OtodomAdapter
+from shared.location_scraper.activities.resolve import resolve_source
+from shared.location_scraper.activities.scrape import normalize_listings, start_apify_run
 
 
 def test_build_input_caps_max_items():
@@ -16,6 +20,32 @@ def test_build_input_common_env_max_items_applies_to_all_actors(monkeypatch):
     assert ImmobilienscoutAdapter().build_input("https://immobilienscout24.de")["maxItems"] == 42
     assert IdealistaAdapter().build_input("https://idealista.com")["maxItems"] == 42
     assert OtodomAdapter().build_input("https://otodom.pl")["maxItems"] == 42
+
+
+def test_build_input_can_omit_max_items_for_unlimited_monthly_runs():
+    assert "maxItems" not in ImmobilienscoutAdapter().build_input("https://immobilienscout24.de", max_items=None)
+    assert "maxItems" not in IdealistaAdapter().build_input("https://idealista.com", max_items=None)
+    assert "maxItems" not in OtodomAdapter().build_input("https://otodom.pl", max_items=None)
+
+
+def test_start_apify_run_omits_max_items_when_source_config_is_unlimited(monkeypatch):
+    captured = {}
+
+    def fake_start_run(actor_id, actor_input):
+        captured["actor_id"] = actor_id
+        captured["actor_input"] = actor_input
+        return {"run_id": "apify-run", "dataset_id": "dataset"}
+
+    monkeypatch.setattr(
+        "shared.location_scraper.activities.scrape.apify_client.start_run",
+        fake_start_run,
+    )
+
+    cfg = resolve_source("berlin", None, "monthly-berlin-2026-05", unlimited_items=True)
+    result = start_apify_run(cfg.to_dict())
+
+    assert result["actor"] == "immobilienscout"
+    assert "maxItems" not in captured["actor_input"]
 
 
 def test_normalize_skips_small_surface():
@@ -112,3 +142,38 @@ def test_normalize_maps_nested_apify_json_shape():
     assert listing.external_id == "167325674"
     assert listing.available_surface_m2 == 1800.0
     assert listing.city == "münchen"
+
+
+def test_normalize_geocodes_missing_coordinates(monkeypatch):
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "test-key")
+    mock_cache = MagicMock()
+    mock_cache.get_or_geocode.return_value = {
+        "latitude": 48.1372,
+        "longitude": 11.5756,
+        "formatted_address": "80636 Munich, Germany",
+    }
+    monkeypatch.setattr(
+        "shared.location_scraper.activities.scrape.GeocodingCache",
+        lambda: mock_cache,
+    )
+
+    raw = {
+        "id": "de-no-coords",
+        "obj_netFloorSpace": "2.000",
+        "obj_totalRent": "25000",
+        "geo_city": "Munich",
+        "geo_quarter": "Maxvorstadt",
+        "geo_plz": "80636",
+        "address": "80636 Munich, Maxvorstadt (incomplete address)",
+    }
+
+    listings = normalize_listings(
+        {"actor": "immobilienscout", "items": [raw], "city": "munich"}
+    )
+
+    assert len(listings) == 1
+    assert listings[0]["latitude"] == 48.1372
+    assert listings[0]["longitude"] == 11.5756
+    assert listings[0]["link_to_gmap"] == "https://www.google.com/maps/search/?api=1&query=48.1372,11.5756"
+    mock_cache.get_or_geocode.assert_called_once()
+    assert "incomplete address" not in mock_cache.get_or_geocode.call_args.args[0]

@@ -52,13 +52,11 @@ def get_run_status(run_id: str) -> dict:
     }
 
 
-def fetch_dataset(dataset_id: str, limit: int = 500) -> list[dict[str, Any]]:
+def fetch_dataset(dataset_id: str, limit: int | None = None) -> list[dict[str, Any]]:
     """Download all items from an Apify dataset."""
-    items = list(
-        _client()
-        .dataset(dataset_id)
-        .iterate_items(limit=limit)
-    )
+    dataset = _client().dataset(dataset_id)
+    iterator = dataset.iterate_items(limit=limit) if limit else dataset.iterate_items()
+    items = list(iterator)
     logger.info("Fetched %d items from dataset %s", len(items), dataset_id)
     return items
 

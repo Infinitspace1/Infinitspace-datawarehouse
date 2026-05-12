@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from decimal import Decimal
 from typing import Any
 
 import pyodbc
 
+from shared.gmaps.geocoding import GeocodingCache
 from shared.azure_clients.sql_client import get_sql_client
 from shared.location_scraper.config import get_country_code_for_city
+from shared.location_scraper.geocoding import geocode_missing_coordinates
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,12 @@ ORDER BY item_index
 """
 
 _DELETE_RUN = "DELETE FROM silver.location_scraper_globe_v2 WHERE run_id = ?"
+
+_READ_HUBSPOT_EXPORTS = """
+SELECT item_index, hubspot_exported, hubspot_re_location_id
+FROM silver.location_scraper_globe_v2
+WHERE run_id = ?
+"""
 
 _REFRESH_QUALITY = "EXEC silver.sp_refresh_location_scraper_globe_quality @run_id = ?"
 
@@ -41,9 +50,10 @@ INSERT INTO silver.location_scraper_globe_v2 (
     lusha_email_1, lusha_contact_1, lusha_title_1, lusha_confidence_1,
     lusha_email_2, lusha_contact_2, lusha_title_2, lusha_confidence_2,
     lusha_email_3, lusha_contact_3, lusha_title_3, lusha_confidence_3,
+    hubspot_exported, hubspot_re_location_id,
     refreshed_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETUTCDATE())
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETUTCDATE())
 """
 
 _READ_LUSHA_CONTACTS_FOR_SOURCE = """
@@ -248,13 +258,43 @@ def _load_lusha_contacts_by_building(sql, source: str) -> dict[tuple[str, str, s
     return by_key
 
 
-def _map_row(row: dict[str, Any], contacts_by_key: dict[tuple[str, str, str], list[dict[str, Any]]]) -> tuple:
+def _map_row(
+    row: dict[str, Any],
+    contacts_by_key: dict[tuple[str, str, str], list[dict[str, Any]]],
+    hubspot_exports_by_item: dict[int, dict[str, Any]],
+    geocode_cache: GeocodingCache | None = None,
+) -> tuple:
     payload = json.loads(row["payload_json"])
     source = row["source"]
 
     country_default = get_country_code_for_city(row["city"]) or {"otodom": "PL", "immobilienscout": "DE"}.get(source)
     latitude = _pick_float(payload, "basicInfo.address.lat", "sections[3].location.lat", "ubication.latitude", "latitude", "geo_wgs84Lat", "normalized.address.latitude")
     longitude = _pick_float(payload, "basicInfo.address.lon", "sections[3].location.lng", "ubication.longitude", "longitude", "geo_wgs84Lon", "normalized.address.longitude")
+    external_id = _pick_str(payload, "normalized.listingId", "header.id", "basicInfo.id", "adid", "id")
+    listing_url = _pick_str(payload, "normalized.url", "detailWebLink", "propertyUrl", "basicInfo.url", "url")
+    address = _pick_str(payload, "basicInfo.address.line", "normalized.address.formatted", "ubication.title", "street", "location", "basicInfo.address")
+    postal_code = _pick_str(payload, "contactInfo.address.postalCode", "normalized.address.zip", "adTargetingParameters.obj_zipCode")
+    district = _pick_str(payload, "district", "basicInfo.district", "geo_ot", "adTargetingParameters.obj_regio4", "subdistrict", "basicInfo.neighborhood", "ubication.administrativeAreaLevel3")
+    city = _pick_str(payload, "basicInfo.municipality", "normalized.address.region", "normalized.address.city", "city", "ubication.administrativeAreaLevel2") or row["city"]
+    country_code = (_pick_str(payload, "countryCode", "normalized.countryCode", "country", "basicInfo.country") or country_default or "").upper()
+
+    if latitude is None or longitude is None:
+        geocoded = geocode_missing_coordinates(
+            cache=geocode_cache,
+            source=source,
+            run_city=row["city"],
+            address=address,
+            postal_code=postal_code,
+            district=district,
+            city=city,
+            external_id=external_id,
+        )
+        if geocoded:
+            latitude = geocoded["latitude"]
+            longitude = geocoded["longitude"]
+            if not address:
+                address = geocoded.get("formatted_address")
+
     floor = _pick_floor(payload, source)
     contacts = (
         contacts_by_key.get(_building_key(latitude, longitude, floor))
@@ -273,21 +313,24 @@ def _map_row(row: dict[str, Any], contacts_by_key: dict[tuple[str, str, str], li
         else _pick_str(payload, "contactInfo.phone1.phoneNumberForMobileDialing", "normalized.contact.phone", "contact.phoneNumbers[0].text", "sellerPhone", "obj_phoneNumber") or _first_seller_phone(payload)
     )
 
+    item_index = int(row["item_index"])
+    hubspot_export = hubspot_exports_by_item.get(item_index, {})
+
     return (
         row["run_id"],
-        int(row["item_index"]),
+        item_index,
         source,
         row["city"],
         row["inserted_at"],
-        _pick_str(payload, "normalized.listingId", "header.id", "basicInfo.id", "adid", "id"),
-        _pick_str(payload, "normalized.url", "detailWebLink", "propertyUrl", "basicInfo.url", "url"),
+        external_id,
+        listing_url,
         latitude,
         longitude,
-        _pick_str(payload, "basicInfo.address.line", "normalized.address.formatted", "ubication.title", "street", "location", "basicInfo.address"),
-        _pick_str(payload, "contactInfo.address.postalCode", "normalized.address.zip", "adTargetingParameters.obj_zipCode"),
-        _pick_str(payload, "district", "basicInfo.district", "geo_ot", "adTargetingParameters.obj_regio4", "subdistrict", "basicInfo.neighborhood", "ubication.administrativeAreaLevel3"),
-        _pick_str(payload, "basicInfo.municipality", "normalized.address.region", "city", "ubication.administrativeAreaLevel2") or row["city"],
-        (_pick_str(payload, "countryCode", "normalized.countryCode", "country", "basicInfo.country") or country_default or "").upper(),
+        address,
+        postal_code,
+        district,
+        city,
+        country_code,
         _pick_decimal(payload, "price", "priceInfo.amount", "basicInfo.price", "normalized.price.amount", "adTargetingParameters.obj_rentPerMonth", "obj_totalRent"),
         _pick_decimal(payload, "pricePerM2", "priceByArea", "adTargetingParameters.obj_rentPerSqM", "obj_baseRent", "basicInfo.priceByArea"),
         _pick_decimal(payload, "area", "moreCharacteristics.constructedArea", "basicInfo.size", "adTargetingParameters.obj_mainFloorSpace", "normalized.area.livingSpace", "obj_netFloorSpace"),
@@ -296,6 +339,8 @@ def _map_row(row: dict[str, Any], contacts_by_key: dict[tuple[str, str, str], li
         company_name,
         phone,
         *_contact_slots(contacts),
+        1 if hubspot_export.get("hubspot_exported") else 0,
+        hubspot_export.get("hubspot_re_location_id"),
     )
 
 
@@ -303,13 +348,27 @@ def materialize_globe_run(payload: dict[str, Any]) -> dict[str, int]:
     run_id = payload["run_id"]
     sql = get_sql_client()
     rows = sql.execute_query(_READ_RAW, (run_id,))
+    try:
+        hubspot_export_rows = sql.execute_query(_READ_HUBSPOT_EXPORTS, (run_id,))
+    except pyodbc.ProgrammingError as exc:
+        sqlstate = exc.args[0] if exc.args else ""
+        if sqlstate != "42S22":
+            raise
+        logger.warning(
+            "location_scraper globe HubSpot export preservation skipped; run the globe v2 SQL migration. run_id=%s error=%s",
+            run_id,
+            exc,
+        )
+        hubspot_export_rows = []
+    hubspot_exports_by_item = {int(row["item_index"]): row for row in hubspot_export_rows}
 
     sql.execute_non_query(_DELETE_RUN, (run_id,))
     if not rows:
         return {"rows_written": 0}
 
     contacts_by_key = _load_lusha_contacts_by_building(sql, rows[0]["source"])
-    insert_rows = [_map_row(r, contacts_by_key) for r in rows]
+    geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else None
+    insert_rows = [_map_row(r, contacts_by_key, hubspot_exports_by_item, geocode_cache) for r in rows]
     written = sql.execute_many(_INSERT_ROW, insert_rows)
     logger.info("location_scraper globe materialized run_id=%s rows=%d", run_id, len(insert_rows))
     return {"rows_written": len(insert_rows) if written == -1 else int(written)}

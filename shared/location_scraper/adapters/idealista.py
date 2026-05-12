@@ -46,9 +46,8 @@ def _parse_date(val) -> Optional[str]:
 class IdealistaAdapter:
     actor_id: str = IDEALISTA_ACTOR_ID
 
-    def build_input(self, start_url: str) -> dict:
-        return {
-            "maxItems": get_actor_max_items(default=100),
+    def build_input(self, start_url: str, max_items: int | None | str = "default") -> dict:
+        payload = {
             "monitoringMode": False,
             "proxy": {
                 "useApifyProxy": True,
@@ -56,6 +55,12 @@ class IdealistaAdapter:
             },
             "startUrls": [start_url],
         }
+        if max_items != "default":
+            if max_items is not None:
+                payload["maxItems"] = max_items
+            return payload
+        payload["maxItems"] = get_actor_max_items(default=100)
+        return payload
 
     def normalize(self, raw_item: dict, city: str) -> Optional[Listing]:
         lat = _get(raw_item, "ubication/latitude")

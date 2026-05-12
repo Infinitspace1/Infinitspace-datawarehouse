@@ -10,7 +10,7 @@ Scrapes commercial office listings from **Idealista** (Spain / Italy), **Otodom*
 
 ```mermaid
 sequenceDiagram
-    participant C as Caller
+    participant C as Caller / Monthly Timer
     participant H as HTTP Trigger<br/>/api/scrape
     participant O as Durable Orchestrator
     participant A as Apify
@@ -22,6 +22,7 @@ sequenceDiagram
     H->>S: INSERT log row (status=running)
     H->>O: start orchestrator
     H-->>C: 202 Accepted {run_id, status_url}
+    C->>O: Monthly timer starts one unlimited run per configured city
 
     O->>O: resolve_source(city)
     O->>A: start actor run (async)
@@ -59,6 +60,12 @@ sequenceDiagram
 | 9 | `ls_consolidate_contacts` | Dedup + seniority sort + top-3 per agency |
 | 10 | `ls_upsert_sql` | Single MERGE pass into SQL |
 | 11 | `ls_write_logs` | Mark run completed in SQL + App Insights |
+
+### Monthly schedule
+
+`location_scraper_monthly` runs on `LOCATION_SCRAPER_MONTHLY_SCHEDULE`, default `0 0 1 1 * *` (01:00 UTC on the first day of each month). It starts one Durable orchestration per city with `unlimited_items=true`, so the Apify actor input omits `maxItems` and the dataset fetch reads all returned items.
+
+Scheduled cities: `barcelona`, `madrid`, `milan`, `berlin`, `munich`, `hamburg`, `cologne`, `frankfurt`, `dusseldorf`, `stuttgart`, `warsaw`.
 
 ---
 
@@ -243,7 +250,8 @@ For raw JSON field discovery (before building/changing a globe view), run:
 |----------|----------|-------------|
 | `APIFY_TOKEN` | Yes | Apify API token |
 | `LUSHA_API_KEY` | Yes | Lusha API key (sent as `api_key` header) |
-| `LOCATION_SCRAPER_MAX_ITEMS` | No | Common max items cap applied to all scraper actors (`idealista`, `otodom`, `immobilienscout`). If unset, actor defaults are used (100 / 200 / 100). |
+| `LOCATION_SCRAPER_MAX_ITEMS` | No | Common max items cap applied to manually triggered scraper actors (`idealista`, `otodom`, `immobilienscout`). If unset, actor defaults are used (100 / 200 / 100). Monthly scheduled runs explicitly omit `maxItems`. |
+| `LOCATION_SCRAPER_MONTHLY_SCHEDULE` | No | NCRONTAB schedule for the monthly all-city scrape; default `0 0 1 1 * *`. |
 | `AZURE_SQL_CONNECTION_STRING` | Yes | Full ODBC connection string (or use SERVER+DATABASE+UID+PWD) |
 | `AzureWebJobsStorage` | Yes | Storage account connection string (Durable Functions state) |
 | `ENABLE_LOCATION_SCRAPER_FUNCTIONS` | Yes | Set to `1` to register functions |
