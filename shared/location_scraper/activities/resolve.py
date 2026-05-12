@@ -10,7 +10,12 @@ from shared.location_scraper.config import COUNTRY_CONFIG
 from shared.location_scraper.models import SourceConfig
 
 
-def resolve_source(city: str, shape: str | None, run_id: str) -> SourceConfig:
+def resolve_source(
+    city: str,
+    shape: str | None,
+    run_id: str,
+    unlimited_items: bool = False,
+) -> SourceConfig:
     """
     Resolve city to a SourceConfig.
     Raises ValueError for unrecognised cities.
@@ -51,6 +56,7 @@ def resolve_source(city: str, shape: str | None, run_id: str) -> SourceConfig:
             actor=actor,
             actor_id=cfg["actor_id"],
             run_id=run_id,
+            unlimited_items=unlimited_items,
         )
 
     available = sorted(

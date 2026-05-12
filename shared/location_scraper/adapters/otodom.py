@@ -36,16 +36,21 @@ def _parse_date(val) -> Optional[str]:
 class OtodomAdapter:
     actor_id: str = OTODOM_ACTOR_ID
 
-    def build_input(self, start_url: str) -> dict:
-        return {
+    def build_input(self, start_url: str, max_items: int | None | str = "default") -> dict:
+        payload = {
             "startUrls": [{"url": start_url}],
-            "maxItems": get_actor_max_items(default=200),
             "extractDetails": True,
             "proxyConfiguration": {
                 "useApifyProxy": True,
                 "apifyProxyGroups": ["RESIDENTIAL"],
             },
         }
+        if max_items != "default":
+            if max_items is not None:
+                payload["maxItems"] = max_items
+            return payload
+        payload["maxItems"] = get_actor_max_items(default=200)
+        return payload
 
     def normalize(self, raw_item: dict, city: str) -> Optional[Listing]:
         # The Otodom dataset city field is in Polish; filter to Warsaw only.

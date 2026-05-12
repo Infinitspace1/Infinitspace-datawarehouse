@@ -3,6 +3,7 @@ Location Scraper — Azure Durable Functions module.
 
 Functions registered here:
   - location_scraper_http   POST /api/scrape  (HTTP starter)
+  - location_scraper_monthly  (monthly timer starter)
   - location_scraper_orch   (Durable orchestrator)
   - ls_resolve_source       (activity)
   - ls_start_apify_run      (activity)
@@ -28,8 +29,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import azure.durable_functions as df
 import azure.functions as func
@@ -46,6 +48,21 @@ from shared.location_scraper.run_quality import compute_run_quality_payload
 logger = logging.getLogger(__name__)
 
 bp = df.Blueprint()
+
+MONTHLY_SCHEDULE = os.getenv("LOCATION_SCRAPER_MONTHLY_SCHEDULE", "0 0 1 1 * *")
+MONTHLY_CITIES = (
+    "barcelona",
+    "madrid",
+    "milan",
+    "berlin",
+    "munich",
+    "hamburg",
+    "cologne",
+    "frankfurt",
+    "dusseldorf",
+    "stuttgart",
+    "warsaw",
+)
 
 
 def _safe_mark_run_failed(run_id: str | None, error: str) -> None:
@@ -144,6 +161,52 @@ async def location_scraper_http(
 
 
 # ---------------------------------------------------------------------------
+# Timer Trigger — monthly scrape for all supported rollout cities
+# ---------------------------------------------------------------------------
+
+@bp.timer_trigger(schedule=MONTHLY_SCHEDULE, arg_name="timer", run_on_startup=False)
+@bp.durable_client_input(client_name="client")
+async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
+    """Start one unlimited scrape orchestration per configured city each month."""
+    now = datetime.now(timezone.utc)
+    month_key = now.strftime("%Y-%m")
+
+    if timer.past_due:
+        logger.warning("Monthly location scraper timer is past due")
+
+    started = []
+    for city in MONTHLY_CITIES:
+        run_id = f"monthly-{city}-{month_key}"
+        instance_id = f"location-scraper-monthly-{city}-{month_key}"
+        existing = await client.get_status(instance_id)
+        existing_status = str(getattr(existing, "runtime_status", "")) if existing else ""
+        if existing:
+            logger.info(
+                "Monthly location scraper instance already exists; skipping city=%s instance_id=%s status=%s",
+                city,
+                instance_id,
+                existing_status,
+            )
+            continue
+
+        try:
+            log_act.init_run_log(run_id, city)
+        except Exception:
+            logger.exception("Could not insert monthly log row for run_id=%s", run_id)
+
+        orchestrator_input = {
+            "city": city,
+            "shape": None,
+            "run_id": run_id,
+            "unlimited_items": True,
+        }
+        await client.start_new("location_scraper_orch", instance_id, orchestrator_input)
+        started.append({"city": city, "run_id": run_id, "instance_id": instance_id})
+
+    logger.info("Monthly location scraper started %d city runs: %s", len(started), started)
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -157,7 +220,12 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
         # 1. Resolve city → SourceConfig
         source_config: dict = yield context.call_activity(
             "ls_resolve_source",
-            {"city": city, "shape": shape, "run_id": run_id},
+            {
+                "city": city,
+                "shape": shape,
+                "run_id": run_id,
+                "unlimited_items": bool(payload.get("unlimited_items")),
+            },
         )
 
         # 2. Start Apify actor (async — do NOT block on completion)
@@ -282,6 +350,7 @@ def ls_resolve_source(payload: dict) -> dict:
         city=payload["city"],
         shape=payload.get("shape"),
         run_id=payload["run_id"],
+        unlimited_items=bool(payload.get("unlimited_items")),
     )
     return cfg.to_dict()
 

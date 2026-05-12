@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 class SourceAdapter(Protocol):
     actor_id: str
 
-    def build_input(self, start_url: str) -> dict:
+    def build_input(self, start_url: str, max_items: int | None | str = "default") -> dict:
         """Return the Apify actor input dict for this source."""
         ...
 

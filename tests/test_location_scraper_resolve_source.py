@@ -85,9 +85,10 @@ class TestResolveSource:
 
     def test_to_dict_roundtrip(self):
         from shared.location_scraper.models import SourceConfig
-        cfg = resolve_source("warsaw", None, "run-99")
+        cfg = resolve_source("warsaw", None, "run-99", unlimited_items=True)
         d = cfg.to_dict()
         restored = SourceConfig.from_dict(d)
         assert restored.city == cfg.city
         assert restored.actor_id == cfg.actor_id
         assert restored.start_url == cfg.start_url
+        assert restored.unlimited_items is True

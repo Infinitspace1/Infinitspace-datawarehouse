@@ -196,6 +196,7 @@ class SourceConfig:
     actor: str
     actor_id: str
     run_id: str
+    unlimited_items: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -206,6 +207,7 @@ class SourceConfig:
             "actor": self.actor,
             "actor_id": self.actor_id,
             "run_id": self.run_id,
+            "unlimited_items": self.unlimited_items,
         }
 
     @staticmethod

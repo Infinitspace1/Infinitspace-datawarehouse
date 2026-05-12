@@ -6,14 +6,41 @@ These are thin wrappers that the Durable orchestrator calls as activities.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
+from shared.gmaps.geocoding import GeocodingCache
 from shared.location_scraper import clients as _c
 from shared.location_scraper.adapters.registry import ADAPTER_REGISTRY
 from shared.location_scraper.clients import apify as apify_client
+from shared.location_scraper.geocoding import geocode_missing_coordinates
 from shared.location_scraper.models import Listing, SourceConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_geocode_fallback(listing: Listing, run_city: str, cache: GeocodingCache | None) -> bool:
+    if listing.latitude is not None and listing.longitude is not None:
+        return False
+    result = geocode_missing_coordinates(
+        cache=cache,
+        source=listing.source,
+        run_city=run_city,
+        address=listing.address,
+        postal_code=listing.postal_code,
+        district=listing.district,
+        city=listing.city,
+        external_id=listing.external_id,
+    )
+    if not result:
+        return False
+
+    listing.latitude = result["latitude"]
+    listing.longitude = result["longitude"]
+    listing.link_to_gmap = f"https://www.google.com/maps/search/?api=1&query={listing.latitude},{listing.longitude}"
+    if not listing.address:
+        listing.address = result.get("formatted_address")
+    return True
 
 
 def start_apify_run(config: dict) -> dict:
@@ -23,7 +50,10 @@ def start_apify_run(config: dict) -> dict:
     """
     src = SourceConfig.from_dict(config)
     adapter = ADAPTER_REGISTRY[src.actor]
-    actor_input = adapter.build_input(src.start_url)
+    actor_input = adapter.build_input(
+        src.start_url,
+        max_items=None if src.unlimited_items else "default",
+    )
     result = apify_client.start_run(src.actor_id, actor_input)
     result["actor"] = src.actor
     return result
@@ -51,12 +81,23 @@ def normalize_listings(payload: dict) -> list[dict]:
 
     adapter = ADAPTER_REGISTRY[actor]
     results = []
+    geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else None
+    geocoded_count = 0
     for raw in items:
         try:
             listing = adapter.normalize(raw, city)
             if listing is not None:
+                if _apply_geocode_fallback(listing, city, geocode_cache):
+                    geocoded_count += 1
                 results.append(listing.to_dict())
         except Exception:
             logger.exception("normalize error for item %s", raw.get("id") or raw.get("adid"))
-    logger.info("Normalized %d/%d items for actor=%s city=%s", len(results), len(items), actor, city)
+    logger.info(
+        "Normalized %d/%d items for actor=%s city=%s geocoded_missing_coords=%d",
+        len(results),
+        len(items),
+        actor,
+        city,
+        geocoded_count,
+    )
     return results

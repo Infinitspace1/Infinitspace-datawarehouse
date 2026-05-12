@@ -48,6 +48,9 @@ BEGIN
         lusha_title_3       NVARCHAR(255)   NULL,
         lusha_confidence_3  DECIMAL(5,2)    NULL,
 
+        hubspot_exported        BIT           NOT NULL DEFAULT 0,
+        hubspot_re_location_id  NVARCHAR(64)  NULL,
+
         refreshed_at   DATETIME2       NOT NULL DEFAULT GETUTCDATE(),
 
         CONSTRAINT PK_location_scraper_globe_v2
@@ -84,6 +87,11 @@ BEGIN
         ALTER TABLE silver.location_scraper_globe_v2 ADD lusha_title_3 NVARCHAR(255) NULL;
     IF COL_LENGTH(N'silver.location_scraper_globe_v2', N'lusha_confidence_3') IS NULL
         ALTER TABLE silver.location_scraper_globe_v2 ADD lusha_confidence_3 DECIMAL(5,2) NULL;
+
+    IF COL_LENGTH(N'silver.location_scraper_globe_v2', N'hubspot_exported') IS NULL
+        ALTER TABLE silver.location_scraper_globe_v2 ADD hubspot_exported BIT NOT NULL CONSTRAINT DF_location_scraper_globe_v2_hubspot_exported DEFAULT 0;
+    IF COL_LENGTH(N'silver.location_scraper_globe_v2', N'hubspot_re_location_id') IS NULL
+        ALTER TABLE silver.location_scraper_globe_v2 ADD hubspot_re_location_id NVARCHAR(64) NULL;
 END
 GO
 

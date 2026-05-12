@@ -86,15 +86,20 @@ def _parse_floor(raw_floor) -> Optional[str]:
 class ImmobilienscoutAdapter:
     actor_id: str = IMMOBILIENSCOUT_ACTOR_ID
 
-    def build_input(self, start_url: str) -> dict:
-        return {
+    def build_input(self, start_url: str, max_items: int | None | str = "default") -> dict:
+        payload = {
             "startUrls": [{"url": start_url}],
-            "maxItems": get_actor_max_items(default=100),
             "maxConcurrency": 10,
             "minConcurrency": 1,
             "maxRequestRetries": 100,
             "proxyConfiguration": {"useApifyProxy": True},
         }
+        if max_items != "default":
+            if max_items is not None:
+                payload["maxItems"] = max_items
+            return payload
+        payload["maxItems"] = get_actor_max_items(default=100)
+        return payload
 
     def normalize(self, raw_item: dict, city: str) -> Optional[Listing]:
         area = _parse_num(
@@ -136,7 +141,7 @@ class ImmobilienscoutAdapter:
             )
         )
         # normalized/address/region = actual city ("München"); normalized/address/city = neighborhood ("Schwabing-Ost")
-        city_value = _pick(raw_item, "normalized/address/region", "adTargetingParameters/geo_krs", "geo_city", "city") or city
+        city_value = _pick(raw_item, "normalized/address/region", "normalized/address/city", "adTargetingParameters/geo_krs", "geo_city", "city") or city
         district = _pick(raw_item, "normalized/address/city", "geo_quarter", "district", "geo_ot")
         postal_code = _pick(raw_item, "normalized/address/zip", "geo_plz", "postalCode", "zipCode")
         street = _pick(raw_item, "normalized/address/street", "geo_street", "street")
