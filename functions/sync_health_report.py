@@ -38,6 +38,16 @@ DEFAULT_RECIPIENTS = (
     "bryan.swannie@infinitspace.com,baptiste.valentin@infinitspace.com"
 )
 
+# Top-level orchestrators that must produce a sync_run row every day.
+# Only covers function-level entries — if any is absent the function never started.
+_EXPECTED_DAILY: frozenset[tuple[str, str, str]] = frozenset([
+    ("nexudus", "bronze_sync", "bronze"),
+    ("ava", "product_availability", "ava"),
+    ("bamboohr", "bamboohr_employees", "bronze"),
+    ("finance_dashboard", "finance_dashboard", "gold"),
+    ("replyio", "sequence_steps", "bronze"),
+])
+
 
 def _parse_recipients() -> list[str]:
     raw = os.getenv("SYNC_REPORT_RECIPIENTS", DEFAULT_RECIPIENTS)
@@ -96,6 +106,15 @@ def _fetch_error_summary(lookback_hours: int) -> list[dict[str, Any]]:
         return []
 
 
+def _find_missing_runs(
+    runs: list[dict[str, Any]],
+    expected: frozenset[tuple[str, str, str]],
+) -> list[tuple[str, str, str]]:
+    """Return expected (source, entity, layer) tuples absent from the current window."""
+    seen = {(r["source_name"], r["entity"], r["layer"]) for r in runs}
+    return sorted(expected - seen)
+
+
 def _fmt_duration(started: datetime | None, finished: datetime | None) -> str:
     if not started or not finished:
         return "—"
@@ -117,10 +136,11 @@ def _fmt_int(value: Any) -> str:
 def _render_html(
     runs: list[dict[str, Any]],
     errors: list[dict[str, Any]],
+    missing: list[tuple[str, str, str]],
     lookback_hours: int,
     as_of: datetime,
-) -> tuple[str, int, int, int]:
-    """Return (html_body, failed_count, running_count, success_count)."""
+) -> tuple[str, int, int, int, int]:
+    """Return (html_body, failed_count, running_count, success_count, missing_count)."""
     failed = [r for r in runs if r["status"] == "failed"]
     running = [r for r in runs if r["status"] == "running"]
     success = [r for r in runs if r["status"] == "success"]
@@ -133,6 +153,21 @@ def _render_html(
         return '<span style="color:#9a6700;font-size:16px;">&#9203;</span>'
 
     rows_html = []
+    for source, entity, layer in missing:
+        rows_html.append(
+            "<tr style='background:#fff8c5;'>"
+            "<td style='padding:6px 10px;text-align:center;'>"
+            "<span style='color:#9a6700;font-size:16px;'>&#9888;</span></td>"
+            f"<td style='padding:6px 10px;'>{html.escape(source)}</td>"
+            f"<td style='padding:6px 10px;'>{html.escape(entity)}</td>"
+            f"<td style='padding:6px 10px;'>{html.escape(layer)}</td>"
+            "<td style='padding:6px 10px;text-align:right;'>—</td>"
+            "<td style='padding:6px 10px;text-align:right;'>—</td>"
+            "<td style='padding:6px 10px;'>—</td>"
+            "<td style='padding:6px 10px;color:#9a6700;font-family:monospace;font-size:12px;'>"
+            "never started in this window</td>"
+            "</tr>"
+        )
     for r in runs:
         err = r.get("error_message") or ""
         if len(err) > 200:
@@ -194,11 +229,12 @@ def _render_html(
             "</table>"
         )
 
-    summary_color = "#cf222e" if failed or running else "#1a7f37"
+    summary_color = "#cf222e" if failed or running or missing else "#1a7f37"
+    missing_part = f" · {len(missing)} never started" if missing else ""
     summary = (
         f"<p style='font-family:-apple-system,Segoe UI,sans-serif;font-size:14px;'>"
         f"<b style='color:{summary_color};'>"
-        f"{len(success)} ok · {len(failed)} failed · {len(running)} still running</b>"
+        f"{len(success)} ok · {len(failed)} failed · {len(running)} still running{missing_part}</b>"
         f"<br><span style='color:#57606a;'>Window: last {lookback_hours}h "
         f"(as of {as_of.strftime('%Y-%m-%d %H:%M UTC')})</span></p>"
     )
@@ -221,7 +257,7 @@ def _render_html(
         "</body></html>"
     )
 
-    return body, len(failed), len(running), len(success)
+    return body, len(failed), len(running), len(success), len(missing)
 
 
 @bp.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
@@ -238,19 +274,22 @@ async def sync_health_report(timer: func.TimerRequest) -> None:
     try:
         runs = _fetch_runs(lookback_hours)
         errors = _fetch_error_summary(lookback_hours)
+        missing = _find_missing_runs(runs, _EXPECTED_DAILY)
         as_of = datetime.now(timezone.utc)
 
-        body, failed, running, success = _render_html(
-            runs, errors, lookback_hours, as_of,
+        body, failed, running, success, n_missing = _render_html(
+            runs, errors, missing, lookback_hours, as_of,
         )
 
         date_str = as_of.strftime("%Y-%m-%d")
-        if failed or running or not runs:
+        if failed or running or n_missing or not runs:
             parts = []
             if failed:
                 parts.append(f"{failed} failed")
             if running:
                 parts.append(f"{running} stuck running")
+            if n_missing:
+                parts.append(f"{n_missing} never started")
             if not runs:
                 parts.append("no runs recorded")
             subject = f"[FAIL] InfinitSpace sync report {date_str} ({', '.join(parts)})"
@@ -259,8 +298,8 @@ async def sync_health_report(timer: func.TimerRequest) -> None:
 
         send_mail(subject=subject, html_body=body, to_recipients=recipients)
         logger.info(
-            "Sync health report sent: subject=%r, recipients=%s, ok=%d, failed=%d, running=%d",
-            subject, recipients, success, failed, running,
+            "Sync health report sent: subject=%r, recipients=%s, ok=%d, failed=%d, running=%d, missing=%d",
+            subject, recipients, success, failed, running, n_missing,
         )
 
     except GraphMailerError as exc:

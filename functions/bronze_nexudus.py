@@ -103,25 +103,26 @@ def _incremental_params(entity: str) -> dict:
 async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
     logger.info("Nexudus -> Bronze sync started")
 
-    try:
-        bearer_token = get_bearer_token()
-    except EnvironmentError as e:
-        logger.error(f"Auth failed: {e}")
-        raise
+    async with RunTracker("nexudus", "bronze_sync", "bronze") as _top:
+        try:
+            bearer_token = get_bearer_token()
+        except EnvironmentError as e:
+            logger.error(f"Auth failed: {e}")
+            raise
 
-    async with NexudusClient(bearer_token) as client:
-        run_id = uuid.uuid4()
-        blob_writer = BlobWriter()
-        writer = BronzeWriter(run_id)
+        async with NexudusClient(bearer_token) as client:
+            run_id = uuid.uuid4()
+            blob_writer = BlobWriter()
+            writer = BronzeWriter(run_id)
 
-        locations = await _sync_locations(client, blob_writer, writer, run_id)
-        products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
-        await _sync_contracts(client, blob_writer, writer, run_id, products)
-        changed_invoices, coworker_ids = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
-        await _sync_coworkers(client, blob_writer, writer, run_id, coworker_ids)
-        await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
-        await _sync_extra_services(client, blob_writer, writer, run_id)
-        await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, changed_invoices)
+            locations = await _sync_locations(client, blob_writer, writer, run_id)
+            products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
+            await _sync_contracts(client, blob_writer, writer, run_id, products)
+            changed_invoices, coworker_ids = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
+            await _sync_coworkers(client, blob_writer, writer, run_id, coworker_ids)
+            await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
+            await _sync_extra_services(client, blob_writer, writer, run_id)
+            await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, changed_invoices)
 
     logger.info(f"Nexudus -> Bronze sync complete [run_id={run_id}]")
 
@@ -280,14 +281,16 @@ async def _sync_coworker_invoices(
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
-    lookback_days: int = 2,
+    lookback_days: int | None = None,
 ) -> tuple[list[dict], list[int]]:
-    # Use Nexudus API filter: invoices updated in the last N days
-    since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime(
+    days = lookback_days if lookback_days is not None else int(
+        os.getenv("NEXUDUS_INVOICE_LOOKBACK_DAYS", "2")
+    )
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
         "%Y-%m-%dT%H:%M:%S"
     )
     extra_params = {"from_CoworkerInvoice_UpdatedOn": since}
-    logger.info("Coworker invoices: fetching updated since %s", since)
+    logger.info("Coworker invoices: fetching updated since %s (%s-day window)", since, days)
 
     async with RunTracker("nexudus", "coworker_invoices", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("billing/coworkerinvoices", extra_params=extra_params)
