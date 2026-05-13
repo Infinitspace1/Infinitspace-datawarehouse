@@ -38,6 +38,7 @@ WHERE run_id = ?
 """
 
 _REFRESH_QUALITY = "EXEC silver.sp_refresh_location_scraper_globe_quality @run_id = ?"
+_REFRESH_GOLD_MAP_MARKERS = "EXEC gold.sp_refresh_location_scraper_map_markers"
 
 _INSERT_ROW = """
 INSERT INTO silver.location_scraper_globe_v2 (
@@ -391,4 +392,24 @@ def refresh_globe_quality(payload: dict[str, Any]) -> dict[str, int | str]:
             return {"run_id": run_id, "status": "skipped_missing_sql_object"}
         raise
     logger.info("location_scraper globe quality refreshed run_id=%s", run_id)
+    return {"run_id": run_id, "status": "refreshed"}
+
+
+def refresh_gold_map_markers(payload: dict[str, Any] | None = None) -> dict[str, str]:
+    """Refresh the gold building-level map marker table used by the RE dashboard."""
+    run_id = (payload or {}).get("run_id", "")
+    sql = get_sql_client()
+    try:
+        sql.execute_non_query(_REFRESH_GOLD_MAP_MARKERS)
+    except pyodbc.ProgrammingError as exc:
+        sqlstate = exc.args[0] if exc.args else ""
+        if sqlstate in {"42S02", "42000"}:
+            logger.warning(
+                "location_scraper gold map marker refresh skipped; required gold SQL objects are missing. run_id=%s error=%s",
+                run_id,
+                exc,
+            )
+            return {"run_id": run_id, "status": "skipped_missing_sql_object"}
+        raise
+    logger.info("location_scraper gold map markers refreshed run_id=%s", run_id)
     return {"run_id": run_id, "status": "refreshed"}

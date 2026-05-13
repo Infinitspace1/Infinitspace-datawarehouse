@@ -500,6 +500,7 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
   - uses `GOOGLE_MAPS_API_KEY`; if unset, rows without coordinates remain ungeocoded and may not appear on the map
 - `shared/location_scraper/activities/materialize_globe.py`
   - applies the same fallback while building `silver.location_scraper_globe_v2`, so existing raw runs can be rematerialized into mappable rows
+  - refreshes `gold.location_scraper_map_markers` through `gold.sp_refresh_location_scraper_map_markers` after each successful location scraper materialization
 - this is especially important for Immobilienscout24, which often hides exact German addresses
 
 ### Nexudus Invoice PDF Storage

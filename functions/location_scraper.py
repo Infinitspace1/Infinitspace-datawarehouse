@@ -19,6 +19,7 @@ Functions registered here:
   - ls_write_lusha_diagnostics (activity)
   - ls_write_logs           (activity)
   - ls_materialize_globe    (activity)
+  - ls_refresh_gold_map_markers (activity)
   - ls_refresh_globe_quality (activity)
 
 Trigger: POST /api/scrape
@@ -330,6 +331,7 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
         # 11. Write completion log
         yield context.call_activity("ls_write_logs", stats)
         yield context.call_activity("ls_materialize_globe", {"run_id": run_id})
+        yield context.call_activity("ls_refresh_gold_map_markers", {"run_id": run_id})
         yield context.call_activity("ls_refresh_globe_quality", {"run_id": run_id})
         return stats
     except Exception as exc:
@@ -449,9 +451,32 @@ def ls_materialize_globe(payload: dict) -> dict:
 
 
 @bp.activity_trigger(input_name="payload")
+def ls_refresh_gold_map_markers(payload: dict) -> dict:
+    try:
+        return materialize_act.refresh_gold_map_markers(payload)
+    except Exception as exc:
+        logger.exception(
+            "location_scraper gold map marker refresh failed but scrape output remains usable. run_id=%s",
+            payload.get("run_id"),
+        )
+        return {
+            "run_id": payload.get("run_id", ""),
+            "status": "skipped_error",
+            "error": str(exc),
+        }
+
+
+@bp.activity_trigger(input_name="payload")
 def ls_refresh_globe_quality(payload: dict) -> dict:
     try:
         return materialize_act.refresh_globe_quality(payload)
     except Exception as exc:
-        _safe_mark_run_failed(payload.get("run_id"), f"ls_refresh_globe_quality failed: {exc}")
-        raise
+        logger.exception(
+            "location_scraper globe quality refresh failed but scrape output remains usable. run_id=%s",
+            payload.get("run_id"),
+        )
+        return {
+            "run_id": payload.get("run_id", ""),
+            "status": "skipped_error",
+            "error": str(exc),
+        }
