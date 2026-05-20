@@ -10,8 +10,12 @@
 --       Materialized user/location access table.
 --   - gold.finance_dashboard_invoice_worklist
 --       Materialized invoice worklist table for the website (Nexudus-primary).
+--   - gold.finance_dashboard_revenue_occupancy
+--       Materialized location-level contracted MRR and physical occupancy.
+--   - gold.vw_finance_dashboard_membership_schedule
+--       Contract-level membership schedule for reporting/export.
 --   - gold.sp_refresh_finance_dashboard
---       Rebuilds both gold tables from silver/meta data.
+--       Rebuilds the materialized gold tables from silver/meta data.
 --
 -- Why gold tables instead of views:
 --   The website should read indexed production tables, not recompute the
@@ -129,6 +133,36 @@ GO
 
 CREATE INDEX ix_gold_finance_dashboard_invoice_worklist_workflow_due
     ON gold.finance_dashboard_invoice_worklist (workflow_type, due_date);
+GO
+
+-- Revenue and occupancy snapshot
+
+DROP TABLE IF EXISTS gold.finance_dashboard_revenue_occupancy;
+GO
+
+CREATE TABLE gold.finance_dashboard_revenue_occupancy (
+    as_of_date_utc              DATE                NOT NULL,
+    location_source_id          BIGINT              NOT NULL,
+    location_name               NVARCHAR(512)       NULL,
+    location_city               NVARCHAR(255)       NULL,
+    location_country_name       NVARCHAR(128)       NULL,
+    currency_code               NVARCHAR(8)         NULL,
+    active_contract_count       INT                 NOT NULL,
+    active_member_count         INT                 NOT NULL,
+    occupied_workstations       INT                 NOT NULL,
+    total_workstation_capacity  INT                 NOT NULL,
+    vacant_workstations         INT                 NOT NULL,
+    occupancy_pct               DECIMAL(9,4)        NULL,
+    contracted_monthly_revenue  DECIMAL(18,2)       NOT NULL,
+    monthly_revenue_per_occupied_workstation DECIMAL(18,2) NULL,
+    last_refreshed_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
+    CONSTRAINT pk_gold_finance_dashboard_revenue_occupancy
+        PRIMARY KEY (as_of_date_utc, location_source_id)
+);
+GO
+
+CREATE INDEX ix_gold_finance_dashboard_revenue_occupancy_location
+    ON gold.finance_dashboard_revenue_occupancy (location_source_id);
 GO
 
 -- ── Stored procedure ────────────────────────────────────────────────────────
@@ -404,22 +438,365 @@ BEGIN
         ON ls.location_source_id = inv.location_source_id
     LEFT JOIN invoice_account_flags af
         ON af.invoice_source_id = inv.source_id;
+
+    -- Step 4: Rebuild contracted revenue and occupancy snapshot.
+    DELETE FROM gold.finance_dashboard_revenue_occupancy
+    WHERE as_of_date_utc = CAST(GETUTCDATE() AS DATE);
+
+    WITH physical_products AS (
+        SELECT
+            p.location_source_id,
+            SUM(
+                CASE
+                    WHEN p.item_type = 1 THEN ISNULL(NULLIF(p.capacity, 0), 1)
+                    WHEN p.item_type IN (2, 3) THEN 1
+                    ELSE 0
+                END
+            ) AS total_workstation_capacity
+        FROM silver.nexudus_products p
+        INNER JOIN silver.nexudus_locations loc
+            ON loc.source_id = p.location_source_id
+           AND loc.is_deleted = 0
+        WHERE p.item_type IN (1, 2, 3)
+          AND p.is_available = 1
+          AND p.is_deleted = 0
+          -- TODO: remove once floor 2 refurbishment is complete and products are re-enabled in Nexudus
+          AND NOT (loc.name = 'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE '2-%')
+        GROUP BY p.location_source_id
+    ),
+    active_contracts AS (
+        SELECT
+            c.source_id,
+            c.coworker_id,
+            c.location_source_id,
+            c.currency_code,
+            COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS monthly_fee
+        FROM silver.nexudus_contracts c
+        WHERE c.active = 1
+          AND c.in_paused_period = 0
+          AND c.is_deleted = 0
+          AND (c.start_date IS NULL OR CAST(c.start_date AS DATE) <= CAST(GETUTCDATE() AS DATE))
+          -- Per AVA end-date semantics: cancellation_date is the hard end when set.
+          -- contract_term alone (no cancellation_date) = rolling month-to-month → always include.
+          -- cancelled = 1 with a future cancellation_date = notice period → still occupied, include.
+          AND (c.cancellation_date IS NULL OR CAST(c.cancellation_date AS DATE) >= CAST(GETUTCDATE() AS DATE))
+          AND (
+              c.cancelled = 0
+              OR (c.cancelled = 1 AND c.cancellation_date IS NOT NULL
+                  AND CAST(c.cancellation_date AS DATE) >= CAST(GETUTCDATE() AS DATE))
+          )
+    ),
+    contract_product_capacity AS (
+        SELECT
+            ac.source_id AS contract_source_id,
+            SUM(
+                CASE
+                    WHEN p.item_type = 1 THEN ISNULL(NULLIF(p.capacity, 0), 1)
+                    WHEN p.item_type IN (2, 3) THEN 1
+                    ELSE 0
+                END
+            ) AS workstation_capacity
+        FROM active_contracts ac
+        INNER JOIN silver.nexudus_contracts c
+            ON c.source_id = ac.source_id
+        CROSS APPLY STRING_SPLIT(ISNULL(c.floor_plan_desk_ids, N''), N',') s
+        INNER JOIN silver.nexudus_products p
+            ON p.source_id = TRY_CONVERT(BIGINT, TRIM(s.value))
+           AND p.is_deleted = 0
+        WHERE TRIM(s.value) <> N''
+        GROUP BY ac.source_id
+    ),
+    contract_facts AS (
+        SELECT
+            ac.source_id,
+            ac.coworker_id,
+            ac.location_source_id,
+            ac.currency_code,
+            ac.monthly_fee,
+            ISNULL(cpc.workstation_capacity, 0) AS workstation_capacity
+        FROM active_contracts ac
+        LEFT JOIN contract_product_capacity cpc
+            ON cpc.contract_source_id = ac.source_id
+    ),
+    location_facts AS (
+        SELECT
+            cf.location_source_id,
+            MAX(cf.currency_code) AS currency_code,
+            COUNT(1) AS active_contract_count,
+            COUNT(DISTINCT cf.coworker_id) AS active_member_count,
+            SUM(cf.workstation_capacity) AS occupied_workstations,
+            SUM(cf.monthly_fee) AS contracted_monthly_revenue
+        FROM contract_facts cf
+        GROUP BY cf.location_source_id
+    )
+    INSERT INTO gold.finance_dashboard_revenue_occupancy (
+        as_of_date_utc,
+        location_source_id,
+        location_name,
+        location_city,
+        location_country_name,
+        currency_code,
+        active_contract_count,
+        active_member_count,
+        occupied_workstations,
+        total_workstation_capacity,
+        vacant_workstations,
+        occupancy_pct,
+        contracted_monthly_revenue,
+        monthly_revenue_per_occupied_workstation,
+        last_refreshed_at
+    )
+    SELECT
+        CAST(GETUTCDATE() AS DATE) AS as_of_date_utc,
+        loc.source_id AS location_source_id,
+        loc.name AS location_name,
+        loc.city AS location_city,
+        loc.country_name AS location_country_name,
+        lf.currency_code,
+        ISNULL(lf.active_contract_count, 0) AS active_contract_count,
+        ISNULL(lf.active_member_count, 0) AS active_member_count,
+        ISNULL(lf.occupied_workstations, 0) AS occupied_workstations,
+        ISNULL(pp.total_workstation_capacity, 0) AS total_workstation_capacity,
+        CASE
+            WHEN ISNULL(pp.total_workstation_capacity, 0) - ISNULL(lf.occupied_workstations, 0) < 0
+                THEN 0
+            ELSE ISNULL(pp.total_workstation_capacity, 0) - ISNULL(lf.occupied_workstations, 0)
+        END AS vacant_workstations,
+        CAST(
+            100.0 * ISNULL(lf.occupied_workstations, 0)
+            / NULLIF(ISNULL(pp.total_workstation_capacity, 0), 0)
+            AS DECIMAL(9,4)
+        ) AS occupancy_pct,
+        ISNULL(lf.contracted_monthly_revenue, 0) AS contracted_monthly_revenue,
+        CAST(
+            ISNULL(lf.contracted_monthly_revenue, 0)
+            / NULLIF(ISNULL(lf.occupied_workstations, 0), 0)
+            AS DECIMAL(18,2)
+        ) AS monthly_revenue_per_occupied_workstation,
+        GETUTCDATE() AS last_refreshed_at
+    FROM silver.nexudus_locations loc
+    LEFT JOIN location_facts lf
+        ON lf.location_source_id = loc.source_id
+    LEFT JOIN physical_products pp
+        ON pp.location_source_id = loc.source_id
+    WHERE loc.is_deleted = 0;
 END
+GO
+
+CREATE OR ALTER VIEW gold.vw_finance_dashboard_membership_schedule
+AS
+WITH contract_product_capacity AS (
+    SELECT
+        c.source_id AS contract_source_id,
+        SUM(
+            CASE
+                WHEN p.item_type = 1 THEN ISNULL(NULLIF(p.capacity, 0), 1)
+                WHEN p.item_type IN (2, 3) THEN 1
+                ELSE 0
+            END
+        ) AS workstation_capacity
+    FROM silver.nexudus_contracts c
+    CROSS APPLY STRING_SPLIT(ISNULL(c.floor_plan_desk_ids, N''), N',') s
+    INNER JOIN silver.nexudus_products p
+        ON p.source_id = TRY_CONVERT(BIGINT, TRIM(s.value))
+       AND p.is_deleted = 0
+    WHERE TRIM(s.value) <> N''
+      AND c.is_deleted = 0
+    GROUP BY c.source_id
+),
+-- AVA end-date semantics:
+--   1. cancellation_date set            → use cancellation_date (explicit hard end)
+--   2. contract_term in the future      → use contract_term (real fixed end)
+--   3. contract_term in the past,
+--      cancellation_date NULL           → NULL (rolled into month-to-month)
+contract_eff_end AS (
+    SELECT
+        c.source_id,
+        CAST(
+            CASE
+                WHEN c.cancellation_date IS NOT NULL
+                    THEN c.cancellation_date
+                WHEN c.contract_term IS NOT NULL
+                     AND CAST(c.contract_term AS DATE) >= CAST(GETUTCDATE() AS DATE)
+                    THEN c.contract_term
+                ELSE NULL
+            END
+        AS DATE) AS eff_end_date
+    FROM silver.nexudus_contracts c
+    WHERE c.is_deleted = 0
+),
+membership AS (
+    SELECT
+        c.source_id AS contract_source_id,
+        c.coworker_id,
+        c.coworker_name,
+        COALESCE(NULLIF(c.coworker_company, N''), c.coworker_billing_name, c.coworker_name) AS member_company_name,
+        c.coworker_email,
+        c.location_source_id,
+        COALESCE(loc.name, c.location_name) AS location_name,
+        loc.city AS location_city,
+        loc.country_name AS location_country_name,
+        c.tariff_id,
+        c.tariff_name,
+        c.next_tariff_id,
+        c.next_tariff_name,
+        c.floor_plan_desk_ids,
+        c.floor_plan_desk_names,
+        ISNULL(cpc.workstation_capacity, 0) AS capacity,
+        c.currency_code,
+        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS latest_monthly_fee,
+        CAST(
+            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            / NULLIF(ISNULL(cpc.workstation_capacity, 0), 0)
+            AS DECIMAL(18,2)
+        ) AS latest_monthly_fee_per_workstation,
+        c.start_date,
+        cee.eff_end_date AS end_date,
+        CASE
+            WHEN c.start_date IS NULL THEN NULL
+            WHEN cee.eff_end_date IS NULL
+                THEN DATEDIFF(MONTH, CAST(c.start_date AS DATE), CAST(GETUTCDATE() AS DATE))
+            ELSE DATEDIFF(MONTH, CAST(c.start_date AS DATE), cee.eff_end_date)
+        END AS term_months,
+        CAST(CEILING(ISNULL(c.cancellation_limit_days, 0) / 30.0) AS INT) AS notice_period_months,
+        CAST(
+            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            * CASE
+                WHEN c.start_date IS NULL THEN 0
+                WHEN cee.eff_end_date IS NULL
+                    THEN CAST(CEILING(ISNULL(c.cancellation_limit_days, 0) / 30.0) AS INT)
+                ELSE DATEDIFF(MONTH, CAST(c.start_date AS DATE), cee.eff_end_date)
+              END
+            AS DECIMAL(18,2)
+        ) AS contract_value,
+        CAST(
+            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            * CASE
+                WHEN cee.eff_end_date IS NULL
+                    THEN CAST(CEILING(ISNULL(c.cancellation_limit_days, 0) / 30.0) AS INT)
+                WHEN cee.eff_end_date < CAST(GETUTCDATE() AS DATE)
+                    THEN 0
+                ELSE DATEDIFF(MONTH, CAST(GETUTCDATE() AS DATE), cee.eff_end_date)
+              END
+            AS DECIMAL(18,2)
+        ) AS remaining_contract_value,
+        c.active,
+        c.cancelled,
+        c.in_paused_period,
+        c.coworker_active,
+        c.created_on,
+        c.updated_on,
+        c.last_synced_at
+    FROM silver.nexudus_contracts c
+    LEFT JOIN contract_product_capacity cpc
+        ON cpc.contract_source_id = c.source_id
+    LEFT JOIN contract_eff_end cee
+        ON cee.source_id = c.source_id
+    LEFT JOIN silver.nexudus_locations loc
+        ON loc.source_id = c.location_source_id
+       AND loc.is_deleted = 0
+    WHERE c.is_deleted = 0
+)
+SELECT *
+FROM membership;
 GO
 
 EXEC gold.sp_refresh_finance_dashboard;
 GO
 
 
+-- SELECT 
+-- location_name,occupied_workstations, 
+-- total_workstation_capacity, 
+-- occupancy_pct 
+-- FROM gold.finance_dashboard_revenue_occupancy
 
-SELECT location_name, sum(due_amount) as total_due, count(1) as num_inv FROM gold.finance_dashboard_invoice_worklist
-WHERE due_state = 'overdue'GROUP BY location_name
-ORDER BY sum(due_amount) DESC;
+-- -- SELECT *
+-- -- FROM gold.vw_finance_dashboard_membership_schedule
+-- -- WHERE location_name = 'Amsterdam - Hoofddorp - Taurusavenue 3'
+-- --   AND capacity != 0
+-- --   -- contract started on or before the last day of this month
+-- --   AND CAST(start_date AS DATE) <= EOMONTH(GETUTCDATE())
+-- --   -- and either ongoing (end_date IS NULL) or ends on/after the first day of this month
+-- --   AND (
+-- --       end_date IS NULL
+-- --       OR CAST(end_date AS DATE) >= DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1)
+-- --   )
 
-SELECT invoice_number, total_amount, due_amount, invoice_date, due_date, days_overdue, workflow_type, due_state FROM gold.finance_dashboard_invoice_worklist
-WHERE due_state = 'overdue' AND location_name = 'London - Holborn - 14 Grays Inn Rd'
 
-SELECT location_name, COUNT(1) FROM gold.finance_dashboard_invoice_worklist
-WHERE due_state = 'upcoming'
-GROUP BY location_name
-ORDER BY COUNT(1) DESC;
+-- SELECT
+--     member_company_name,
+--     SUM(capacity)                                           AS total_capacity,
+--     SUM(latest_monthly_fee)                                 AS total_monthly_fee,
+--     STRING_AGG(floor_plan_desk_names, ', ')
+--         WITHIN GROUP (ORDER BY contract_source_id)          AS all_desk_names
+-- FROM gold.vw_finance_dashboard_membership_schedule
+-- WHERE location_name = 'Amsterdam - Noord - Papaverhof 59'
+-- AND capacity != 0
+-- AND CAST(start_date AS DATE) <= EOMONTH(GETUTCDATE())
+-- AND (
+--     end_date IS NULL
+--     OR CAST(end_date AS DATE) >= DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1)
+-- )
+-- GROUP BY member_company_name
+
+-- -- --241
+-- --Crescode Group B.V. DD04, Prabakaran DD02
+
+
+
+-- SELECT *
+-- FROM gold.vw_finance_dashboard_membership_schedule
+-- WHERE location_name = 'Amsterdam - Hoofddorp - Taurusavenue 3'
+--   AND capacity != 0
+--   -- contract started on or before the last day of this month
+--   AND CAST(start_date AS DATE) <= EOMONTH(GETUTCDATE())
+--   -- and either ongoing (end_date IS NULL) or ends on/after the first day of this month
+--   AND (
+--       end_date IS NULL
+--       OR CAST(end_date AS DATE) >= DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1)
+--   )
+--   AND floor_plan_desk_names = 'DD02'
+
+-- SELECT
+--     contract_source_id,
+--     member_company_name,
+--     tariff_name,
+--     capacity,
+--     latest_monthly_fee,
+--     start_date,
+--     end_date,
+--     active,
+--     cancelled,
+--     in_paused_period,
+--     floor_plan_desk_names,
+--     floor_plan_desk_ids
+-- FROM gold.vw_finance_dashboard_membership_schedule
+-- WHERE location_name = 'Amsterdam - Hoofddorp - Taurusavenue 3'
+--   AND capacity != 0
+--   AND CAST(start_date AS DATE) <= EOMONTH(GETUTCDATE())
+--   AND (
+--       end_date IS NULL
+--       OR CAST(end_date AS DATE) >= DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1)
+--   )
+-- ORDER BY capacity DESC, member_company_name;
+
+
+-- SELECT
+--     item_type,
+--     p.name,
+--     p.capacity,
+--     CASE
+--         WHEN p.item_type = 1 THEN ISNULL(NULLIF(p.capacity, 0), 1)
+--         WHEN p.item_type IN (2, 3) THEN 1
+--         ELSE 0
+--     END AS counted_as,
+--     p.is_available
+-- FROM silver.nexudus_products p
+-- INNER JOIN silver.nexudus_locations loc
+--     ON loc.source_id = p.location_source_id
+-- WHERE loc.name = 'Amsterdam - Hoofddorp - Taurusavenue 3'
+--   AND p.item_type IN (1, 2, 3)
+--   AND p.is_available = 1
+--   AND p.is_deleted = 0
+-- ORDER BY item_type, p.name;

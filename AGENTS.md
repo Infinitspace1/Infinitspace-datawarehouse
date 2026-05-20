@@ -416,6 +416,12 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
   - materialized Nexudus invoice worklist (Nexudus-only, no Xero dependency)
   - workflow_type: `recurrent` if any line item has `financial_account_name LIKE '%MEMBERSHIP FEES%'`
   - includes `pdf_blob_path` for cached Nexudus invoice PDFs
+- `gold.finance_dashboard_revenue_occupancy`
+  - materialized daily location snapshot for contracted MRR and workstation occupancy
+  - occupancy = active physical workstation capacity assigned by active contracts / total physical workstation capacity from Nexudus products
+  - revenue = contracted monthly recurring value from active Nexudus contracts, using `price_with_products` fallback to `price`/`tariff_price`
+- `gold.vw_finance_dashboard_membership_schedule`
+  - contract-level membership schedule view for member/company, dates, capacity, latest monthly fee, notice period, contract value, and remaining value
   - rebuilt by `gold.sp_refresh_finance_dashboard`
 
 ### Meta
