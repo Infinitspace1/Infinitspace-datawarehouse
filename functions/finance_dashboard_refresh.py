@@ -40,6 +40,9 @@ async def refresh_finance_dashboard(timer: func.TimerRequest) -> None:
             before_access_rows = sql.execute_scalar(
                 "SELECT COUNT(1) FROM gold.finance_dashboard_user_access"
             )
+            before_revenue_occupancy_rows = sql.execute_scalar(
+                "SELECT COUNT(1) FROM gold.finance_dashboard_revenue_occupancy"
+            )
 
             sql.execute_non_query("EXEC gold.sp_refresh_finance_dashboard")
 
@@ -49,15 +52,24 @@ async def refresh_finance_dashboard(timer: func.TimerRequest) -> None:
             after_access_rows = sql.execute_scalar(
                 "SELECT COUNT(1) FROM gold.finance_dashboard_user_access"
             )
+            after_revenue_occupancy_rows = sql.execute_scalar(
+                "SELECT COUNT(1) FROM gold.finance_dashboard_revenue_occupancy"
+            )
 
-            run.rows_written = int(after_invoice_rows or 0) + int(after_access_rows or 0)
+            run.rows_written = (
+                int(after_invoice_rows or 0)
+                + int(after_access_rows or 0)
+                + int(after_revenue_occupancy_rows or 0)
+            )
 
             logger.info(
-                "Finance dashboard gold refresh complete: invoice_worklist %s -> %s, user_access %s -> %s",
+                "Finance dashboard gold refresh complete: invoice_worklist %s -> %s, user_access %s -> %s, revenue_occupancy %s -> %s",
                 before_invoice_rows,
                 after_invoice_rows,
                 before_access_rows,
                 after_access_rows,
+                before_revenue_occupancy_rows,
+                after_revenue_occupancy_rows,
             )
 
     except Exception as exc:
