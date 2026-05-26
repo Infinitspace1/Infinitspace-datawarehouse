@@ -39,6 +39,42 @@ WHERE run_id = ?
 
 _REFRESH_QUALITY = "EXEC silver.sp_refresh_location_scraper_globe_quality @run_id = ?"
 _REFRESH_GOLD_MAP_MARKERS = "EXEC gold.sp_refresh_location_scraper_map_markers"
+_UPDATE_GOLD_MAP_MARKER_CURRENCY = """
+;WITH latest_silver AS (
+    SELECT
+        source,
+        run_city,
+        external_id,
+        latitude,
+        longitude,
+        currency,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                source,
+                run_city,
+                COALESCE(external_id, CONCAT(latitude, N'|', longitude))
+            ORDER BY inserted_at DESC, run_id DESC, item_index DESC
+        ) AS rn
+    FROM silver.location_scraper_globe_v2
+    WHERE currency IS NOT NULL
+)
+UPDATE gold_markers
+SET currency = latest_silver.currency
+FROM gold.location_scraper_map_markers AS gold_markers
+JOIN latest_silver
+    ON latest_silver.rn = 1
+   AND latest_silver.source = gold_markers.source
+   AND latest_silver.run_city = gold_markers.run_city
+   AND (
+        (latest_silver.external_id IS NOT NULL AND latest_silver.external_id = gold_markers.external_id)
+        OR (
+            latest_silver.external_id IS NULL
+            AND gold_markers.external_id IS NULL
+            AND latest_silver.latitude = gold_markers.latitude
+            AND latest_silver.longitude = gold_markers.longitude
+        )
+   )
+"""
 
 _INSERT_ROW = """
 INSERT INTO silver.location_scraper_globe_v2 (
@@ -168,6 +204,13 @@ def _pick_floor(payload: dict[str, Any], source: str) -> str | None:
             "floor",
         )
     )
+
+
+def _pick_currency(payload: dict[str, Any], source: str) -> str | None:
+    currency = _pick_str(payload, "priceCurrency", "normalized.price.currency", "basicInfo.currency", "currency")
+    if currency:
+        return currency.upper()
+    return {"idealista": "EUR", "immobilienscout": "EUR", "otodom": "PLN"}.get(source)
 
 
 def _first_seller_phone(payload: dict[str, Any]) -> str | None:
@@ -335,7 +378,7 @@ def _map_row(
         _pick_decimal(payload, "price", "priceInfo.amount", "basicInfo.price", "normalized.price.amount", "adTargetingParameters.obj_rentPerMonth", "obj_totalRent"),
         _pick_decimal(payload, "pricePerM2", "priceByArea", "adTargetingParameters.obj_rentPerSqM", "obj_baseRent", "basicInfo.priceByArea"),
         _pick_decimal(payload, "area", "moreCharacteristics.constructedArea", "basicInfo.size", "adTargetingParameters.obj_mainFloorSpace", "normalized.area.livingSpace", "obj_netFloorSpace"),
-        _pick_str(payload, "priceCurrency", "normalized.price.currency", "basicInfo.currency") or "EUR",
+        _pick_currency(payload, source),
         contact_name,
         company_name,
         phone,
@@ -401,9 +444,10 @@ def refresh_gold_map_markers(payload: dict[str, Any] | None = None) -> dict[str,
     sql = get_sql_client()
     try:
         sql.execute_non_query(_REFRESH_GOLD_MAP_MARKERS)
+        sql.execute_non_query(_UPDATE_GOLD_MAP_MARKER_CURRENCY)
     except pyodbc.ProgrammingError as exc:
         sqlstate = exc.args[0] if exc.args else ""
-        if sqlstate in {"42S02", "42000"}:
+        if sqlstate in {"42S02", "42000", "42S22"}:
             logger.warning(
                 "location_scraper gold map marker refresh skipped; required gold SQL objects are missing. run_id=%s error=%s",
                 run_id,
