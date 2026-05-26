@@ -342,6 +342,36 @@ class BronzeWriter:
         )
         return changed, written
 
+    def write_coworker_invoice_histories(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_coworker_invoice_histories"""
+        table = "bronze.nexudus_coworker_invoice_histories"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                r.get("CoworkerInvoiceId"),
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "invoice_source_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "invoice_source_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written
+
     def write_coworkers(self, records: list[dict]) -> tuple[list[dict], int]:
         """bronze.nexudus_coworkers"""
         table = "bronze.nexudus_coworkers"

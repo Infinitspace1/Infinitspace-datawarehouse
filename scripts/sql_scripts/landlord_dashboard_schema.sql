@@ -13,16 +13,29 @@
 --   - contract_term (the Nexudus "contract end date") is deliberately ignored for
 --     forecasting. A contract whose contract_term has passed but whose
 --     cancellation_date is NULL rolls forward as ongoing indefinitely.
---   - Zero-capacity contracts (capacity known = 0) are excluded.
---   - Contracts where capacity is UNKNOWN (product link missing but floor_plan_desk_ids
---     exists) are INCLUDED with list_price_missing = 1 so revenue is never silently dropped.
+--   - Contracts with a linked physical product (item_type 1, 2, or 3) are included
+--     normally. This excludes Beyond Access / parking-only / storage-only /
+--     meeting-room-only contracts from the desk-product capacity count.
+--     A mixed contract (e.g. office + parking in floor_plan_desk_ids) IS included;
+--     only the physical components count toward capacity and list price. The
+--     sold_monthly_fee still reflects the full contract price (unavoidable — Nexudus
+--     stores a single price per contract, not per product component).
+--   - Negative-fee contracts (discount / credit adjustments — Nexudus allows
+--     price < 0, see silver.nexudus_contracts.price comment) are ALSO included
+--     even when they have no floor_plan_desk_ids. They contribute zero capacity
+--     and negative sold_monthly_fee, so SUM(sold_monthly_fee) correctly nets out
+--     the adjustment instead of overstating revenue. The is_negative_adjustment
+--     flag identifies these rows; list_price_missing is suppressed for them.
 --
 -- STATUS FILTER IN vw_landlord_current_contracts:
 --   The view is pre-filtered — Flask does not need to filter by status.
 --   Included:  active = 1 (all active/paused contracts)
---              cancelled = 1 AND cancellation_date >= first-of-current-month (notice period)
---   Excluded:  active = 0 AND cancelled = 0 (abandoned/historical with no cancellation date)
---              contracts cancelled before the current month started
+--              cancelled = 1 AND cancellation_date > EOMONTH(today) (notice period, not yet effective)
+--   Excluded:  active = 0 AND cancelled = 0 (abandoned/historical)
+--              contracts where cancellation_date <= EOMONTH(today) (already past)
+--              contracts where start_date > EOMONTH(today) (future — not yet current;
+--                these DO appear in vw_landlord_contract_book_monthly from their
+--                start month forward)
 --
 -- PRICING JOIN:
 --   - List price  = SUM(silver.nexudus_products.price) for products linked via
@@ -30,8 +43,8 @@
 --                   product source_ids).
 --   - Sold price  = COALESCE(price_with_products, price, tariff_price, 0) from the
 --                   contract — always populated regardless of product link.
---   - list_price_missing = 1 when no product link resolves. list_monthly_fee,
---     list_price_per_ws, discount_value, discount_pct are NULL in that case.
+--   - list_price_missing = 1 only for root cause E: physical product found (capacity > 0)
+--     but price = NULL or 0 in Nexudus. Fix: update the product price in Nexudus and re-sync.
 --
 -- CAPACITY COUNTING (consistent with existing gold layer):
 --   item_type 1 (Office)         → product.capacity field (default 1 if 0)
@@ -193,8 +206,21 @@ SELECT
         ELSE NULL
     END                                 AS days_until_cancellation,
 
-    -- Data quality flag: 1 when product link is missing so list price cannot be computed
-    CASE WHEN pl.contract_source_id IS NULL THEN 1 ELSE 0 END AS list_price_missing,
+    -- list_price_missing = 1 when physical products exist (capacity > 0) but ALL have
+    -- price = NULL or 0 in Nexudus (root cause E). Fix: set product price in Nexudus.
+    -- Suppressed for negative-fee adjustment contracts (no list price expected).
+    CASE
+        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 0
+        WHEN ISNULL(pl.list_monthly_fee, 0) = 0 THEN 1
+        ELSE 0
+    END                                 AS list_price_missing,
+
+    -- 1 when sold_monthly_fee is negative — discount / credit / refund contract.
+    -- These contribute zero capacity and negative revenue to aggregates.
+    CASE
+        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+        ELSE 0
+    END                                 AS is_negative_adjustment,
     ISNULL(pl.product_match_count, 0)   AS product_match_count,
 
     -- Timestamps
@@ -209,15 +235,14 @@ LEFT JOIN product_link pl
     ON  pl.contract_source_id = c.source_id
 WHERE c.is_deleted = 0
 
-  -- Status pre-filter: include active contracts and notice-period contracts only.
-  -- Excludes: abandoned (active=0, cancelled=0), pre-month cancellations.
+  -- Status pre-filter: active contracts and notice-period (cancelled but not yet effective).
+  -- Excludes: abandoned (active=0, cancelled=0).
   AND (
       c.active = 1
       OR (
           c.cancelled = 1
           AND c.cancellation_date IS NOT NULL
-          AND CAST(c.cancellation_date AS DATE)
-              >= DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1)
+          AND CAST(c.cancellation_date AS DATE) > EOMONTH(GETUTCDATE())
       )
   )
 
@@ -225,17 +250,23 @@ WHERE c.is_deleted = 0
   AND c.start_date IS NOT NULL
   AND CAST(c.start_date AS DATE) <= EOMONTH(GETUTCDATE())
 
-  -- Cancellation pre-filter: not cancelled before the current month started
+  -- Cancellation pre-filter: cancellation_date = 2026-05-01 means May is NOT active.
+  -- A contract is active in the current month only if cancellation is AFTER month-end.
   AND (
       c.cancellation_date IS NULL
-      OR CAST(c.cancellation_date AS DATE)
-         >= DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1)
+      OR CAST(c.cancellation_date AS DATE) > EOMONTH(GETUTCDATE())
   )
 
-  -- Capacity pre-filter: exclude only contracts where capacity is KNOWN to be 0.
-  -- Contracts with NULL capacity (product link missing) are retained — they still
-  -- carry sold revenue and the gap is flagged via list_price_missing.
-  AND (pl.capacity IS NULL OR pl.capacity > 0);
+  -- Capacity pre-filter: require either at least one physical desk/office product,
+  -- OR a negative-fee adjustment contract (discount / credit). Negatives have no
+  -- product link but their negative sold_monthly_fee must reach the aggregates so
+  -- revenue is not overstated.
+  -- Excludes: Beyond Access (no floor_plan_desk_ids), parking-only, storage-only,
+  -- meeting-room-only contracts whose price is also zero or positive.
+  AND (
+      pl.capacity > 0
+      OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+  );
 GO
 
 
@@ -244,13 +275,22 @@ GO
 --    One row per location per month covering ±12 months (25 months total).
 --    Contract active-in-month rule:
 --      start_date <= EOMONTH(month_start)
---      AND (cancellation_date IS NULL OR cancellation_date >= month_start)
+--      AND (cancellation_date IS NULL OR cancellation_date > EOMONTH(month_start))
+--    cancellation_date = 2025-05-01 → active in Apr, NOT in May.
 --    contract_term (contract_end_date) is deliberately NOT used as a stop criterion.
 --
 --    Contracts included in the monthly model:
---      active = 1  OR  (cancelled = 1 AND cancellation_date is set)
---    This mirrors the current-contracts view: abandoned (active=0, no cancellation)
---    contracts are excluded because they carry no reliable stop date.
+--      a) active = 1
+--      b) cancelled = 1 AND cancellation_date is set        (in-notice / past notice)
+--      c) active = 0 AND cancelled = 0 AND start_date > today
+--           — future-signed contracts: not yet active in Nexudus, but already
+--             booked. They appear in the forecast from their start month forward,
+--             so the ±12 month book reflects committed bookings.
+--      d) sold_monthly_fee < 0 (regardless of (a)/(b)/(c)) — discount / credit
+--           adjustment contracts. They net negative revenue into the month they're
+--           active without contributing capacity.
+--    Excluded: abandoned (active=0, cancelled=0, start_date <= today) — these
+--    have no reliable stop date and no committed future date.
 -- =============================================================================
 
 CREATE OR ALTER VIEW gold.vw_landlord_contract_book_monthly
@@ -333,19 +373,37 @@ contract_facts AS (
         CAST(c.cancellation_date AS DATE) AS cancellation_date,
         -- Use product-derived capacity when available; NULL otherwise
         pl.capacity,
-        pl.list_monthly_fee
+        pl.list_monthly_fee,
+        CASE
+            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+            ELSE 0
+        END                          AS is_negative_adjustment
     FROM silver.nexudus_contracts c
     LEFT JOIN contract_product_link pl
         ON pl.contract_source_id = c.source_id
     WHERE c.is_deleted = 0
       AND c.start_date IS NOT NULL
-      -- Same status filter as current-contracts view
+      -- Status filter:
+      --   active=1                                            → current/active
+      --   cancelled=1 AND cancellation_date IS NOT NULL       → in or past notice
+      --   active=0 AND cancelled=0 AND start_date > today     → future-signed (booked but not yet started)
+      -- Abandoned (active=0, cancelled=0, start_date <= today) is excluded.
       AND (
           c.active = 1
           OR (c.cancelled = 1 AND c.cancellation_date IS NOT NULL)
+          OR (
+              c.active = 0
+              AND c.cancelled = 0
+              AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
+          )
       )
-      -- Exclude contracts where capacity is explicitly 0 (known zero-capacity)
-      AND (pl.capacity IS NULL OR pl.capacity > 0)
+      -- Capacity filter: physical desk/office product required, OR negative-fee
+      -- adjustment (discount/credit) which has no product link but must still
+      -- net out of monthly revenue.
+      AND (
+          pl.capacity > 0
+          OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+      )
 ),
 -- Fan out: for each location+month, which contracts are active?
 active_by_month AS (
@@ -353,40 +411,56 @@ active_by_month AS (
         ms.month_start,
         cf.location_source_id,
         cf.contract_source_id,
-        ISNULL(cf.capacity, 0)          AS capacity,
+        cf.capacity,
         cf.sold_monthly_fee,
         ISNULL(cf.list_monthly_fee, 0)  AS list_monthly_fee,
-        CASE WHEN cf.list_monthly_fee IS NULL THEN 1 ELSE 0 END AS list_price_missing,
+        cf.is_negative_adjustment,
+        -- list_price_missing: 1 only when a physical product exists (capacity > 0)
+        -- but its price in Nexudus is NULL/0 (root cause E). Suppressed for
+        -- negative-fee adjustment contracts since they're not expected to carry one.
+        CASE
+            WHEN cf.is_negative_adjustment = 1 THEN 0
+            WHEN ISNULL(cf.list_monthly_fee, 0) = 0 THEN 1
+            ELSE 0
+        END AS list_price_missing,
         CASE
             WHEN cf.start_date >= ms.month_start
              AND cf.start_date <= EOMONTH(ms.month_start) THEN 1
             ELSE 0
         END AS is_new_this_month,
+        -- Last active month: cancellation_date falls in the NEXT calendar month (or earlier).
+        -- Example: cancellation_date=2025-05-01 → April is last active month, flagged here.
+        -- Example: cancellation_date=2025-05-15 → April is still last active month (May excluded).
         CASE
             WHEN cf.cancellation_date IS NOT NULL
-             AND cf.cancellation_date >= ms.month_start
-             AND cf.cancellation_date <= EOMONTH(ms.month_start) THEN 1
+             AND cf.cancellation_date <= EOMONTH(DATEADD(MONTH, 1, ms.month_start)) THEN 1
             ELSE 0
         END AS is_cancelling_this_month
     FROM month_spine ms
     INNER JOIN contract_facts cf
+        -- Active in month: started before month ended AND cancellation hasn't happened yet.
+        -- cancellation_date = 2025-05-01 → NOT active in May (May 1 is NOT after May 31).
         ON  cf.start_date <= EOMONTH(ms.month_start)
         AND (
             cf.cancellation_date IS NULL
-            OR cf.cancellation_date >= ms.month_start
+            OR cf.cancellation_date > EOMONTH(ms.month_start)
         )
 ),
 monthly_agg AS (
     SELECT
         month_start,
         location_source_id,
-        COUNT(1)                                                            AS active_contract_count,
-        SUM(capacity)                                                       AS occupied_workstations,
+        -- Exclude negative-fee adjustment contracts from the contract count so
+        -- the headline number reflects real bookings, not adjustment lines.
+        SUM(CASE WHEN is_negative_adjustment = 0 THEN 1 ELSE 0 END)         AS active_contract_count,
+        SUM(ISNULL(capacity, 0))                                            AS occupied_workstations,
         SUM(sold_monthly_fee)                                               AS sold_monthly_revenue,
         SUM(list_monthly_fee)                                               AS list_monthly_revenue,
         SUM(list_price_missing)                                             AS contracts_missing_list_price,
-        SUM(CASE WHEN is_new_this_month      = 1 THEN capacity ELSE 0 END) AS new_workstations_starting,
-        SUM(CASE WHEN is_cancelling_this_month = 1 THEN capacity ELSE 0 END) AS workstations_cancelling
+        SUM(CASE WHEN is_new_this_month      = 1 THEN ISNULL(capacity, 0) ELSE 0 END) AS new_workstations_starting,
+        SUM(CASE WHEN is_cancelling_this_month = 1 THEN ISNULL(capacity, 0) ELSE 0 END) AS workstations_cancelling,
+        SUM(CASE WHEN is_negative_adjustment = 1 THEN 1 ELSE 0 END)         AS adjustment_contract_count,
+        SUM(CASE WHEN is_negative_adjustment = 1 THEN sold_monthly_fee ELSE 0 END) AS adjustment_monthly_value
     FROM active_by_month
     GROUP BY month_start, location_source_id
 )
@@ -447,6 +521,12 @@ SELECT
     -- Data quality
     ISNULL(ma.contracts_missing_list_price, 0)  AS contracts_missing_list_price,
 
+    -- Negative-fee adjustment contracts (discount / credit lines). The negative
+    -- value is already netted into sold_monthly_revenue above; surfaced here for
+    -- QA / dashboard transparency.
+    ISNULL(ma.adjustment_contract_count, 0)     AS adjustment_contract_count,
+    CAST(ISNULL(ma.adjustment_monthly_value, 0) AS DECIMAL(18,2)) AS adjustment_monthly_value,
+
     N'contract_book'                            AS calculation_basis
 
 FROM month_spine ms
@@ -504,17 +584,26 @@ SELECT
 
     -- Occupancy
     SUM(ISNULL(capacity, 0))                        AS occupied_workstations,
-    COUNT(1)                                        AS active_contract_count,
+    SUM(CASE WHEN is_negative_adjustment = 0 THEN 1 ELSE 0 END) AS active_contract_count,
 
-    -- QA: fraction of contracts with a valid product-price link
+    -- QA: fraction of *real* contracts with a valid product-price link.
+    -- Negative-fee adjustments are excluded from both numerator and denominator.
     CAST(
-        100.0 * SUM(CASE WHEN list_price_missing = 0 THEN 1 ELSE 0 END)
-        / NULLIF(COUNT(1), 0)
+        100.0 * SUM(CASE WHEN is_negative_adjustment = 0 AND list_price_missing = 0 THEN 1 ELSE 0 END)
+        / NULLIF(SUM(CASE WHEN is_negative_adjustment = 0 THEN 1 ELSE 0 END), 0)
         AS DECIMAL(9,4)
     )                                               AS product_match_coverage_pct,
 
     -- Number of contracts where list price could not be determined
     SUM(list_price_missing)                         AS contracts_missing_list_price,
+
+    -- Adjustment lines (discount / credit). adjustment_monthly_value is already
+    -- netted into sold_monthly_revenue above; surfaced separately for transparency.
+    SUM(is_negative_adjustment)                     AS adjustment_contract_count,
+    CAST(
+        SUM(CASE WHEN is_negative_adjustment = 1 THEN sold_monthly_fee ELSE 0 END)
+        AS DECIMAL(18,2)
+    )                                               AS adjustment_monthly_value,
 
     CAST(GETUTCDATE() AS DATE)                      AS last_refreshed_at
 
@@ -524,6 +613,93 @@ GROUP BY
     location_name,
     location_city,
     location_country_name;
+GO
+
+
+-- =============================================================================
+-- 4. gold.vw_landlord_current_companies
+--    One row per location + member_company_name for current-month contracts.
+--    Aggregates gold.vw_landlord_current_contracts so the dashboard reads one
+--    row per company instead of one row per contract/desk component.
+--
+--    Filter: location must be known AND contract must have capacity > 0 OR
+--    sold_monthly_fee > 0 — removes zero-value admin/placeholder rows.
+--
+--    Status priority: notice_period > active > paused > inactive.
+--    Pricing is re-derived from summed totals, not averaged from contract rows.
+-- =============================================================================
+
+CREATE OR ALTER VIEW gold.vw_landlord_current_companies
+AS
+SELECT
+    location_source_id,
+    location_name,
+    location_city,
+    location_country_name,
+    member_company_name,
+
+    -- Date range across all contracts for this company at this location
+    MIN(start_date)                                         AS start_date,
+    MAX(cancellation_date)                                  AS cancellation_date,
+    MAX(contract_end_date)                                  AS contract_end_date,
+
+    -- Aggregated workstations and revenue
+    SUM(ISNULL(capacity, 0))                                AS capacity,
+    SUM(sold_monthly_fee)                                   AS sold_monthly_fee,
+    SUM(list_monthly_fee)                                   AS list_monthly_fee,
+    SUM(discount_value)                                     AS discount_value,
+    SUM(contract_value)                                     AS contract_value,
+    SUM(remaining_contract_value)                           AS remaining_contract_value,
+
+    -- Notice / term info: take the most conservative (longest) values
+    MAX(notice_period_months)                               AS notice_period_months,
+    MAX(term_months)                                        AS term_months,
+    MAX(days_until_cancellation)                            AS days_until_cancellation,
+
+    -- Data quality
+    SUM(product_match_count)                                AS product_match_count,
+    SUM(CASE WHEN list_price_missing = 1 THEN 1 ELSE 0 END) AS contracts_missing_list_price,
+
+    -- Derived per-WS pricing from aggregated totals (NOT averaged from rows)
+    CAST(
+        SUM(sold_monthly_fee)
+        / NULLIF(SUM(ISNULL(capacity, 0)), 0)
+        AS DECIMAL(18,2)
+    )                                                       AS sold_price_per_ws,
+    CAST(
+        SUM(list_monthly_fee)
+        / NULLIF(SUM(ISNULL(capacity, 0)), 0)
+        AS DECIMAL(18,2)
+    )                                                       AS list_price_per_ws,
+    CAST(
+        SUM(discount_value)
+        / NULLIF(SUM(list_monthly_fee), 0)
+        AS DECIMAL(9,4)
+    )                                                       AS discount_pct,
+
+    -- Company-level status: highest-priority status across all contracts wins
+    CASE
+        WHEN MAX(CASE WHEN status = N'notice_period' THEN 3 ELSE 0 END) > 0 THEN N'notice_period'
+        WHEN MAX(CASE WHEN status = N'active'        THEN 2 ELSE 0 END) > 0 THEN N'active'
+        WHEN MAX(CASE WHEN status = N'paused'        THEN 1 ELSE 0 END) > 0 THEN N'paused'
+        ELSE N'inactive'
+    END                                                     AS status,
+
+    CAST(GETUTCDATE() AS DATE)                              AS last_refreshed_at
+
+FROM gold.vw_landlord_current_contracts
+WHERE location_source_id IS NOT NULL
+  -- A company can have a mix of positive desk contracts and negative-fee
+  -- adjustment lines (discount / credit). Both are aggregated here so the
+  -- company row shows true net revenue. Adjustment-only companies (no positive
+  -- contract) will appear with capacity = 0 and a negative sold_monthly_fee —
+  -- this is intentional, dashboards can filter by status / capacity if needed.
+GROUP BY
+    location_source_id,
+    location_name,
+    location_city,
+    location_country_name,
+    member_company_name;
 GO
 
 
@@ -729,3 +905,164 @@ WHERE c.active = 0
   AND c.cancelled = 0;
 -- Expect 0 rows.
 */
+
+-- ── QA 9: Future-signed contracts appearing in the monthly forecast ──────────
+-- Contracts with start_date > today should appear in vw_landlord_contract_book_monthly
+-- from their start month forward, regardless of their active flag. They must NOT
+-- appear in vw_landlord_current_contracts.
+/*
+WITH future_contracts AS (
+    SELECT TOP 20
+        c.source_id     AS contract_source_id,
+        loc.name        AS location_name,
+        c.coworker_name,
+        CAST(c.start_date AS DATE)        AS start_date,
+        CAST(c.cancellation_date AS DATE) AS cancellation_date,
+        c.active,
+        c.cancelled
+    FROM silver.nexudus_contracts c
+    LEFT JOIN silver.nexudus_locations loc ON loc.source_id = c.location_source_id
+    WHERE c.is_deleted = 0
+      AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
+      AND c.cancelled = 0
+    ORDER BY c.start_date
+)
+SELECT
+    fc.contract_source_id,
+    fc.location_name,
+    fc.coworker_name,
+    fc.start_date,
+    fc.active,
+    -- Should be present in the monthly view from start_date onward
+    EXISTS(
+        SELECT 1 FROM gold.vw_landlord_contract_book_monthly m
+        WHERE m.location_source_id = (SELECT location_source_id FROM silver.nexudus_contracts WHERE source_id = fc.contract_source_id)
+          AND m.month_start_date >= DATEFROMPARTS(YEAR(fc.start_date), MONTH(fc.start_date), 1)
+    ) AS in_monthly_forecast,
+    -- Should be ABSENT from current contracts (start_date is in the future)
+    EXISTS(
+        SELECT 1 FROM gold.vw_landlord_current_contracts cc
+        WHERE cc.contract_source_id = fc.contract_source_id
+    ) AS in_current_contracts
+FROM future_contracts fc;
+-- Expect: in_monthly_forecast = 1, in_current_contracts = 0 for all rows.
+*/
+
+-- ── QA 10: Negative-fee (discount / credit) adjustment contracts ─────────────
+-- Inventory of negative contracts and their effect on the current month.
+/*
+SELECT
+    location_name,
+    member_company_name,
+    contract_source_id,
+    capacity,
+    sold_monthly_fee,
+    list_monthly_fee,
+    is_negative_adjustment,
+    status
+FROM gold.vw_landlord_current_contracts
+WHERE is_negative_adjustment = 1
+ORDER BY sold_monthly_fee ASC;
+
+-- Net adjustment value per location for the current month
+SELECT
+    location_name,
+    sold_monthly_revenue,
+    adjustment_contract_count,
+    adjustment_monthly_value
+FROM gold.vw_landlord_pricing_summary
+WHERE adjustment_contract_count > 0
+ORDER BY adjustment_monthly_value;
+*/
+
+SELECT
+  member_company_name,
+  contract_source_id,
+  capacity,
+  sold_monthly_fee,
+  list_monthly_fee,
+  list_price_missing,
+  product_match_count
+FROM gold.vw_landlord_current_contracts
+WHERE location_source_id = 1414964753
+
+
+
+-- 1. Add silver columns
+IF COL_LENGTH('silver.nexudus_coworker_invoices', 'invoice_status') IS NULL
+    ALTER TABLE silver.nexudus_coworker_invoices ADD invoice_status NVARCHAR(64) NULL;
+GO
+
+IF COL_LENGTH('silver.nexudus_coworker_invoices', 'processing') IS NULL
+    ALTER TABLE silver.nexudus_coworker_invoices ADD processing BIT NULL;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_silver_nexudus_coworker_invoices_processing'
+      AND object_id = OBJECT_ID('silver.nexudus_coworker_invoices')
+)
+    CREATE INDEX ix_silver_nexudus_coworker_invoices_processing
+    ON silver.nexudus_coworker_invoices (processing, invoice_status);
+GO
+
+-- 2. Add gold worklist columns
+IF COL_LENGTH('gold.finance_dashboard_invoice_worklist', 'invoice_status') IS NULL
+    ALTER TABLE gold.finance_dashboard_invoice_worklist ADD invoice_status NVARCHAR(64) NULL;
+GO
+
+IF COL_LENGTH('gold.finance_dashboard_invoice_worklist', 'processing') IS NULL
+    ALTER TABLE gold.finance_dashboard_invoice_worklist
+    ADD processing BIT NOT NULL
+        CONSTRAINT df_gold_finance_dashboard_invoice_worklist_processing DEFAULT 0;
+GO
+
+
+
+UPDATE s
+SET
+    due_date = CAST(
+        (TRY_CONVERT(DATETIME2, REPLACE(JSON_VALUE(b.raw_json, '$.DueDate'), 'Z', ''), 126)
+            AT TIME ZONE 'UTC'
+            AT TIME ZONE 'Central European Standard Time') AS DATETIME2
+    ),
+    invoice_status = COALESCE(
+        NULLIF(JSON_VALUE(b.raw_json, '$.Status'), ''),
+        NULLIF(JSON_VALUE(b.raw_json, '$.InvoiceStatus'), ''),
+        NULLIF(JSON_VALUE(b.raw_json, '$.PaymentStatus'), '')
+    ),
+    processing = CASE
+        WHEN UPPER(COALESCE(
+            JSON_VALUE(b.raw_json, '$.Status'),
+            JSON_VALUE(b.raw_json, '$.InvoiceStatus'),
+            JSON_VALUE(b.raw_json, '$.PaymentStatus'),
+            ''
+        )) LIKE '%PROCESSING%' THEN 1
+        ELSE 0
+    END
+FROM silver.nexudus_coworker_invoices s
+JOIN bronze.nexudus_coworker_invoices b
+    ON b.source_id = s.source_id
+WHERE JSON_VALUE(b.raw_json, '$.DueDate') IS NOT NULL;
+GO
+
+
+SELECT TOP 1
+    c.source_id, c.coworker_name, c.location_source_id,
+    CAST(c.start_date AS DATE) AS start_date, c.active, c.cancelled
+FROM silver.nexudus_contracts c
+WHERE c.is_deleted = 0
+  AND c.start_date > GETUTCDATE()
+  AND c.active = 0 AND c.cancelled = 0
+ORDER BY c.start_date;
+
+
+
+SELECT invoice_number, due_date, workflow_type, invoice_status, processing
+FROM gold.finance_dashboard_invoice_worklist
+WHERE invoice_number IN ('GB-INV-2026.05-0188', 'GB-INV-2026.05-0186');
+
+
+SELECT *
+FROM gold.finance_dashboard_invoice_worklist
+WHERE location_name = 'Amsterdam - Center - Herengracht 471'

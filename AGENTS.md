@@ -89,6 +89,9 @@ bronze_to_silver
   -> silver.nexudus_extra_services
   -> silver.nexudus_coworker_invoice_lines
 
+nexudus_to_bronze
+  -> bronze.nexudus_coworker_invoice_histories (only unpaid direct-debit invoices due from last month onward)
+
 nexudus_invoice_pdf_cache (timer, 03:30 UTC)
   -> downloads PDFs from Nexudus API for recent invoices missing pdf_blob_path (last 2 days)
   -> uploads to Azure Blob: nexudus-invoice-pdfs container
@@ -371,6 +374,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - `bronze.xero_invoice_pdfs` — stores `blob_path` reference, not raw bytes
 - `bronze.bamboohr_employees`
 - `bronze.nexudus_coworker_invoice_lines`
+- `bronze.nexudus_coworker_invoice_histories`
 - `bronze.replyio_sequence_steps`
 - `bronze.replyio_sequence_step_performance`
 
@@ -388,7 +392,7 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
 - `silver.nexudus_contracts`
 - `silver.nexudus_resources`
 - `silver.nexudus_extra_services`
-- `silver.nexudus_coworker_invoices` — includes `pdf_blob_path`, `pdf_cached_at`
+- `silver.nexudus_coworker_invoices` — includes `pdf_blob_path`, `pdf_cached_at`, `invoice_status`, `processing`
 - `silver.nexudus_coworker_invoice_lines` — per-invoice line items with `financial_account_code`/`financial_account_name`
 - `silver.nexudus_coworkers`
 - `silver.xero_invoices` — includes `pdf_blob_path`, `pdf_cached_at`
@@ -518,6 +522,16 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
 - `pdf_blob_path IS NULL` AND `updated_on >= 2 days ago` is the watermark — only recently-updated invoices missing a cached PDF are fetched each run
 - invoices returning Nexudus server errors (500/502/503) are marked `__unavailable__` to avoid infinite retries
 - timer function: `nexudus_invoice_pdf_cache` at 03:30 UTC
+
+### Nexudus invoice status and due-date handling
+
+- `shared/nexudus/transformers/coworker_invoices.py` normalizes timezone-aware Nexudus `DueDate` values into the local business timezone before writing silver.
+- Default invoice timezone is `Europe/Amsterdam`; override with `NEXUDUS_INVOICE_TIMEZONE` if needed.
+- Silver invoices carry `invoice_status` and `processing`; finance dashboard gold refreshes exclude invoices where `processing = 1` or `invoice_status` contains `Processing`.
+- The Nexudus invoice API does not expose the UI `Processing` badge as `Status`; direct-debit payment state is derived from `billing/coworkerinvoicehistories` `Payment Result` rows.
+- Histories are fetched only for unpaid direct-debit invoices with due dates from the last month onward (`NEXUDUS_INVOICE_HISTORY_LOOKBACK_MONTHS`, default `1`).
+- `AWAITING`/pending history rows keep an invoice out of the finance dashboard. Failed payment result rows are counted in `payment_failure_count`; invoices enter the dashboard only when the failed-payment count is greater than `3`.
+- One-off finance dashboard rows are held back until `due_date <= today + 2 days`, matching the -2 / due-day reminder start.
 
 ### Xero PDF Storage
 
