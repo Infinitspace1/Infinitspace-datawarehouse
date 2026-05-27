@@ -430,7 +430,10 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
     isn't overstated. `list_price_missing` is suppressed for adjustments.
 - `gold.vw_landlord_contract_book_monthly` (view — `scripts/sql_scripts/landlord_dashboard_schema.sql`)
   - one row per location per month, ±12 months from current UTC month (25 rows per location)
-  - active-in-month: `start_date <= EOMONTH(month)` AND `(cancellation_date IS NULL OR cancellation_date >= month_start)`
+  - active-in-month: `start_date <= EOMONTH(month)` AND `(cancellation_date IS NULL OR cancellation_date >= EOMONTH(month))`
+    - the `>=` (not strict `>`) handles Nexudus's month-end cancellation convention:
+      a contract with `cancellation_date = last_day_of_month` is `active=1` in Nexudus
+      through its last day, so it must count as active for that month
   - `contract_term` NOT used as stop criterion — open-ended contracts stay active indefinitely
   - Includes future-signed contracts (`active=0 AND cancelled=0 AND start_date > today`)
     so they appear in the forecast from their start month forward; also includes
@@ -445,6 +448,43 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
   - filters: `location_source_id IS NOT NULL` AND `(capacity > 0 OR sold_monthly_fee > 0)`
   - pricing re-derived from summed totals (not row averages)
   - status priority: `notice_period > active > paused > inactive` across all contracts for that company
+  - **Follow-up detection** (added 2026-05-27): exposes `has_open_ended_current_contract`,
+    `has_followup_contract`, `followup_contract_count`, `followup_total_monthly_fee`,
+    `earliest_followup_start`, `latest_followup_end_date`, `has_re_engagement`,
+    `next_engagement_date`, `next_engagement_gap_days`, `re_engagement_contract_count`,
+    `re_engagement_total_monthly_fee`, `latest_re_engagement_end_date`, `lifecycle_state`,
+    and the **`effective_end_date`** column dashboards should display instead of
+    `cancellation_date`. The raw aggregate `MAX(cancellation_date)` picks up the
+    latest cancellation across all the company's current contracts (including
+    discount lines), which misrepresents companies that have a follow-up signed
+    or an open-ended office contract.
+    - **Renewal (gap = 0)** → continuous occupancy under Nexudus's same-day cutover
+      convention. Counted via `has_followup_contract`; extends `effective_end_date`
+      to the latest follow-up end.
+    - **Re-engagement (gap >= 1 day, any length up to many months)** → counted via
+      `has_re_engagement`; the company IS leaving on `cancellation_date`
+      (which becomes `effective_end_date`), and the dashboard should surface
+      `next_engagement_date` + `next_engagement_gap_days` as "returning on X
+      after N days". The forecast chart correctly shows zero contribution during
+      the gap months because each contract is counted in its own active months only.
+    - The 0-vs-1+ day boundary is intentional (not 7 days or any other arbitrary
+      threshold): gap=0 reflects Nexudus's same-day handover convention, gap>=1
+      means the contract truly lapses for at least one day so the company is
+      not continuously present.
+    - `lifecycle_state` is a convenience label: `'ongoing'` (open-ended current
+      contract), `'renewing'` (continuous renewal, gap=0), `'returning'`
+      (re-engagement only, has a gap), `'terminating'` (cancellation, no
+      follow-up), `'active'` (no cancellation, no follow-up info).
+    - `effective_end_date` is NULL when (a) any positive-fee current contract is
+      open-ended, or (b) any continuous-renewal follow-up is open-ended; otherwise
+      it returns the latest continuous-renewal end date if available, else falls
+      back to the raw `cancellation_date`.
+    - **Ancillary contracts deliberately excluded**: positive-fee non-desk lines
+      (parking, business address, hot desk, bandwidth, network ports, etc.) are
+      filtered out of `vw_landlord_current_contracts` via the
+      `(capacity > 0 OR sold_monthly_fee < 0)` rule. The dashboard is
+      desk-focused; ancillary revenue (~€12k/month dataset-wide) is intentionally
+      not aggregated here. Use silver/finance views for full revenue.
 
 ### Meta
 
@@ -942,7 +982,9 @@ After any material project change:
 
 ---
 
-Last updated: 2026-05-26 (Landlord dashboard fix: `scripts/sql_scripts/landlord_dashboard_schema.sql` now considers two contract categories that were silently dropped: (1) **future-signed contracts** (`active=0 AND cancelled=0 AND start_date > today`) now appear in `gold.vw_landlord_contract_book_monthly` from their start month forward — previously the `active=1 OR cancelled=1` filter excluded them from the ±12-month forecast; (2) **negative-fee adjustment contracts** (Nexudus allows `price < 0` for discounts/credits/refunds — they typically have no `floor_plan_desk_ids` so the `pl.capacity > 0` filter dropped them) are now included with zero capacity and netted into `sold_monthly_revenue` so revenue isn't overstated. New column `is_negative_adjustment` on `vw_landlord_current_contracts`; new columns `adjustment_contract_count` + `adjustment_monthly_value` on both `vw_landlord_contract_book_monthly` and `vw_landlord_pricing_summary`. `list_price_missing` is suppressed for negative adjustments, and `product_match_coverage_pct` / `active_contract_count` now exclude adjustments from their counts. Added QA 9 (future-contract forecast presence) and QA 10 (negative-adjustment inventory). Current-month view `vw_landlord_current_contracts` still excludes future starts — they belong only to the forward forecast.)
+Last updated: 2026-05-27 (Landlord dashboard fix — follow-up contract surfacing + cutover double-count fix: (A) `gold.vw_landlord_current_companies` gains `has_open_ended_current_contract`, `has_followup_contract`, `followup_contract_count`, `followup_total_monthly_fee`, `earliest_followup_start`, `latest_followup_end_date`, and `effective_end_date`. The `effective_end_date` is the value dashboards should display in place of the raw aggregate `cancellation_date` — it is NULL when an open-ended current contract exists (e.g. ADP Nederland's offices through 2028 with a discount cancelling 2026-07-31) or when a follow-up is genuinely open-ended (RxSight), and otherwise extends to the latest follow-up end date (Allianz: shown 30/06/2026 raw → corrected to 31/12/2026 via follow-up). Detected 32 companies across all locations that had hidden follow-ups; the colleague's manual "Not terminating - check replacement product" annotation is now derivable from the data. (B) `gold.vw_landlord_contract_book_monthly` and `gold.vw_landlord_current_contracts` gain timezone-aware effective_start_date logic: `CAST(DATEADD(HOUR, 4, c.start_date) AS DATE)` converts Nexudus's UTC 22:00 end-of-day timestamps to local-time next-day start. This fixes a chart-side regression where the prior month-end-cancellation fix caused cutover contracts (new contract starts same day old contract ends) to be double-counted in the cutover month. Found 55 such same-day cutovers; the most material was Allianz at Taurusavenue where June 2026 was overstated by €6,600 + ~20 desks. Deployed via `scripts/python_scripts/apply_landlord_fix.py` (now also includes `vw_landlord_current_companies`). See investigation reports: `termination_investigation.txt`.)
+Previous: 2026-05-27 (Landlord dashboard fix — month-end cancellation convention: changed the active-in-month rule in `gold.vw_landlord_current_contracts` and `gold.vw_landlord_contract_book_monthly` from strict `cancellation_date > EOMONTH(month_start)` to `cancellation_date >= EOMONTH(month_start)`. Reason: Nexudus's convention is to set `cancellation_date` to the LAST DAY of a contract's final billable month (e.g. a discount that applies Apr + May has `cancellation_date = 2026-05-31`), and Nexudus keeps `active = 1` through that day. The previous strict-`>` rule silently dropped these contracts from their own final month, overstating revenue (positives dropped) and understating discounts (negatives dropped). The new rule aligns with `gold.vw_finance_dashboard_membership_schedule`'s behaviour. Concrete impact for May 2026: Cainiao (Netherlands) B.V. (Alibaba)'s -€13,650 discount now correctly nets to €0 net revenue (was overstated as +€13,650); Amsterdam-Taurusavenue 3 monthly revenue corrected from €63,041 to €49,391. Same `>` → `>=` change applied to the notice-period branch of the status filter for consistency. `is_cancelling_this_month` flag unchanged — its semantic still works correctly under the new rule. Deployed via `scripts/python_scripts/apply_landlord_fix.py` (idempotent CREATE OR ALTER VIEW). See investigation reports: `partnership_data_findings.txt`, `cainiao_investigation.txt`, `cainiao_finance_investigation.txt`.)
+Previous: 2026-05-26 (Landlord dashboard fix: `scripts/sql_scripts/landlord_dashboard_schema.sql` now considers two contract categories that were silently dropped: (1) **future-signed contracts** (`active=0 AND cancelled=0 AND start_date > today`) now appear in `gold.vw_landlord_contract_book_monthly` from their start month forward — previously the `active=1 OR cancelled=1` filter excluded them from the ±12-month forecast; (2) **negative-fee adjustment contracts** (Nexudus allows `price < 0` for discounts/credits/refunds — they typically have no `floor_plan_desk_ids` so the `pl.capacity > 0` filter dropped them) are now included with zero capacity and netted into `sold_monthly_revenue` so revenue isn't overstated. New column `is_negative_adjustment` on `vw_landlord_current_contracts`; new columns `adjustment_contract_count` + `adjustment_monthly_value` on both `vw_landlord_contract_book_monthly` and `vw_landlord_pricing_summary`. `list_price_missing` is suppressed for negative adjustments, and `product_match_coverage_pct` / `active_contract_count` now exclude adjustments from their counts. Added QA 9 (future-contract forecast presence) and QA 10 (negative-adjustment inventory). Current-month view `vw_landlord_current_contracts` still excludes future starts — they belong only to the forward forecast.)
 Previous: 2026-05-20 (Landlord dashboard: added 3 gold views in `scripts/sql_scripts/landlord_dashboard_schema.sql` — `gold.vw_landlord_current_contracts` (pre-filtered current-month contracts; status filter built into WHERE so Flask reads without further filtering; LEFT JOIN to product_link so contracts without product resolution are included with `list_price_missing=1` rather than silently dropped; abandoned contracts `active=0 AND cancelled=0` excluded), `gold.vw_landlord_contract_book_monthly` (±12 months = 25 rows per location; same status filter applied to contract_facts so abandoned contracts don't inflate history; `contracts_missing_list_price` column for data quality), `gold.vw_landlord_pricing_summary` (current-month KPI aggregation; `product_match_coverage_pct` and `contracts_missing_list_price` for QA). Key semantic change: only `cancellation_date` is a hard stop; `contract_term` is informational only. 8 QA queries included, commented out. No HubSpot pipeline view — no deal pipeline data in ETL.)
 Previous: 2026-05-12 (Observability: `nexudus_to_bronze` now wraps its entire body in `RunTracker("nexudus", "bronze_sync", "bronze")` so auth failures are recorded to `meta.sync_runs` and visible in the health report. `sync_health_report` gained an `_EXPECTED_DAILY` list of 5 critical orchestrator-level entries and a `_find_missing_runs()` check — any expected (source, entity, layer) absent from the window renders as a yellow ⚠ "never started" row, counts toward `[FAIL]` subject, and appears in the summary line as "N never started".)
 Previous: 2026-05-11 (Finance dashboard: added on-demand invoice worklist refresh endpoint `POST /api/finance/refresh-invoice-worklist` (`functions/finance_invoice_worklist_refresh.py`); refreshes silver coworker_invoices → coworker_invoice_lines → coworkers then calls new `gold.sp_refresh_invoice_worklist` (invoice worklist only, skips user_access); SQL procedure in `scripts/sql_scripts/finance_invoice_worklist_sp.sql`; registered under `ENABLE_ETL_FUNCTIONS=1`; all steps tracked in `meta.sync_runs` with `triggered_by=http`.)
