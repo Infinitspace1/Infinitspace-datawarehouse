@@ -293,14 +293,17 @@ async def _sync_tariffs(
     writer: BronzeWriter,
     run_id: uuid.UUID,
 ) -> None:
-    """Phase 2 (2026-05-28): pull all Nexudus tariffs.
+    """Phase 2 (2026-05-28): pull Nexudus tariffs.
 
-    Small reference table (one row per price plan). No UpdatedSince filter —
-    we fetch all every run and let bronze-writer's SHA-256 hash skip the
-    unchanged ones.
+    Uses the UpdatedSince watermark like the other paginated entities so each
+    nightly run only fetches what's changed. The SHA-256 hash check in
+    BronzeWriter.write_tariffs is the second line of defence — it catches
+    updates where Nexudus's UpdatedOn timestamp was bumped but the actual
+    payload didn't change.
     """
+    extra_params = _incremental_params("tariffs")
     async with RunTracker("nexudus", "tariffs", "bronze", metadata=str(run_id)) as run:
-        records = await client.get_all("billing/tariffs")
+        records = await client.get_all("billing/tariffs", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("tariffs", records, run_id)
         changed, run.rows_written = writer.write_tariffs(records)
@@ -317,12 +320,13 @@ async def _sync_financial_accounts(
     writer: BronzeWriter,
     run_id: uuid.UUID,
 ) -> None:
-    """Phase 2 (2026-05-28): pull all Nexudus financial accounts.
+    """Phase 2 (2026-05-28): pull Nexudus financial accounts.
 
-    Small reference table. Same approach as _sync_tariffs.
+    Same incremental approach as _sync_tariffs above.
     """
+    extra_params = _incremental_params("financial_accounts")
     async with RunTracker("nexudus", "financial_accounts", "bronze", metadata=str(run_id)) as run:
-        records = await client.get_all("billing/financialaccounts")
+        records = await client.get_all("billing/financialaccounts", extra_params=extra_params)
         run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("financial_accounts", records, run_id)
         changed, run.rows_written = writer.write_financial_accounts(records)
