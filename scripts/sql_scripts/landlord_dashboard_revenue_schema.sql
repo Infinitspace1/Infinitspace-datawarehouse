@@ -238,6 +238,350 @@ GO
 
 
 -- =============================================================================
+-- Phase 2 (2026-05-28): FUTURE REVENUE + OCCUPANCY (tariff-filtered)
+-- =============================================================================
+--
+-- gold.vw_landlord_membership_book_monthly mirrors
+-- gold.vw_landlord_contract_book_monthly but joins each contract through
+-- its tariff to silver.nexudus_financial_accounts and filters by
+-- LOWER(financial_account.name) LIKE '%membership fee%' — the SAME rule
+-- Phase 1's invoice-based revenue uses. Result: past, current, and future
+-- months are now classified consistently.
+--
+-- Flask reads from this view for the FUTURE side of the forecast chart.
+-- Past months continue to use the invoice-based view from Phase 1.
+--
+-- Output grain: one row per (location, period) — same shape as
+-- vw_landlord_contract_book_monthly so Flask code can swap in with
+-- minimal change.
+-- =============================================================================
+
+CREATE OR ALTER VIEW gold.vw_landlord_membership_book_monthly
+AS
+WITH month_offsets AS (
+    -- 25 months: -12 to +12 from the current UTC month.
+    SELECT -12 AS n
+    UNION ALL
+    SELECT n + 1 FROM month_offsets WHERE n < 12
+),
+month_spine AS (
+    SELECT
+        DATEADD(MONTH, n, DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1)) AS month_start
+    FROM month_offsets
+),
+location_list AS (
+    SELECT
+        source_id       AS location_source_id,
+        name            AS location_name,
+        city            AS location_city,
+        country_name    AS location_country_name
+    FROM silver.nexudus_locations
+    WHERE is_deleted = 0
+),
+-- Same capacity-and-list-price product link as contract_book_monthly so
+-- numbers reconcile on the rows that pass the filter.
+contract_product_link AS (
+    SELECT
+        c.source_id AS contract_source_id,
+        SUM(
+            CASE
+                WHEN p.item_type = 1 THEN ISNULL(NULLIF(p.capacity, 0), 1)
+                WHEN p.item_type IN (2, 3) THEN 1
+                ELSE 0
+            END
+        ) AS capacity,
+        SUM(ISNULL(p.price, 0)) AS list_monthly_fee
+    FROM silver.nexudus_contracts c
+    CROSS APPLY STRING_SPLIT(ISNULL(c.floor_plan_desk_ids, N''), N',') s
+    INNER JOIN silver.nexudus_products p
+        ON  p.source_id = TRY_CONVERT(BIGINT, TRIM(s.value))
+        AND p.item_type IN (1, 2, 3)
+        AND p.is_deleted = 0
+    WHERE TRIM(s.value) <> N''
+      AND c.is_deleted = 0
+    GROUP BY c.source_id
+),
+-- Per-contract facts ALREADY filtered to membership-fee accounts via tariff.
+-- Same status filter as contract_book_monthly:
+--   active=1                                            → current/active
+--   cancelled=1 AND cancellation_date IS NOT NULL       → in or past notice
+--   active=0 AND cancelled=0 AND start_date > today     → future-signed
+-- PLUS the unlinked-future-contract branch (renewal handover gap).
+contract_facts AS (
+    SELECT
+        c.source_id                 AS contract_source_id,
+        c.location_source_id,
+        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS sold_monthly_fee,
+        CAST(c.start_date        AS DATE) AS start_date,
+        CAST(c.cancellation_date AS DATE) AS cancellation_date,
+        CAST(DATEADD(HOUR, 4, c.start_date) AS DATE) AS effective_start_date,
+        pl.capacity,
+        pl.list_monthly_fee,
+        CASE
+            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+            ELSE 0
+        END                          AS is_negative_adjustment
+    FROM silver.nexudus_contracts c
+    INNER JOIN silver.nexudus_tariffs t
+        ON  t.source_id  = c.tariff_id
+        AND t.is_deleted = 0
+    INNER JOIN silver.nexudus_financial_accounts fa
+        ON  fa.source_id = t.financial_account_id
+        AND fa.is_deleted = 0
+    LEFT JOIN contract_product_link pl
+        ON pl.contract_source_id = c.source_id
+    WHERE c.is_deleted = 0
+      AND c.start_date IS NOT NULL
+      -- THE Phase 2 FILTER — same rule as the invoice-based view
+      AND LOWER(fa.name) LIKE N'%membership fee%'
+      -- Status filter — matches vw_landlord_contract_book_monthly
+      AND (
+          c.active = 1
+          OR (c.cancelled = 1 AND c.cancellation_date IS NOT NULL)
+          OR (
+              c.active = 0
+              AND c.cancelled = 0
+              AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
+          )
+      )
+      -- Capacity filter — matches the relaxed version we added 2026-05-28
+      -- (includes unlinked future contracts so renewal handovers don't
+      -- silently drop their revenue from the forecast).
+      AND (
+          pl.capacity > 0
+          OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+          OR (
+              c.active = 0
+              AND c.cancelled = 0
+              AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
+              AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+          )
+      )
+),
+location_capacity AS (
+    SELECT
+        p.location_source_id,
+        SUM(
+            CASE
+                WHEN p.item_type = 1 THEN ISNULL(NULLIF(p.capacity, 0), 1)
+                WHEN p.item_type IN (2, 3) THEN 1
+                ELSE 0
+            END
+        ) AS total_workstation_capacity
+    FROM silver.nexudus_products p
+    INNER JOIN silver.nexudus_locations loc
+        ON  loc.source_id = p.location_source_id
+        AND loc.is_deleted = 0
+    WHERE p.item_type IN (1, 2, 3)
+      AND p.is_available = 1
+      AND p.is_deleted = 0
+      AND NOT (loc.name = N'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE N'2-%')
+    GROUP BY p.location_source_id
+),
+active_by_month AS (
+    SELECT
+        ms.month_start,
+        cf.location_source_id,
+        cf.contract_source_id,
+        cf.capacity,
+        cf.sold_monthly_fee,
+        ISNULL(cf.list_monthly_fee, 0)  AS list_monthly_fee,
+        cf.is_negative_adjustment
+    FROM month_spine ms
+    INNER JOIN contract_facts cf
+        ON  cf.effective_start_date <= EOMONTH(ms.month_start)
+        AND (
+            cf.cancellation_date IS NULL
+            OR cf.cancellation_date >= EOMONTH(ms.month_start)
+        )
+),
+monthly_agg AS (
+    SELECT
+        month_start,
+        location_source_id,
+        SUM(CASE WHEN is_negative_adjustment = 0 THEN 1 ELSE 0 END) AS active_contract_count,
+        SUM(ISNULL(capacity, 0))                                    AS occupied_workstations,
+        SUM(sold_monthly_fee)                                       AS sold_monthly_revenue,
+        SUM(list_monthly_fee)                                       AS list_monthly_revenue,
+        SUM(CASE WHEN is_negative_adjustment = 1 THEN 1 ELSE 0 END) AS adjustment_contract_count,
+        SUM(CASE WHEN is_negative_adjustment = 1 THEN sold_monthly_fee ELSE 0 END) AS adjustment_monthly_value
+    FROM active_by_month
+    GROUP BY month_start, location_source_id
+)
+SELECT
+    FORMAT(ms.month_start, 'yyyy-MM')           AS period,
+    ms.month_start                              AS month_start_date,
+    ll.location_source_id,
+    ll.location_name,
+    ll.location_city,
+    ll.location_country_name,
+
+    ISNULL(lc.total_workstation_capacity, 0)    AS total_workstation_capacity,
+    ISNULL(ma.active_contract_count, 0)         AS active_contract_count,
+    ISNULL(ma.occupied_workstations, 0)         AS occupied_workstations,
+    CASE
+        WHEN ISNULL(lc.total_workstation_capacity, 0) - ISNULL(ma.occupied_workstations, 0) < 0 THEN 0
+        ELSE ISNULL(lc.total_workstation_capacity, 0) - ISNULL(ma.occupied_workstations, 0)
+    END                                         AS vacant_workstations,
+    CAST(
+        100.0 * ISNULL(ma.occupied_workstations, 0)
+        / NULLIF(ISNULL(lc.total_workstation_capacity, 0), 0)
+        AS DECIMAL(9,4)
+    )                                           AS occupancy_pct,
+    ISNULL(ma.sold_monthly_revenue, 0)          AS sold_monthly_revenue,
+    ISNULL(ma.list_monthly_revenue, 0)          AS list_monthly_revenue,
+    CAST(
+        ISNULL(ma.sold_monthly_revenue, 0) / NULLIF(ISNULL(ma.occupied_workstations, 0), 0)
+        AS DECIMAL(18,2)
+    )                                           AS avg_sold_price_per_ws,
+    CAST(
+        ISNULL(ma.list_monthly_revenue, 0) / NULLIF(ISNULL(ma.occupied_workstations, 0), 0)
+        AS DECIMAL(18,2)
+    )                                           AS avg_list_price_per_ws,
+    ISNULL(ma.adjustment_contract_count, 0)     AS adjustment_contract_count,
+    CAST(ISNULL(ma.adjustment_monthly_value, 0) AS DECIMAL(18,2)) AS adjustment_monthly_value,
+    N'membership_book'                          AS calculation_basis
+FROM month_spine ms
+CROSS JOIN location_list ll
+LEFT JOIN location_capacity lc
+    ON  lc.location_source_id = ll.location_source_id
+LEFT JOIN monthly_agg ma
+    ON  ma.month_start        = ms.month_start
+    AND ma.location_source_id = ll.location_source_id;
+GO
+
+
+-- =============================================================================
+-- Phase 2: DATA QUALITY — contracts that LOOK like membership fees but are
+-- missing their floor_plan_desk_ids / capacity link in Nexudus.
+--
+-- These are the renewal-handover / new-tenant cases that show up in revenue
+-- (because of the unlinked-future-contract branch we added) but contribute
+-- 0 to occupancy. Surfaces them so ops can fix the desk assignment in
+-- Nexudus and the dashboard occupancy reflects reality.
+--
+-- Coverage:
+--   1. Active or future-signed contracts
+--   2. financial_account.name LIKE '%membership fee%'
+--   3. EITHER:
+--        - no floor_plan_desk_ids at all, OR
+--        - has floor_plan_desk_ids but they don't resolve to any item_type
+--          1/2/3 product (capacity = 0)
+--   4. Positive fee (we ignore the negative-adjustment lines)
+--
+-- Plus a separate row type for the "tariff without financial account" case
+-- so ops can see those too.
+-- =============================================================================
+
+CREATE OR ALTER VIEW gold.vw_landlord_data_quality_issues
+AS
+WITH product_link AS (
+    SELECT
+        c.source_id AS contract_source_id,
+        SUM(
+            CASE
+                WHEN p.item_type = 1 THEN ISNULL(NULLIF(p.capacity, 0), 1)
+                WHEN p.item_type IN (2, 3) THEN 1
+                ELSE 0
+            END
+        ) AS capacity
+    FROM silver.nexudus_contracts c
+    CROSS APPLY STRING_SPLIT(ISNULL(c.floor_plan_desk_ids, N''), N',') s
+    INNER JOIN silver.nexudus_products p
+        ON  p.source_id = TRY_CONVERT(BIGINT, TRIM(s.value))
+        AND p.item_type IN (1, 2, 3)
+        AND p.is_deleted = 0
+    WHERE TRIM(s.value) <> N''
+      AND c.is_deleted = 0
+    GROUP BY c.source_id
+)
+-- Issue type A: membership-fee contract with no resolvable desks
+SELECT
+    c.source_id                                  AS contract_source_id,
+    c.location_source_id,
+    loc.name                                     AS location_name,
+    COALESCE(
+        NULLIF(c.coworker_company, N''),
+        c.coworker_billing_name,
+        c.coworker_name
+    )                                            AS member_company_name,
+    c.coworker_name,
+    c.tariff_id,
+    t.name                                       AS tariff_name,
+    fa.name                                      AS financial_account_name,
+    CAST(c.start_date AS DATE)                   AS start_date,
+    CAST(c.cancellation_date AS DATE)            AS cancellation_date,
+    COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS monthly_fee,
+    c.floor_plan_desk_ids                        AS desk_ids_raw,
+    N'unlinked_membership_contract'              AS issue_type,
+    CASE
+        WHEN c.floor_plan_desk_ids IS NULL OR c.floor_plan_desk_ids = N''
+            THEN N'No floor_plan_desk_ids set'
+        ELSE N'floor_plan_desk_ids set but no products resolve (deleted? wrong item_type?)'
+    END                                          AS issue_detail,
+    c.last_synced_at
+FROM silver.nexudus_contracts c
+LEFT JOIN silver.nexudus_locations loc
+    ON loc.source_id = c.location_source_id
+INNER JOIN silver.nexudus_tariffs t
+    ON  t.source_id  = c.tariff_id
+    AND t.is_deleted = 0
+INNER JOIN silver.nexudus_financial_accounts fa
+    ON  fa.source_id = t.financial_account_id
+    AND fa.is_deleted = 0
+LEFT JOIN product_link pl
+    ON pl.contract_source_id = c.source_id
+WHERE c.is_deleted = 0
+  AND LOWER(fa.name) LIKE N'%membership fee%'
+  AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+  AND (
+      c.active = 1
+      OR (c.cancelled = 1 AND c.cancellation_date IS NOT NULL)
+      OR (c.active = 0 AND c.cancelled = 0 AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE))
+  )
+  AND ISNULL(pl.capacity, 0) = 0
+
+UNION ALL
+
+-- Issue type B: tariff with no financial account — ops needs to set one
+SELECT
+    c.source_id                                  AS contract_source_id,
+    c.location_source_id,
+    loc.name                                     AS location_name,
+    COALESCE(
+        NULLIF(c.coworker_company, N''),
+        c.coworker_billing_name,
+        c.coworker_name
+    )                                            AS member_company_name,
+    c.coworker_name,
+    c.tariff_id,
+    t.name                                       AS tariff_name,
+    NULL                                         AS financial_account_name,
+    CAST(c.start_date AS DATE)                   AS start_date,
+    CAST(c.cancellation_date AS DATE)            AS cancellation_date,
+    COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS monthly_fee,
+    c.floor_plan_desk_ids                        AS desk_ids_raw,
+    N'tariff_without_financial_account'          AS issue_type,
+    N'Tariff exists but has no financial_account_id — Nexudus admin needs to set one' AS issue_detail,
+    c.last_synced_at
+FROM silver.nexudus_contracts c
+LEFT JOIN silver.nexudus_locations loc
+    ON loc.source_id = c.location_source_id
+INNER JOIN silver.nexudus_tariffs t
+    ON  t.source_id  = c.tariff_id
+    AND t.is_deleted = 0
+    AND t.financial_account_id IS NULL
+WHERE c.is_deleted = 0
+  AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+  AND (
+      c.active = 1
+      OR (c.cancelled = 1 AND c.cancellation_date IS NOT NULL)
+      OR (c.active = 0 AND c.cancelled = 0 AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE))
+  );
+GO
+
+
+-- =============================================================================
 -- QA / VALIDATION QUERIES
 -- Uncomment and run manually after deployment.
 -- =============================================================================
@@ -323,4 +667,17 @@ SELECT *, ROUND(allocated_total - original_total, 2) AS rounding_residual FROM a
 WHERE ABS(allocated_total - original_total) > 0.05;
 */
 
-
+SELECT
+    c.source_id, c.coworker_company, c.tariff_id, t.name AS tariff_name,
+    c.active, c.cancelled, c.floor_plan_desk_ids,
+    CAST(c.start_date AS DATE) AS start_date,
+    CAST(c.cancellation_date AS DATE) AS cancellation_date,
+    COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS fee
+FROM silver.nexudus_contracts c
+LEFT JOIN silver.nexudus_tariffs t ON t.source_id = c.tariff_id
+LEFT JOIN silver.nexudus_locations loc ON loc.source_id = c.location_source_id
+WHERE loc.name = 'London - Holborn - 229-231 High Holborn'
+  AND c.is_deleted = 0
+  AND c.floor_plan_desk_ids IS NOT NULL  -- only contracts with desks
+  AND c.floor_plan_desk_ids <> ''
+ORDER BY fee DESC, cancellation_date;

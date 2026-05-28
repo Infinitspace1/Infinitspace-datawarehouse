@@ -51,6 +51,9 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     from functions.replyio_sync import bp as replyio_bp
     from functions.sync_health_report import bp as sync_health_report_bp
     from functions.xero_sync import bp as xero_sync_bp
+    # Phase 3 (2026-05-28): monthly cron that freezes prior month's landlord
+    # occupancy into silver.landlord_frozen_monthly_occupancy.
+    from functions.landlord_freeze_monthly_occupancy import bp as landlord_freeze_bp
 
     app.register_functions(bronze_bp)
     app.register_functions(silver_bp)
@@ -65,6 +68,7 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     app.register_functions(finance_worklist_refresh_bp)
     app.register_functions(replyio_bp)
     app.register_functions(sync_health_report_bp)
+    app.register_functions(landlord_freeze_bp)
 
 
 if _env_flag("ENABLE_ADMIN_FUNCTIONS", False):

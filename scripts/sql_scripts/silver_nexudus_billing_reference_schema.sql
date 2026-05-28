@@ -176,3 +176,28 @@ SELECT COUNT(*) AS bronze_tariffs              FROM bronze.nexudus_tariffs;
 SELECT COUNT(*) AS bronze_financial_accounts   FROM bronze.nexudus_financial_accounts;
 SELECT COUNT(*) AS silver_tariffs              FROM silver.nexudus_tariffs;
 SELECT COUNT(*) AS silver_financial_accounts   FROM silver.nexudus_financial_accounts;
+
+
+-- Aggregate classification across ALL active contracts — the headline number
+SELECT
+    CASE
+        WHEN LOWER(fa.name) LIKE '%membership fee%' THEN 'MATCH (counts for revenue)'
+        WHEN fa.name IS NOT NULL                    THEN 'other account (excluded — parking/admin/etc)'
+        WHEN t.source_id IS NULL                    THEN 'unresolved tariff'
+        ELSE                                              'tariff without financial account'
+    END                                        AS classification,
+    COUNT(*)                                   AS contract_count,
+    SUM(COALESCE(c.price_with_products, c.price, c.tariff_price, 0)) AS monthly_total
+FROM silver.nexudus_contracts c
+LEFT JOIN silver.nexudus_tariffs t              ON t.source_id  = c.tariff_id
+LEFT JOIN silver.nexudus_financial_accounts fa  ON fa.source_id = t.financial_account_id
+WHERE c.active = 1
+  AND c.is_deleted = 0
+GROUP BY
+    CASE
+        WHEN LOWER(fa.name) LIKE '%membership fee%' THEN 'MATCH (counts for revenue)'
+        WHEN fa.name IS NOT NULL                    THEN 'other account (excluded — parking/admin/etc)'
+        WHEN t.source_id IS NULL                    THEN 'unresolved tariff'
+        ELSE                                              'tariff without financial account'
+    END
+ORDER BY contract_count DESC;
