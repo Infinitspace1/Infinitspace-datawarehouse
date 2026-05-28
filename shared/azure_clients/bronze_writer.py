@@ -401,3 +401,71 @@ class BronzeWriter:
             rows,
         )
         return changed, written
+
+    def write_tariffs(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_tariffs — Phase 2 (2026-05-28).
+
+        Small reference table (one row per price plan). No incremental
+        watermark used on the sync side because the table is tiny; we
+        re-fetch all every run and skip unchanged rows via the SHA-256
+        hash comparison (same pattern as locations).
+        """
+        table = "bronze.nexudus_tariffs"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written
+
+    def write_financial_accounts(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_financial_accounts — Phase 2 (2026-05-28).
+
+        Small reference table (accounting categories). Same approach as
+        write_tariffs above.
+        """
+        table = "bronze.nexudus_financial_accounts"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written

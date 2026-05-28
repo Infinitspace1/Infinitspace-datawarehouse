@@ -14,6 +14,8 @@ Entities pulled (in order):
   7. extra_services         -- GET /billing/extraservices
   8. coworker_invoice_lines -- GET /billing/coworkerinvoicelines
   9. coworker_invoice_histories -- GET /billing/coworkerinvoicehistories
+ 10. tariffs                -- GET /billing/tariffs                  (Phase 2, 2026-05-28)
+ 11. financial_accounts     -- GET /billing/financialaccounts        (Phase 2, 2026-05-28)
 
 Incremental sync:
   Paginated entities (locations, products, contracts, extra_services)
@@ -129,6 +131,9 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
             await _sync_extra_services(client, blob_writer, writer, run_id)
             await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, changed_invoices)
             await _sync_coworker_invoice_histories(client, blob_writer, writer, run_id)
+            # Phase 2 reference data — small tables, full re-fetch each run.
+            await _sync_tariffs(client, blob_writer, writer, run_id)
+            await _sync_financial_accounts(client, blob_writer, writer, run_id)
 
     logger.info(f"Nexudus -> Bronze sync complete [run_id={run_id}]")
 
@@ -278,6 +283,52 @@ async def _sync_extra_services(
         run.rows_skipped = len(records) - len(changed)
         logger.info(
             "Extra services: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
+        )
+
+
+async def _sync_tariffs(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    """Phase 2 (2026-05-28): pull all Nexudus tariffs.
+
+    Small reference table (one row per price plan). No UpdatedSince filter —
+    we fetch all every run and let bronze-writer's SHA-256 hash skip the
+    unchanged ones.
+    """
+    async with RunTracker("nexudus", "tariffs", "bronze", metadata=str(run_id)) as run:
+        records = await client.get_all("billing/tariffs")
+        run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("tariffs", records, run_id)
+        changed, run.rows_written = writer.write_tariffs(records)
+        run.rows_skipped = len(records) - len(changed)
+        logger.info(
+            "Tariffs: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
+        )
+
+
+async def _sync_financial_accounts(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    """Phase 2 (2026-05-28): pull all Nexudus financial accounts.
+
+    Small reference table. Same approach as _sync_tariffs.
+    """
+    async with RunTracker("nexudus", "financial_accounts", "bronze", metadata=str(run_id)) as run:
+        records = await client.get_all("billing/financialaccounts")
+        run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("financial_accounts", records, run_id)
+        changed, run.rows_written = writer.write_financial_accounts(records)
+        run.rows_skipped = len(records) - len(changed)
+        logger.info(
+            "Financial accounts: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
             run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
         )
 

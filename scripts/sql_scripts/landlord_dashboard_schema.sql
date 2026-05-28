@@ -48,6 +48,16 @@
 --                these DO appear in vw_landlord_contract_book_monthly from their
 --                start month forward)
 --
+-- UNLINKED-FUTURE-CONTRACT BRANCH (added 2026-05-28):
+--   The forecast (vw_landlord_contract_book_monthly + vw_landlord_monthly_contract_detail)
+--   also includes future-signed positive-fee contracts that DON'T have
+--   floor_plan_desk_ids yet. Renewal handovers commonly create the new
+--   contract days before ops migrates the desk assignments — without this
+--   branch, the new contract's revenue silently disappears from the forecast.
+--   These contracts contribute their fee to revenue and 0 to capacity (we
+--   don't know the desk count). Flagged via `is_unlinked_future = 1` in the
+--   monthly detail view so dashboards can surface "Desks not linked".
+--
 -- MONTH-END CANCELLATION CONVENTION (changed 2026-05-27):
 --   Nexudus often sets cancellation_date to the LAST DAY of a contract's final
 --   billable month (e.g. a discount that applies April + May has cancellation_date
@@ -533,12 +543,27 @@ contract_facts AS (
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
           )
       )
-      -- Capacity filter: physical desk/office product required, OR negative-fee
-      -- adjustment (discount/credit) which has no product link but must still
-      -- net out of monthly revenue.
+      -- Capacity filter (changed 2026-05-28):
+      --   1. pl.capacity > 0  → contract has a physical desk/office product.
+      --   2. price < 0        → negative-fee adjustment (discount/credit), no product link
+      --                          needed but must net out of monthly revenue.
+      --   3. NEW: future-signed positive-fee contracts WITHOUT floor_plan_desk_ids.
+      --      Renewal handovers / new tenants often sit with no desk link for a
+      --      few days while ops migrates floor_plan_desk_ids from the outgoing
+      --      contract. Without this branch the new contract's revenue silently
+      --      vanishes from the forecast until the link is created — see
+      --      Allianz #1418600394 and RxSight #1418433597 at Hoofddorp Beyond
+      --      (May 2026). They contribute fee to revenue, 0 to capacity (since
+      --      we don't know the desk count yet).
       AND (
           pl.capacity > 0
           OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+          OR (
+              c.active = 0
+              AND c.cancelled = 0
+              AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
+              AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+          )
       )
 ),
 -- Fan out: for each location+month, which contracts are active?
@@ -813,9 +838,17 @@ contract_facts AS (
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
           )
       )
+      -- Capacity filter — mirrors vw_landlord_contract_book_monthly; see the
+      -- comment block in that view for the unlinked-future-contract branch.
       AND (
           pl.capacity > 0
           OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+          OR (
+              c.active = 0
+              AND c.cancelled = 0
+              AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
+              AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+          )
       )
 )
 SELECT
@@ -829,6 +862,18 @@ SELECT
     ISNULL(cf.capacity, 0)                      AS capacity,
     cf.private_office_capacity,
     cf.is_pure_private_office,
+    -- Flag for unlinked future contracts (no floor_plan_desk_ids but a positive
+    -- fee committed for a future month). Lets the drill-down modal surface
+    -- "Desks not linked yet — confirm with ops" without re-deriving the filter.
+    CASE
+        WHEN cf.capacity IS NULL
+         AND cf.sold_monthly_fee > 0
+         AND cf.is_pure_private_office = 0
+         AND cf.private_office_capacity = 0
+         AND cf.effective_start_date > CAST(GETUTCDATE() AS DATE)
+            THEN 1
+        ELSE 0
+    END                                         AS is_unlinked_future,
     CAST(cf.sold_monthly_fee AS DECIMAL(18,2))  AS sold_monthly_fee,
     CAST(cf.list_monthly_fee AS DECIMAL(18,2))  AS list_monthly_fee,
     CAST(

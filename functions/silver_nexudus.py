@@ -44,6 +44,10 @@ ENTITIES = [
     "resources",
     "extra_services",
     "coworker_invoice_lines",
+    # Phase 2 reference data (2026-05-28) — small tables that drive the
+    # landlord dashboard's tariff → financial-account filter.
+    "tariffs",
+    "financial_accounts",
 ]
 
 
