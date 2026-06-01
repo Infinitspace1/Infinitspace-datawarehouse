@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -83,13 +84,17 @@ INSERT INTO silver.location_scraper_globe_v2 (
     latitude, longitude,
     address, postal_code, district, city, country_code,
     price_monthly, price_per_m2, surface_m2, currency,
+    additional_costs_per_m2, total_price_per_m2,
+    divisible_from_m2, price_kind, price_monthly_is_estimated,
     contact_name, company_name, phone,
     lusha_email_1, lusha_contact_1, lusha_title_1, lusha_confidence_1,
     lusha_email_2, lusha_contact_2, lusha_title_2, lusha_confidence_2,
     lusha_email_3, lusha_contact_3, lusha_title_3, lusha_confidence_3,
     hubspot_exported, hubspot_re_location_id,
     refreshed_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETUTCDATE())
 """
 
@@ -176,6 +181,77 @@ def _pick_decimal(obj: dict[str, Any], *paths: str) -> Decimal | None:
             return Decimal(str(val).replace(",", "."))
         except Exception:
             continue
+    return None
+
+
+_IS24_NUMBER_RE = re.compile(r"-?\d[\d.  ]*(?:[.,]\d+)?") if False else None  # placeholder; we use re lazily below
+
+
+def _parse_eu_number(raw: Any) -> Decimal | None:
+    """Parse strings like '16,50 €', '3.20 €/m²', '4.194 m²', '385 m²' to Decimal."""
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float, Decimal)):
+        try:
+            return Decimal(str(raw))
+        except Exception:
+            return None
+    import re as _re
+
+    cleaned = str(raw).replace(" ", " ").replace(" ", " ").strip()
+    match = _re.search(r"-?\d[\d. ]*(?:[.,]\d+)?", cleaned)
+    if not match:
+        return None
+    token = match.group(0).replace(" ", "")
+    if "," in token and "." in token:
+        token = token.replace(".", "").replace(",", ".")
+    elif "," in token:
+        parts = token.split(",")
+        if len(parts) == 2 and len(parts[1]) == 3:
+            token = "".join(parts)
+        else:
+            token = token.replace(",", ".")
+    elif "." in token:
+        parts = token.split(".")
+        if len(parts) == 2 and len(parts[1]) == 3:
+            token = "".join(parts)
+    try:
+        return Decimal(token)
+    except Exception:
+        return None
+
+
+def _iter_is24_attributes(payload: dict[str, Any]):
+    """Yield (label, text) pairs from every IS24 section that carries `attributes`.
+    Covers both TOP_ATTRIBUTES and ATTRIBUTE_LIST (Kosten, Hauptkriterien, etc.).
+    """
+    sections = payload.get("sections")
+    if not isinstance(sections, list):
+        return
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        attrs = section.get("attributes")
+        if not isinstance(attrs, list):
+            continue
+        for attr in attrs:
+            if not isinstance(attr, dict):
+                continue
+            label = attr.get("label")
+            text = attr.get("text")
+            if label is None or text is None:
+                continue
+            yield str(label).strip().lower().rstrip(":"), str(text)
+
+
+def _is24_attr_decimal(payload: dict[str, Any], *label_substrings: str) -> Decimal | None:
+    """Find the first IS24 attribute whose label contains any of the given lowercase substrings."""
+    needles = [s.lower() for s in label_substrings]
+    for label, text in _iter_is24_attributes(payload):
+        if any(n in label for n in needles):
+            value = _parse_eu_number(text)
+            if value is not None:
+                return value
     return None
 
 
@@ -360,6 +436,56 @@ def _map_row(
     item_index = int(row["item_index"])
     hubspot_export = hubspot_exports_by_item.get(item_index, {})
 
+    price_monthly = _pick_decimal(
+        payload,
+        "price",
+        "priceInfo.amount",
+        "basicInfo.price",
+        "normalized.price.amount",
+        "adTargetingParameters.obj_rentPerMonth",
+        "obj_totalRent",
+    )
+    price_per_m2 = _pick_decimal(
+        payload,
+        "pricePerM2",
+        "priceByArea",
+        "adTargetingParameters.obj_rentPerSqM",
+        "obj_baseRent",
+        "basicInfo.priceByArea",
+    )
+    surface_m2 = _pick_decimal(
+        payload,
+        "area",
+        "moreCharacteristics.constructedArea",
+        "basicInfo.size",
+        "adTargetingParameters.obj_mainFloorSpace",
+        "normalized.area.livingSpace",
+        "obj_netFloorSpace",
+    )
+
+    additional_costs_per_m2: Decimal | None = None
+    divisible_from_m2: Decimal | None = None
+    price_kind: str | None = None
+    if source == "immobilienscout":
+        # IS24 office divisibles expose per-m^2 rent + Nebenkosten in TOP_ATTRIBUTES /
+        # the "Kosten" ATTRIBUTE_LIST, while normalized.price.amount stays null.
+        if price_per_m2 is None:
+            price_per_m2 = _is24_attr_decimal(payload, "miete/m", "monatl. miete pro m")
+        additional_costs_per_m2 = _is24_attr_decimal(payload, "nebenkosten/m", "nebenkosten")
+        divisible_from_m2 = _is24_attr_decimal(payload, "teilbar ab", "fläche teilbar ab")
+        price_kind = _pick_str(payload, "normalized.price.kind")
+
+    total_price_per_m2: Decimal | None = None
+    if price_per_m2 is not None and additional_costs_per_m2 is not None:
+        total_price_per_m2 = price_per_m2 + additional_costs_per_m2
+    elif price_per_m2 is not None:
+        total_price_per_m2 = price_per_m2
+
+    price_monthly_is_estimated = 0
+    if price_monthly is None and price_per_m2 is not None and surface_m2 is not None:
+        price_monthly = (price_per_m2 * surface_m2).quantize(Decimal("0.01"))
+        price_monthly_is_estimated = 1
+
     return (
         row["run_id"],
         item_index,
@@ -375,10 +501,15 @@ def _map_row(
         district,
         city,
         country_code,
-        _pick_decimal(payload, "price", "priceInfo.amount", "basicInfo.price", "normalized.price.amount", "adTargetingParameters.obj_rentPerMonth", "obj_totalRent"),
-        _pick_decimal(payload, "pricePerM2", "priceByArea", "adTargetingParameters.obj_rentPerSqM", "obj_baseRent", "basicInfo.priceByArea"),
-        _pick_decimal(payload, "area", "moreCharacteristics.constructedArea", "basicInfo.size", "adTargetingParameters.obj_mainFloorSpace", "normalized.area.livingSpace", "obj_netFloorSpace"),
+        price_monthly,
+        price_per_m2,
+        surface_m2,
         _pick_currency(payload, source),
+        additional_costs_per_m2,
+        total_price_per_m2,
+        divisible_from_m2,
+        price_kind,
+        price_monthly_is_estimated,
         contact_name,
         company_name,
         phone,
