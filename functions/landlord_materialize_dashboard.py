@@ -17,14 +17,16 @@ What it does:
     empty / partial table.
 
 Schedule:
-    LANDLORD_MATERIALIZE_DASHBOARD_SCHEDULE  (NCRONTAB; default "0 */15 * * * *")
-    = every 15 minutes. Set to 0 to keep the table fresh after silver syncs.
+    LANDLORD_MATERIALIZE_DASHBOARD_SCHEDULE  (NCRONTAB; default "0 0 3 * * *")
+    = 03:00 UTC daily — sits between the silver sync (02:30 UTC) and the
+    sync-health email (06:00 UTC), so the snapshot always reflects the latest
+    silver refresh. Override the env var for a different cadence if needed
+    (e.g. "0 0 */6 * * *" for every 6 hours).
 
 Staleness:
-    Membership-fee KPIs change only when contracts/invoices are created or
-    cancelled in Nexudus. A 15-minute lag is fine for the planning use-case
-    this dashboard serves. The dashboard surfaces refreshed_at as "Last
-    refreshed" badge so users can see freshness.
+    Silver itself only refreshes once per day, so running materialization
+    more often than that is wasted compute. The dashboard surfaces
+    refreshed_at as "Last refreshed" badge so users can see freshness.
 
 Idempotency:
     Full TRUNCATE + INSERT — safe to run any time. If the silver layer is
@@ -49,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 bp = func.Blueprint()
 
-SCHEDULE = os.getenv("LANDLORD_MATERIALIZE_DASHBOARD_SCHEDULE", "0 */15 * * * *")
+SCHEDULE = os.getenv("LANDLORD_MATERIALIZE_DASHBOARD_SCHEDULE", "0 0 3 * * *")
 
 
 # ── Refresh specs ─────────────────────────────────────────────────────────────

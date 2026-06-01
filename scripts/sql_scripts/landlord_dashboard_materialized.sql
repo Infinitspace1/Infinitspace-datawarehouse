@@ -8,11 +8,13 @@
 -- STRING_SPLIT(floor_plan_desk_ids) explodes to multi-second query times.
 --
 -- Refresh:
---   functions/landlord_materialize_dashboard.py runs every N minutes
---   (default schedule "0 */15 * * * *") and does:
+--   functions/landlord_materialize_dashboard.py runs daily at 03:00 UTC
+--   (default schedule "0 0 3 * * *", sits between silver sync at 02:30 and
+--   the sync-health email at 06:00) and does:
 --     1. TRUNCATE gold.t_landlord_contract_book_monthly
 --     2. INSERT INTO ... SELECT FROM gold.vw_landlord_contract_book_monthly
---     3. Same for gold.t_landlord_revenue_past_location_monthly
+--     3. Same for gold.t_landlord_revenue_past_location_monthly and
+--        gold.t_landlord_membership_book_monthly
 --   Each refresh is wrapped in a transaction so readers never see a partially
 --   populated table. RunTracker logs row counts + elapsed time.
 --
@@ -22,9 +24,8 @@
 --   pattern.
 --
 -- Staleness budget:
---   Membership-fee KPIs change once a contract is signed/cancelled in Nexudus.
---   For the strategic-partnership dashboard a 15-minute lag is acceptable
---   (the dashboard is used for planning, not real-time ops). The dashboard's
+--   Silver itself refreshes once per day (silver_nexudus at 02:30 UTC), so
+--   the dashboard data is at most one silver-cycle stale. The dashboard's
 --   "last refreshed at" badge surfaces the refresh timestamp.
 -- =============================================================================
 
