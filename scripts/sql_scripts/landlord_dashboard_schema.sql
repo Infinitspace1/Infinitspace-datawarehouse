@@ -504,6 +504,13 @@ contract_facts AS (
     SELECT
         c.source_id                 AS contract_source_id,
         c.location_source_id,
+        -- Member identity — used to group positive contracts with their
+        -- negative-adjustment discount lines for the per-WS PO KPI.
+        COALESCE(
+            NULLIF(c.coworker_company, N''),
+            c.coworker_billing_name,
+            c.coworker_name
+        )                            AS member_company_name,
         COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS sold_monthly_fee,
         CAST(c.start_date        AS DATE) AS start_date,
         CAST(c.cancellation_date AS DATE) AS cancellation_date,
@@ -572,6 +579,7 @@ active_by_month AS (
         ms.month_start,
         cf.location_source_id,
         cf.contract_source_id,
+        cf.member_company_name,
         cf.capacity,
         cf.sold_monthly_fee,
         ISNULL(cf.list_monthly_fee, 0)  AS list_monthly_fee,
@@ -621,6 +629,52 @@ active_by_month AS (
             OR cf.cancellation_date >= EOMONTH(ms.month_start)
         )
 ),
+-- ── Per-member roll-up per (location, month) ─────────────────────────────────
+-- Lets the avg_sold_price_per_ws / avg_list_price_per_ws KPIs filter out
+-- members whose NET sold is 0 (fully comped — e.g. Elusis B.V at Herengracht).
+-- Each member's gross pure-PO sold gets netted with that same member's
+-- negative-fee adjustment contracts (Nexudus stores discounts as separate
+-- contracts), giving the actual amount they pay. We then keep only members
+-- whose net > 0 to feed the PO benchmark. Mirrors the popup table row-by-row.
+per_member_per_month AS (
+    SELECT
+        month_start,
+        location_source_id,
+        member_company_name,
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0
+                 THEN sold_monthly_fee ELSE 0 END)         AS po_gross_sold,
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0
+                 THEN ISNULL(list_monthly_fee, 0) ELSE 0 END) AS po_list,
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0
+                 THEN ISNULL(capacity, 0) ELSE 0 END)      AS po_capacity,
+        SUM(CASE WHEN is_negative_adjustment = 1
+                 THEN sold_monthly_fee ELSE 0 END)         AS adj_sold
+    FROM active_by_month
+    GROUP BY month_start, location_source_id, member_company_name
+),
+-- Filter: members with PO capacity AND net sold > 0
+po_members_monthly AS (
+    SELECT
+        month_start,
+        location_source_id,
+        po_gross_sold + adj_sold AS net_sold,
+        po_list,
+        po_capacity
+    FROM per_member_per_month
+    WHERE po_capacity > 0
+      AND (po_gross_sold + adj_sold) > 0
+),
+-- Roll up to (location, month) for the KPI calculation
+po_kpi_monthly AS (
+    SELECT
+        month_start,
+        location_source_id,
+        SUM(net_sold)    AS po_net_sold,
+        SUM(po_list)     AS po_list_total,
+        SUM(po_capacity) AS po_capacity_total
+    FROM po_members_monthly
+    GROUP BY month_start, location_source_id
+),
 monthly_agg AS (
     SELECT
         month_start,
@@ -637,19 +691,20 @@ monthly_agg AS (
         SUM(CASE WHEN is_negative_adjustment = 1 THEN 1 ELSE 0 END)         AS adjustment_contract_count,
         SUM(CASE WHEN is_negative_adjustment = 1 THEN sold_monthly_fee ELSE 0 END) AS adjustment_monthly_value,
 
-        -- Private-office-only aggregates. Used by avg_sold_price_per_ws /
-        -- avg_list_price_per_ws / avg_discount_pct downstream — these KPIs are
-        -- restricted to private offices (item_type = 1) since hot / dedicated
-        -- desks drag the average down and are not what a landlord benchmarks on.
-        -- Mixed contracts (PO + parking, etc.) are excluded via is_pure_private_office
-        -- because the contract-level sold price can't be split per product.
-        SUM(CASE WHEN is_pure_private_office = 1 THEN ISNULL(capacity, 0) ELSE 0 END)
+        -- Private-office-only aggregates that feed avg_sold_price_per_ws /
+        -- avg_list_price_per_ws / avg_discount_pct downstream. Restricted to:
+        --   1. is_pure_private_office = 1 (every product is item_type = 1)
+        --   2. sold_monthly_fee <> 0      (drop zero-priced / comped contracts
+        --                                  so they don't deflate the per-WS avg)
+        -- Negative-fee adjustment contracts (the actual discounts) are netted
+        -- in downstream via adjustment_monthly_value.
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0 THEN ISNULL(capacity, 0) ELSE 0 END)
                                                                             AS private_office_capacity,
-        SUM(CASE WHEN is_pure_private_office = 1 THEN sold_monthly_fee ELSE 0 END)
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0 THEN sold_monthly_fee ELSE 0 END)
                                                                             AS private_office_sold_revenue,
-        SUM(CASE WHEN is_pure_private_office = 1 THEN list_monthly_fee ELSE 0 END)
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0 THEN list_monthly_fee ELSE 0 END)
                                                                             AS private_office_list_revenue,
-        SUM(CASE WHEN is_pure_private_office = 1 AND is_negative_adjustment = 0 THEN 1 ELSE 0 END)
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0 AND is_negative_adjustment = 0 THEN 1 ELSE 0 END)
                                                                             AS private_office_contract_count
     FROM active_by_month
     GROUP BY month_start, location_source_id
@@ -684,26 +739,30 @@ SELECT
     ISNULL(ma.sold_monthly_revenue, 0)          AS sold_monthly_revenue,
     ISNULL(ma.list_monthly_revenue, 0)          AS list_monthly_revenue,
 
-    -- ── Per-workstation pricing KPIs (PRIVATE OFFICES ONLY) ──────────────────
-    -- Computed from is_pure_private_office contracts only. See monthly_agg
-    -- comments above for rationale.
+    -- ── Per-workstation pricing KPIs (PRIVATE OFFICES ONLY, formula D) ────
+    -- Numerator   = SUM(net sold) per PO member with net sold > 0
+    -- Denominator = SUM(PO desks) over the same set of members
+    -- "Net sold" = member's gross pure-PO sold + their own negative-fee
+    -- adjustment contracts (Nexudus stores discounts as separate negative
+    -- rows). Fully-comped members (net = 0) are dropped so their desks
+    -- don't deflate the per-WS average. Mirrors the dashboard popup.
     CAST(
-        ISNULL(ma.private_office_sold_revenue, 0)
-        / NULLIF(ISNULL(ma.private_office_capacity, 0), 0)
+        ISNULL(pk.po_net_sold, 0)
+        / NULLIF(ISNULL(pk.po_capacity_total, 0), 0)
         AS DECIMAL(18,2)
     )                                           AS avg_sold_price_per_ws,
     CAST(
-        ISNULL(ma.private_office_list_revenue, 0)
-        / NULLIF(ISNULL(ma.private_office_capacity, 0), 0)
+        ISNULL(pk.po_list_total, 0)
+        / NULLIF(ISNULL(pk.po_capacity_total, 0), 0)
         AS DECIMAL(18,2)
     )                                           AS avg_list_price_per_ws,
     CAST(
-        (ISNULL(ma.private_office_list_revenue, 0) - ISNULL(ma.private_office_sold_revenue, 0))
-        / NULLIF(ISNULL(ma.private_office_list_revenue, 0), 0)
+        (ISNULL(pk.po_list_total, 0) - ISNULL(pk.po_net_sold, 0))
+        / NULLIF(ISNULL(pk.po_list_total, 0), 0)
         AS DECIMAL(9,4)
     )                                           AS avg_discount_pct,
     CAST(
-        ISNULL(ma.private_office_list_revenue, 0) - ISNULL(ma.private_office_sold_revenue, 0)
+        ISNULL(pk.po_list_total, 0) - ISNULL(pk.po_net_sold, 0)
         AS DECIMAL(18,2)
     )                                           AS discount_monthly_value,
 
@@ -740,7 +799,10 @@ LEFT JOIN location_capacity lc
     ON  lc.location_source_id = ll.location_source_id
 LEFT JOIN monthly_agg ma
     ON  ma.month_start        = ms.month_start
-    AND ma.location_source_id = ll.location_source_id;
+    AND ma.location_source_id = ll.location_source_id
+LEFT JOIN po_kpi_monthly pk
+    ON  pk.month_start        = ms.month_start
+    AND pk.location_source_id = ll.location_source_id;
 GO
 
 
@@ -919,96 +981,115 @@ GO
 
 CREATE OR ALTER VIEW gold.vw_landlord_pricing_summary
 AS
+-- ── Per-member roll-up FIRST (member_company_name × location) ─────────────────
+-- Lets us filter by "net sold > 0 per member" before the location-level
+-- aggregate, so fully-comped members (Elusis at Herengracht etc.) drop their
+-- desks from both numerator and denominator. Matches what the dashboard
+-- popup shows row-by-row.
+WITH per_member AS (
+    SELECT
+        location_source_id,
+        location_name,
+        location_city,
+        location_country_name,
+        member_company_name,
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0
+                 THEN sold_monthly_fee ELSE 0 END) AS po_gross_sold,
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0
+                 THEN ISNULL(list_monthly_fee, 0) ELSE 0 END) AS po_list,
+        SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0
+                 THEN capacity ELSE 0 END) AS po_capacity,
+        SUM(CASE WHEN is_negative_adjustment = 1
+                 THEN sold_monthly_fee ELSE 0 END) AS adj_sold
+    FROM gold.vw_landlord_current_contracts
+    GROUP BY
+        location_source_id, location_name, location_city, location_country_name,
+        member_company_name
+),
+-- Members with at least one pure-PO contract AND positive net sold after
+-- their own discounts. Members with no PO, or net = 0 (fully comped), don't
+-- contribute to the per-WS PO benchmark.
+po_members AS (
+    SELECT *,
+           po_gross_sold + adj_sold AS net_sold
+    FROM per_member
+    WHERE po_capacity > 0
+      AND (po_gross_sold + adj_sold) > 0
+),
+-- Location-level aggregates for revenue / occupancy (ALL contracts, not just PO).
+loc_totals AS (
+    SELECT
+        location_source_id,
+        location_name,
+        location_city,
+        location_country_name,
+        CAST(SUM(sold_monthly_fee)            AS DECIMAL(18,2)) AS sold_monthly_revenue,
+        CAST(SUM(ISNULL(list_monthly_fee,0))  AS DECIMAL(18,2)) AS list_monthly_revenue,
+        SUM(ISNULL(capacity, 0))                                AS occupied_workstations,
+        SUM(CASE WHEN is_negative_adjustment = 0 THEN 1 ELSE 0 END) AS active_contract_count,
+        SUM(CASE WHEN is_pure_private_office = 1 AND is_negative_adjustment = 0 THEN 1 ELSE 0 END) AS private_office_contract_count,
+        SUM(CASE WHEN is_pure_private_office = 1 THEN capacity ELSE 0 END)        AS private_office_capacity,
+        SUM(list_price_missing)                                 AS contracts_missing_list_price,
+        SUM(is_negative_adjustment)                             AS adjustment_contract_count,
+        CAST(SUM(CASE WHEN is_negative_adjustment = 1 THEN sold_monthly_fee ELSE 0 END) AS DECIMAL(18,2)) AS adjustment_monthly_value,
+        CAST(
+            100.0 * SUM(CASE WHEN is_negative_adjustment = 0 AND list_price_missing = 0 THEN 1 ELSE 0 END)
+            / NULLIF(SUM(CASE WHEN is_negative_adjustment = 0 THEN 1 ELSE 0 END), 0)
+            AS DECIMAL(9,4)
+        )                                                       AS product_match_coverage_pct
+    FROM gold.vw_landlord_current_contracts
+    GROUP BY location_source_id, location_name, location_city, location_country_name
+)
 SELECT
-    location_source_id,
-    location_name,
-    location_city,
-    location_country_name,
-    FORMAT(
-        DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1),
-        'yyyy-MM'
-    )                                               AS period,
+    lt.location_source_id,
+    lt.location_name,
+    lt.location_city,
+    lt.location_country_name,
+    FORMAT(DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1), 'yyyy-MM') AS period,
 
-    -- Revenue (sold always populated; list NULL where product link missing).
-    -- Includes ALL desk types: private offices, dedicated desks, hot desks.
-    CAST(SUM(sold_monthly_fee)  AS DECIMAL(18,2))  AS sold_monthly_revenue,
-    CAST(SUM(ISNULL(list_monthly_fee, 0)) AS DECIMAL(18,2)) AS list_monthly_revenue,
+    -- Revenue: includes ALL desk types
+    lt.sold_monthly_revenue,
+    lt.list_monthly_revenue,
 
-    -- ── Per-workstation pricing KPIs (PRIVATE OFFICES ONLY) ──────────────────
-    -- Landlords benchmark pricing on private offices, not on hot / dedicated
-    -- desks (whose per-WS price is structurally lower and would skew the
-    -- average down). We therefore restrict the avg sold / list price / discount
-    -- to contracts where is_pure_private_office = 1 — i.e. every product on the
-    -- contract is item_type = 1. Mixed contracts (e.g. office + parking +
-    -- storage) are excluded because Nexudus stores a single contract price
-    -- that cannot be cleanly attributed to individual product components.
-    --
-    -- Revenue (above) continues to include every desk type — landlords still
-    -- want the total revenue picture, just not the average mixed in.
+    -- ── Per-WS pricing KPIs (PRIVATE OFFICES ONLY, formula D) ─────────────
+    -- avg_sold_price_per_ws = SUM(member net sold) / SUM(member PO desks)
+    --                         over PO members with net sold > 0
+    -- avg_list_price_per_ws = SUM(member PO list)  / SUM(member PO desks)
+    -- Match what's visible in the popup table row-by-row.
     CAST(
-        SUM(CASE WHEN is_pure_private_office = 1 THEN sold_monthly_fee ELSE 0 END)
-        / NULLIF(SUM(CASE WHEN is_pure_private_office = 1 THEN capacity ELSE 0 END), 0)
+        ISNULL((SELECT SUM(net_sold)    FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
+        / NULLIF((SELECT SUM(po_capacity) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
         AS DECIMAL(18,2)
-    )                                               AS avg_sold_price_per_ws,
+    ) AS avg_sold_price_per_ws,
     CAST(
-        SUM(CASE WHEN is_pure_private_office = 1 THEN ISNULL(list_monthly_fee, 0) ELSE 0 END)
-        / NULLIF(SUM(CASE WHEN is_pure_private_office = 1 THEN capacity ELSE 0 END), 0)
+        ISNULL((SELECT SUM(po_list)     FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
+        / NULLIF((SELECT SUM(po_capacity) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
         AS DECIMAL(18,2)
-    )                                               AS avg_list_price_per_ws,
-
-    -- Discount KPIs (also PRIVATE OFFICES ONLY) — NULL when no PO list prices
-    -- exist for this location.
+    ) AS avg_list_price_per_ws,
     CAST(
-        (SUM(CASE WHEN is_pure_private_office = 1 THEN ISNULL(list_monthly_fee, 0) ELSE 0 END)
-         - SUM(CASE WHEN is_pure_private_office = 1 THEN sold_monthly_fee ELSE 0 END))
-        / NULLIF(SUM(CASE WHEN is_pure_private_office = 1 THEN ISNULL(list_monthly_fee, 0) ELSE 0 END), 0)
+        ((SELECT SUM(po_list)    FROM po_members pm WHERE pm.location_source_id = lt.location_source_id)
+         - (SELECT SUM(net_sold) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id))
+        / NULLIF((SELECT SUM(po_list) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
         AS DECIMAL(9,4)
-    )                                               AS avg_discount_pct,
+    ) AS avg_discount_pct,
     CAST(
-        SUM(CASE WHEN is_pure_private_office = 1 THEN ISNULL(list_monthly_fee, 0) ELSE 0 END)
-        - SUM(CASE WHEN is_pure_private_office = 1 THEN sold_monthly_fee ELSE 0 END)
+        ISNULL((SELECT SUM(po_list)  FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
+        - ISNULL((SELECT SUM(net_sold) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
         AS DECIMAL(18,2)
-    )                                               AS discount_monthly_value,
+    ) AS discount_monthly_value,
 
-    -- Transparency: how many PO contracts feed the averages above, plus how
-    -- many capacity units. Lets the dashboard expose "Avg based on N private
-    -- offices" so a small-sample number isn't misread as the whole book.
-    SUM(CASE WHEN is_pure_private_office = 1 AND is_negative_adjustment = 0 THEN 1 ELSE 0 END)
-                                                    AS private_office_contract_count,
-    SUM(CASE WHEN is_pure_private_office = 1 THEN capacity ELSE 0 END)
-                                                    AS private_office_capacity,
+    -- Transparency
+    lt.private_office_contract_count,
+    lt.private_office_capacity,
+    lt.occupied_workstations,
+    lt.active_contract_count,
+    lt.product_match_coverage_pct,
+    lt.contracts_missing_list_price,
+    lt.adjustment_contract_count,
+    lt.adjustment_monthly_value,
 
-    -- Occupancy
-    SUM(ISNULL(capacity, 0))                        AS occupied_workstations,
-    SUM(CASE WHEN is_negative_adjustment = 0 THEN 1 ELSE 0 END) AS active_contract_count,
-
-    -- QA: fraction of *real* contracts with a valid product-price link.
-    -- Negative-fee adjustments are excluded from both numerator and denominator.
-    CAST(
-        100.0 * SUM(CASE WHEN is_negative_adjustment = 0 AND list_price_missing = 0 THEN 1 ELSE 0 END)
-        / NULLIF(SUM(CASE WHEN is_negative_adjustment = 0 THEN 1 ELSE 0 END), 0)
-        AS DECIMAL(9,4)
-    )                                               AS product_match_coverage_pct,
-
-    -- Number of contracts where list price could not be determined
-    SUM(list_price_missing)                         AS contracts_missing_list_price,
-
-    -- Adjustment lines (discount / credit). adjustment_monthly_value is already
-    -- netted into sold_monthly_revenue above; surfaced separately for transparency.
-    SUM(is_negative_adjustment)                     AS adjustment_contract_count,
-    CAST(
-        SUM(CASE WHEN is_negative_adjustment = 1 THEN sold_monthly_fee ELSE 0 END)
-        AS DECIMAL(18,2)
-    )                                               AS adjustment_monthly_value,
-
-    CAST(GETUTCDATE() AS DATE)                      AS last_refreshed_at
-
-FROM gold.vw_landlord_current_contracts
-GROUP BY
-    location_source_id,
-    location_name,
-    location_city,
-    location_country_name;
+    CAST(GETUTCDATE() AS DATE) AS last_refreshed_at
+FROM loc_totals lt;
 GO
 
 

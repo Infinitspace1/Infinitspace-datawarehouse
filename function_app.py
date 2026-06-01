@@ -54,6 +54,9 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     # Phase 3 (2026-05-28): monthly cron that freezes prior month's landlord
     # occupancy into silver.landlord_frozen_monthly_occupancy.
     from functions.landlord_freeze_monthly_occupancy import bp as landlord_freeze_bp
+    # 15-min cron that materializes the slow gold.vw_landlord_*_monthly views
+    # into tables so the dashboard reads stay sub-second on big locations.
+    from functions.landlord_materialize_dashboard import bp as landlord_materialize_bp
 
     app.register_functions(bronze_bp)
     app.register_functions(silver_bp)
@@ -69,6 +72,7 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     app.register_functions(replyio_bp)
     app.register_functions(sync_health_report_bp)
     app.register_functions(landlord_freeze_bp)
+    app.register_functions(landlord_materialize_bp)
 
 
 if _env_flag("ENABLE_ADMIN_FUNCTIONS", False):
