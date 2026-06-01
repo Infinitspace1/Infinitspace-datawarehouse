@@ -359,7 +359,15 @@ contract_facts AS (
       )
 ),
 location_capacity AS (
+    -- Time-aware capacity per (location, month) — same rules as the contract-book
+    -- view's location_capacity. A product counts toward month M iff:
+    --   1. is_available = 1, is_deleted = 0, price > 0
+    --   2. available_from <= EOMONTH(M)
+    --   3. available_to IS NULL OR available_to >= month_start(M)
+    -- The price > 0 filter excludes Chair-style €0 placeholders; everything else
+    -- (including brand-new just-priced products with no contracts yet) counts.
     SELECT
+        ms.month_start,
         p.location_source_id,
         SUM(
             CASE
@@ -368,15 +376,19 @@ location_capacity AS (
                 ELSE 0
             END
         ) AS total_workstation_capacity
-    FROM silver.nexudus_products p
+    FROM month_spine ms
+    INNER JOIN silver.nexudus_products p
+        ON  p.item_type IN (1, 2, 3)
+        AND p.is_deleted = 0
+        AND p.is_available = 1
+        AND ISNULL(p.price, 0) > 0
+        AND (p.available_from IS NULL OR CAST(p.available_from AS DATE) <= EOMONTH(ms.month_start))
+        AND (p.available_to   IS NULL OR CAST(p.available_to   AS DATE) >= ms.month_start)
     INNER JOIN silver.nexudus_locations loc
         ON  loc.source_id = p.location_source_id
         AND loc.is_deleted = 0
-    WHERE p.item_type IN (1, 2, 3)
-      AND p.is_available = 1
-      AND p.is_deleted = 0
-      AND NOT (loc.name = N'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE N'2-%')
-    GROUP BY p.location_source_id
+    WHERE NOT (loc.name = N'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE N'2-%')
+    GROUP BY ms.month_start, p.location_source_id
 ),
 active_by_month AS (
     SELECT
@@ -445,6 +457,7 @@ FROM month_spine ms
 CROSS JOIN location_list ll
 LEFT JOIN location_capacity lc
     ON  lc.location_source_id = ll.location_source_id
+    AND lc.month_start        = ms.month_start
 LEFT JOIN monthly_agg ma
     ON  ma.month_start        = ms.month_start
     AND ma.location_source_id = ll.location_source_id;

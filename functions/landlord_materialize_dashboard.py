@@ -132,36 +132,37 @@ def _refresh_one(sql, spec: dict, now_iso: str) -> tuple[int, float]:
     return n_rows, elapsed
 
 
-@bp.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
-async def landlord_materialize_dashboard(timer: func.TimerRequest) -> None:
-    """Refresh the materialized landlord-dashboard tables."""
+async def _run_refresh(trigger_source: str) -> dict:
+    """Shared refresh routine used by both the timer trigger and the HTTP
+    trigger. Returns a small dict summary so the HTTP caller can render
+    something useful."""
     now = datetime.now(timezone.utc)
     now_iso = now.replace(microsecond=0).isoformat(sep=" ")
     run_id = uuid.uuid4()
 
     logger.info(
-        "Landlord materialize starting: run_id=%s timestamp=%s",
-        run_id, now_iso,
+        "Landlord materialize starting: run_id=%s trigger=%s timestamp=%s",
+        run_id, trigger_source, now_iso,
     )
 
     async with RunTracker(
         "landlord_dashboard", "materialize_dashboard", "gold",
-        metadata=f"run_id={run_id}",
+        metadata=f"run_id={run_id} trigger={trigger_source}",
     ) as run:
         sql = get_sql_client()
+        per_table = []
         total_rows = 0
 
         for spec in _REFRESHES:
             try:
                 n_rows, elapsed = _refresh_one(sql, spec, now_iso)
                 total_rows += n_rows
+                per_table.append({"target": spec["target"], "rows": n_rows, "elapsed_s": round(elapsed, 2)})
                 logger.info(
                     "Refreshed %s: %d rows in %.2fs",
                     spec["target"], n_rows, elapsed,
                 )
                 if n_rows == 0:
-                    # Don't raise — that would prevent other tables refreshing —
-                    # but flag for the sync-health email.
                     run.log_error(
                         spec["name"],
                         RuntimeError(f"Refresh produced 0 rows for {spec['target']}"),
@@ -169,6 +170,7 @@ async def landlord_materialize_dashboard(timer: func.TimerRequest) -> None:
                     )
             except Exception as exc:
                 logger.exception("Failed to refresh %s", spec["target"])
+                per_table.append({"target": spec["target"], "error": str(exc)})
                 run.log_error(
                     spec["name"],
                     exc,
@@ -179,4 +181,43 @@ async def landlord_materialize_dashboard(timer: func.TimerRequest) -> None:
         logger.info(
             "Landlord materialize complete: run_id=%s total_rows=%d",
             run_id, total_rows,
+        )
+        return {
+            "run_id": str(run_id),
+            "trigger": trigger_source,
+            "timestamp": now_iso,
+            "total_rows_written": total_rows,
+            "tables": per_table,
+        }
+
+
+@bp.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
+async def landlord_materialize_dashboard(timer: func.TimerRequest) -> None:
+    """Daily 03:00 UTC refresh of the materialized landlord-dashboard tables."""
+    await _run_refresh(trigger_source="timer")
+
+
+# HTTP trigger — lets the strategic-partnership Flask app refresh the
+# materialized tables on demand (e.g. after ops fixes data in Nexudus and
+# wants the dashboard to reflect it without waiting for the next daily run).
+# Auth is function-key based: caller must pass the function key in the
+# `x-functions-key` header or `?code=` query param. The Flask app stores the
+# key as LANDLORD_MATERIALIZE_FUNCTION_KEY.
+@bp.route(route="landlord_materialize_dashboard/refresh", auth_level=func.AuthLevel.FUNCTION, methods=["POST"])
+async def landlord_materialize_dashboard_http(req: func.HttpRequest) -> func.HttpResponse:
+    """HTTP-triggered refresh. Returns JSON with per-table row counts."""
+    import json
+    try:
+        result = await _run_refresh(trigger_source="http")
+        return func.HttpResponse(
+            json.dumps(result),
+            status_code=200,
+            mimetype="application/json",
+        )
+    except Exception as exc:
+        logger.exception("HTTP-triggered refresh failed")
+        return func.HttpResponse(
+            json.dumps({"error": str(exc)}),
+            status_code=500,
+            mimetype="application/json",
         )

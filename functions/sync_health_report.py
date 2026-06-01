@@ -46,6 +46,10 @@ _EXPECTED_DAILY: frozenset[tuple[str, str, str]] = frozenset([
     ("bamboohr", "bamboohr_employees", "bronze"),
     ("finance_dashboard", "finance_dashboard", "gold"),
     ("replyio", "sequence_steps", "bronze"),
+    # Landlord dashboard materialization — runs 03:00 UTC daily. If it
+    # silently stops firing, the dashboard would just go stale without
+    # anyone noticing; this guards against that.
+    ("landlord_dashboard", "materialize_dashboard", "gold"),
 ])
 
 

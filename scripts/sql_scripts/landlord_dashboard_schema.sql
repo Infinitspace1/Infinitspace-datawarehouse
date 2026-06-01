@@ -131,6 +131,11 @@ WITH product_link AS (
     -- is_pure_private_office = 1 when ALL products on the contract are PO; mixed
     -- contracts (PO + hot desk + parking) are excluded from PO pricing averages
     -- because Nexudus stores a single contract price that cannot be cleanly split.
+    -- item_type 4 (Other/storeroom/parking) is included so storeroom
+    -- contracts (e.g. 50five at Chausseestrasse) flow revenue through.
+    -- Item type 5 (Meeting Room) is deliberately NOT included: a contract
+    -- pointing to a meeting-room product is a data-quality issue ops needs
+    -- to fix in Nexudus, not something to silently absorb here.
     SELECT
         c.source_id AS contract_source_id,
         SUM(
@@ -158,7 +163,7 @@ WITH product_link AS (
     CROSS APPLY STRING_SPLIT(ISNULL(c.floor_plan_desk_ids, N''), N',') s
     INNER JOIN silver.nexudus_products p
         ON p.source_id = TRY_CONVERT(BIGINT, TRIM(s.value))
-       AND p.item_type IN (1, 2, 3)
+       AND p.item_type IN (1, 2, 3, 4)   -- 4 = Other (storeroom / parking)
        AND p.is_deleted = 0
     WHERE TRIM(s.value) <> N''
       AND c.is_deleted = 0
@@ -201,10 +206,22 @@ SELECT
     ISNULL(pl.is_pure_private_office, 0)     AS is_pure_private_office,
     c.currency_code,
 
-    -- Sold price — always populated from contract fields
-    COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS sold_monthly_fee,
+    -- Sold price — for adjustment contracts (price_with_products < 0), use
+    -- `price` instead. Adjustments have no linked products, so the two
+    -- fields SHOULD be equal — but 4 contracts in Nexudus have a phantom
+    -- delta of €20–180 (e.g. EBCONT 1417662289 at QH). Using `price`
+    -- matches what Nexudus's own UI shows for those.
+    CASE
+        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+            THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
+        ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+    END                                 AS sold_monthly_fee,
     CAST(
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        CASE
+            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+                THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
+            ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        END
         / NULLIF(pl.capacity, 0)
         AS DECIMAL(18,2)
     )                                   AS sold_price_per_ws,
@@ -327,6 +344,15 @@ SELECT
         WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
         ELSE 0
     END                                 AS is_negative_adjustment,
+
+    -- 1 when this contract's tariff sits on a "Membership Fee" financial
+    -- account. Lets downstream PO KPI calculations filter out parking /
+    -- ancillary discounts (e.g. Degura's €600 parking discount at QH would
+    -- otherwise leak into the PO sold side).
+    CASE
+        WHEN LOWER(ISNULL(fa.name, N'')) LIKE N'%membership fee%' THEN 1
+        ELSE 0
+    END                                 AS is_membership_fee_account,
     ISNULL(pl.product_match_count, 0)   AS product_match_count,
 
     -- Timestamps
@@ -339,6 +365,12 @@ LEFT JOIN silver.nexudus_locations loc
     AND loc.is_deleted = 0
 LEFT JOIN product_link pl
     ON  pl.contract_source_id = c.source_id
+LEFT JOIN silver.nexudus_tariffs t
+    ON  t.source_id = c.tariff_id
+    AND t.is_deleted = 0
+LEFT JOIN silver.nexudus_financial_accounts fa
+    ON  fa.source_id = t.financial_account_id
+    AND fa.is_deleted = 0
 WHERE c.is_deleted = 0
 
   -- Status pre-filter: active contracts and notice-period (cancelled but still in
@@ -439,7 +471,22 @@ location_list AS (
 ),
 -- Physical capacity: total available workstations per location (current snapshot).
 location_capacity AS (
+    -- Capacity is PER (location, month) so historical months reflect the
+    -- inventory that was actually bookable at the time.
+    --
+    -- A product counts toward month M's capacity when ALL of:
+    --   1. is_available = 1                           (currently bookable in Nexudus)
+    --   2. is_deleted = 0
+    --   3. available_from <= EOMONTH(M) AND (available_to IS NULL OR available_to >= month_start(M))
+    --   4. price > 0                                  (excludes Chair-style €0 placeholders)
+    --
+    -- Rationale for (4): the "price > 0" filter distinguishes real inventory
+    -- (ops always sets a real rent on a new desk) from junk placeholders
+    -- (Chair = €0, test products) without depending on contract existence —
+    -- so a brand-new PO created today still counts from day 1, while
+    -- never-priced placeholders are excluded forever.
     SELECT
+        ms.month_start,
         p.location_source_id,
         SUM(
             CASE
@@ -448,16 +495,19 @@ location_capacity AS (
                 ELSE 0
             END
         ) AS total_workstation_capacity
-    FROM silver.nexudus_products p
+    FROM month_spine ms
+    INNER JOIN silver.nexudus_products p
+        ON  p.item_type IN (1, 2, 3)
+        AND p.is_deleted = 0
+        AND p.is_available = 1
+        AND ISNULL(p.price, 0) > 0
+        AND (p.available_from IS NULL OR CAST(p.available_from AS DATE) <= EOMONTH(ms.month_start))
+        AND (p.available_to   IS NULL OR CAST(p.available_to   AS DATE) >= ms.month_start)
     INNER JOIN silver.nexudus_locations loc
         ON  loc.source_id = p.location_source_id
         AND loc.is_deleted = 0
-    WHERE p.item_type IN (1, 2, 3)
-      AND p.is_available = 1
-      AND p.is_deleted = 0
-      -- Exclude floor-2 refurb products at Taurusavenue until re-enabled in Nexudus
-      AND NOT (loc.name = N'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE N'2-%')
-    GROUP BY p.location_source_id
+    WHERE NOT (loc.name = N'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE N'2-%')
+    GROUP BY ms.month_start, p.location_source_id
 ),
 -- Per-contract facts used for the monthly rollup.
 -- LEFT JOIN to product_link so contracts without product resolution are still
@@ -468,13 +518,20 @@ location_capacity AS (
 -- (item_type = 1), matching gold.vw_landlord_pricing_summary's behaviour. See
 -- that view's comments for the rationale.
 contract_product_link AS (
+    -- item_type 4 ("Other" — storerooms, parking, etc.) is included so
+    -- contracts billing for storage flow into revenue. Storerooms
+    -- contribute 0 to capacity — they're not desks. Meeting rooms
+    -- (item_type 5) are deliberately NOT included: a contract pointing
+    -- to a meeting-room product is a data-quality issue ops needs to fix
+    -- in Nexudus (the desk needs to become item_type 1), not something
+    -- to silently absorb into revenue here.
     SELECT
         c.source_id AS contract_source_id,
         SUM(
             CASE
                 WHEN p.item_type = 1 THEN ISNULL(NULLIF(p.capacity, 0), 1)
                 WHEN p.item_type IN (2, 3) THEN 1
-                ELSE 0
+                ELSE 0  -- item_type 4 contributes 0 to capacity
             END
         ) AS capacity,
         SUM(ISNULL(p.price, 0)) AS list_monthly_fee,
@@ -494,7 +551,7 @@ contract_product_link AS (
     CROSS APPLY STRING_SPLIT(ISNULL(c.floor_plan_desk_ids, N''), N',') s
     INNER JOIN silver.nexudus_products p
         ON  p.source_id = TRY_CONVERT(BIGINT, TRIM(s.value))
-        AND p.item_type IN (1, 2, 3)
+        AND p.item_type IN (1, 2, 3, 4)   -- 4 = Other (storeroom / parking)
         AND p.is_deleted = 0
     WHERE TRIM(s.value) <> N''
       AND c.is_deleted = 0
@@ -511,7 +568,26 @@ contract_facts AS (
             c.coworker_billing_name,
             c.coworker_name
         )                            AS member_company_name,
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS sold_monthly_fee,
+        -- For adjustment contracts (price < 0), use `price` instead of
+        -- `price_with_products`. Adjustments have no linked products so the
+        -- two SHOULD be equal — but 4 contracts in Nexudus have a phantom
+        -- delta of €20–180 (e.g. EBCONT 1417662289: price=-1149,
+        -- price_with_products=-1224). Using `price` matches what Nexudus's
+        -- own UI shows. Positive contracts keep using price_with_products
+        -- so add-on fees still count.
+        CASE
+            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+                THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
+            ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        END                          AS sold_monthly_fee,
+        -- Whether this contract's tariff is a "Membership Fee" financial
+        -- account. Used downstream to make sure parking/ancillary discounts
+        -- don't get netted into the PO membership-fee KPI (e.g. Degura's
+        -- €600 parking discount at QH).
+        CASE
+            WHEN LOWER(ISNULL(fa.name, N'')) LIKE N'%membership fee%' THEN 1
+            ELSE 0
+        END                          AS is_membership_fee_account,
         CAST(c.start_date        AS DATE) AS start_date,
         CAST(c.cancellation_date AS DATE) AS cancellation_date,
         -- effective_start_date converts Nexudus's UTC end-of-day convention to a
@@ -534,6 +610,12 @@ contract_facts AS (
     FROM silver.nexudus_contracts c
     LEFT JOIN contract_product_link pl
         ON pl.contract_source_id = c.source_id
+    LEFT JOIN silver.nexudus_tariffs t
+        ON  t.source_id  = c.tariff_id
+        AND t.is_deleted = 0
+    LEFT JOIN silver.nexudus_financial_accounts fa
+        ON  fa.source_id  = t.financial_account_id
+        AND fa.is_deleted = 0
     WHERE c.is_deleted = 0
       AND c.start_date IS NOT NULL
       -- Status filter:
@@ -587,6 +669,7 @@ active_by_month AS (
         cf.private_office_list_fee,
         cf.is_pure_private_office,
         cf.is_negative_adjustment,
+        cf.is_membership_fee_account,
         -- list_price_missing: 1 only when a physical product exists (capacity > 0)
         -- but its price in Nexudus is NULL/0 (root cause E). Suppressed for
         -- negative-fee adjustment contracts since they're not expected to carry one.
@@ -647,7 +730,12 @@ per_member_per_month AS (
                  THEN ISNULL(list_monthly_fee, 0) ELSE 0 END) AS po_list,
         SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0
                  THEN ISNULL(capacity, 0) ELSE 0 END)      AS po_capacity,
+        -- Only net adjustments whose tariff sits on a Membership Fee
+        -- financial account. Parking/ancillary discounts (e.g. Degura's
+        -- €600 parking discount at QH) are excluded — they belong to a
+        -- different revenue line.
         SUM(CASE WHEN is_negative_adjustment = 1
+                  AND is_membership_fee_account = 1
                  THEN sold_monthly_fee ELSE 0 END)         AS adj_sold
     FROM active_by_month
     GROUP BY month_start, location_source_id, member_company_name
@@ -797,6 +885,7 @@ FROM month_spine ms
 CROSS JOIN location_list ll
 LEFT JOIN location_capacity lc
     ON  lc.location_source_id = ll.location_source_id
+    AND lc.month_start        = ms.month_start
 LEFT JOIN monthly_agg ma
     ON  ma.month_start        = ms.month_start
     AND ma.location_source_id = ll.location_source_id
@@ -999,7 +1088,12 @@ WITH per_member AS (
                  THEN ISNULL(list_monthly_fee, 0) ELSE 0 END) AS po_list,
         SUM(CASE WHEN is_pure_private_office = 1 AND sold_monthly_fee <> 0
                  THEN capacity ELSE 0 END) AS po_capacity,
+        -- Only net adjustments whose tariff is a "Membership Fee" account.
+        -- Parking / ancillary discounts (e.g. Degura's €600 parking discount
+        -- at QH) are on different financial accounts and would otherwise
+        -- pollute the membership-fee PO sold side.
         SUM(CASE WHEN is_negative_adjustment = 1
+                  AND is_membership_fee_account = 1
                  THEN sold_monthly_fee ELSE 0 END) AS adj_sold
     FROM gold.vw_landlord_current_contracts
     GROUP BY
