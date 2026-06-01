@@ -406,14 +406,17 @@ WHERE c.is_deleted = 0
       OR CAST(c.cancellation_date AS DATE) >= EOMONTH(GETUTCDATE())
   )
 
-  -- Capacity pre-filter: require either at least one physical desk/office product,
-  -- OR a negative-fee adjustment contract (discount / credit). Negatives have no
-  -- product link but their negative sold_monthly_fee must reach the aggregates so
-  -- revenue is not overstated.
-  -- Excludes: Beyond Access (no floor_plan_desk_ids), parking-only, storage-only,
-  -- meeting-room-only contracts whose price is also zero or positive.
+  -- Product-link pre-filter: a contract must EITHER have at least one
+  -- resolved product link (pl.contract_source_id IS NOT NULL — covers desks
+  -- AND storerooms/parking at item_type=4, which contribute 0 to capacity
+  -- but carry real revenue), OR be a negative-fee adjustment (discount /
+  -- credit — no product link, but the negative sold_monthly_fee must reach
+  -- the aggregates).
+  -- Excludes: Beyond Access (no floor_plan_desk_ids at all) and other
+  -- ancillary contracts with no resolvable products, when their price
+  -- is also zero or positive.
   AND (
-      pl.capacity > 0
+      pl.contract_source_id IS NOT NULL
       OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
   );
 GO
@@ -632,20 +635,17 @@ contract_facts AS (
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
           )
       )
-      -- Capacity filter (changed 2026-05-28):
-      --   1. pl.capacity > 0  → contract has a physical desk/office product.
-      --   2. price < 0        → negative-fee adjustment (discount/credit), no product link
-      --                          needed but must net out of monthly revenue.
-      --   3. NEW: future-signed positive-fee contracts WITHOUT floor_plan_desk_ids.
-      --      Renewal handovers / new tenants often sit with no desk link for a
-      --      few days while ops migrates floor_plan_desk_ids from the outgoing
-      --      contract. Without this branch the new contract's revenue silently
-      --      vanishes from the forecast until the link is created — see
-      --      Allianz #1418600394 and RxSight #1418433597 at Hoofddorp Beyond
-      --      (May 2026). They contribute fee to revenue, 0 to capacity (since
-      --      we don't know the desk count yet).
+      -- Product-link filter:
+      --   1. pl.contract_source_id IS NOT NULL → contract has at least one
+      --      resolved product (desk, storeroom, parking — item_type 1/2/3/4).
+      --      Storeroom contracts have capacity=0 but still carry revenue.
+      --   2. price < 0  → negative-fee adjustment (discount/credit), no product
+      --                   link needed but must net out of monthly revenue.
+      --   3. Future-signed positive-fee contracts WITHOUT floor_plan_desk_ids
+      --      (renewal handovers / new tenants — Allianz #1418600394 et al.).
+      --      They contribute fee to revenue, 0 to capacity.
       AND (
-          pl.capacity > 0
+          pl.contract_source_id IS NOT NULL
           OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0
@@ -989,10 +989,10 @@ contract_facts AS (
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
           )
       )
-      -- Capacity filter — mirrors vw_landlord_contract_book_monthly; see the
-      -- comment block in that view for the unlinked-future-contract branch.
+      -- Product-link filter — mirrors vw_landlord_contract_book_monthly.
+      -- See that view for the rationale on each branch.
       AND (
-          pl.capacity > 0
+          pl.contract_source_id IS NOT NULL
           OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0
@@ -1254,11 +1254,20 @@ WITH base AS (
         MAX(cancellation_date)                                  AS cancellation_date,
         MAX(contract_end_date)                                  AS contract_end_date,
 
-        -- Aggregated workstations and revenue
+        -- Aggregated workstations and revenue.
+        -- sold_monthly_fee / list_monthly_fee / discount_value are filtered
+        -- to is_membership_fee_account = 1 so the membership-schedule row
+        -- shows ONLY the member's membership-fee revenue (matches what's
+        -- in the Nexudus pivot export). Parking / Ancillary / Business
+        -- Address contracts have their own financial accounts and don't
+        -- belong in this row. Without this filter, the asymmetry between
+        -- a +€600 parking contract (dropped by the capacity filter
+        -- upstream) and a -€600 parking discount (kept by the price<0
+        -- branch) would produce wrong nets (e.g. Degura at QH).
         SUM(ISNULL(capacity, 0))                                AS capacity,
-        SUM(sold_monthly_fee)                                   AS sold_monthly_fee,
-        SUM(list_monthly_fee)                                   AS list_monthly_fee,
-        SUM(discount_value)                                     AS discount_value,
+        SUM(CASE WHEN is_membership_fee_account = 1 THEN sold_monthly_fee ELSE 0 END) AS sold_monthly_fee,
+        SUM(CASE WHEN is_membership_fee_account = 1 THEN list_monthly_fee ELSE 0 END) AS list_monthly_fee,
+        SUM(CASE WHEN is_membership_fee_account = 1 THEN discount_value   ELSE 0 END) AS discount_value,
         SUM(contract_value)                                     AS contract_value,
         SUM(remaining_contract_value)                           AS remaining_contract_value,
 

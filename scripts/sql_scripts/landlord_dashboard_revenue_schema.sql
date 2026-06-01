@@ -344,11 +344,12 @@ contract_facts AS (
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
           )
       )
-      -- Capacity filter — matches the relaxed version we added 2026-05-28
-      -- (includes unlinked future contracts so renewal handovers don't
-      -- silently drop their revenue from the forecast).
+      -- Product-link filter — matches vw_landlord_contract_book_monthly.
+      -- Accepts any resolved product link (including item_type=4 storeroom/
+      -- parking, which contribute 0 capacity but real revenue), negative
+      -- adjustments, and unlinked-future renewal handovers.
       AND (
-          pl.capacity > 0
+          pl.contract_source_id IS NOT NULL
           OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0
