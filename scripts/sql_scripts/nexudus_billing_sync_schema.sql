@@ -58,6 +58,32 @@ BEGIN
 END
 GO
 
+IF OBJECT_ID('bronze.nexudus_coworker_invoice_histories', 'U') IS NULL
+BEGIN
+    CREATE TABLE bronze.nexudus_coworker_invoice_histories (
+        id                  BIGINT              IDENTITY(1,1) PRIMARY KEY,
+        sync_run_id         UNIQUEIDENTIFIER    NOT NULL,
+        source_id           BIGINT              NOT NULL,
+        invoice_source_id   BIGINT              NULL,
+        raw_json            NVARCHAR(MAX)       NOT NULL,
+        payload_hash        CHAR(64)            NULL,
+        synced_at           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
+        CONSTRAINT uq_bronze_nexudus_coworker_invoice_histories_source UNIQUE (source_id)
+    );
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_bronze_nexudus_coworker_invoice_histories_invoice'
+      AND object_id = OBJECT_ID('bronze.nexudus_coworker_invoice_histories')
+)
+BEGIN
+    CREATE INDEX ix_bronze_nexudus_coworker_invoice_histories_invoice
+        ON bronze.nexudus_coworker_invoice_histories (invoice_source_id);
+END
+GO
+
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
     WHERE name = 'ix_bronze_nexudus_coworkers_location'
@@ -96,6 +122,9 @@ BEGIN
         bill_to_tax_id_number       NVARCHAR(128)       NULL,
         description                 NVARCHAR(MAX)       NULL,
         currency_code               NVARCHAR(8)         NULL,
+        invoice_status              NVARCHAR(64)        NULL,
+        processing                  BIT                 NULL,
+        payment_failure_count       INT                 NULL,
         due_date                    DATETIME2           NULL,
         invoice_from_date           DATETIME2           NULL,
         invoice_to_date             DATETIME2           NULL,
@@ -123,6 +152,38 @@ BEGIN
         first_seen_at               DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
         last_synced_at              DATETIME2           NOT NULL DEFAULT GETUTCDATE()
     );
+END
+GO
+
+IF COL_LENGTH('silver.nexudus_coworker_invoices', 'invoice_status') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD invoice_status NVARCHAR(64) NULL;
+END
+GO
+
+IF COL_LENGTH('silver.nexudus_coworker_invoices', 'processing') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD processing BIT NULL;
+END
+GO
+
+IF COL_LENGTH('silver.nexudus_coworker_invoices', 'payment_failure_count') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD payment_failure_count INT NULL;
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'ix_silver_nexudus_coworker_invoices_processing'
+      AND object_id = OBJECT_ID('silver.nexudus_coworker_invoices')
+)
+BEGIN
+    CREATE INDEX ix_silver_nexudus_coworker_invoices_processing
+        ON silver.nexudus_coworker_invoices (processing, invoice_status);
 END
 GO
 

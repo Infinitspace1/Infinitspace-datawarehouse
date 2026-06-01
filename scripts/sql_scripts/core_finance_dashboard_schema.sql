@@ -108,6 +108,9 @@ CREATE TABLE gold.finance_dashboard_invoice_worklist (
     company_display_name        NVARCHAR(512)       NULL,
     company_email               NVARCHAR(512)       NULL,
     currency_code               NVARCHAR(8)         NULL,
+    invoice_status              NVARCHAR(64)        NULL,
+    processing                  BIT                 NOT NULL DEFAULT 0,
+    payment_failure_count       INT                 NULL,
     invoice_date                DATE                NULL,
     due_date                    DATE                NULL,
     as_of_date_utc              DATE                NOT NULL,
@@ -133,6 +136,30 @@ GO
 
 CREATE INDEX ix_gold_finance_dashboard_invoice_worklist_workflow_due
     ON gold.finance_dashboard_invoice_worklist (workflow_type, due_date);
+GO
+
+IF OBJECT_ID('silver.nexudus_coworker_invoices', 'U') IS NOT NULL
+   AND COL_LENGTH('silver.nexudus_coworker_invoices', 'invoice_status') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD invoice_status NVARCHAR(64) NULL;
+END
+GO
+
+IF OBJECT_ID('silver.nexudus_coworker_invoices', 'U') IS NOT NULL
+   AND COL_LENGTH('silver.nexudus_coworker_invoices', 'processing') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD processing BIT NULL;
+END
+GO
+
+IF OBJECT_ID('silver.nexudus_coworker_invoices', 'U') IS NOT NULL
+   AND COL_LENGTH('silver.nexudus_coworker_invoices', 'payment_failure_count') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD payment_failure_count INT NULL;
+END
 GO
 
 -- Revenue and occupancy snapshot
@@ -320,8 +347,12 @@ BEGIN
             nci.location_source_id,
             nci.location_name,
             nci.currency_code,
+            nci.invoice_status,
+            ISNULL(nci.processing, 0) AS processing,
+            nci.payment_failure_count,
             nci.invoice_from_date,
             nci.due_date,
+            CAST((nci.due_date AT TIME ZONE 'UTC' AT TIME ZONE 'Central European Standard Time') AS DATE) AS due_date_local,
             nci.total_amount,
             nci.due_amount,
             nci.paid_amount,
@@ -332,8 +363,14 @@ BEGIN
           AND nci.void = 0
           AND nci.draft = 0
           AND nci.paid = 0
-          AND nci.credit_note = 0
+          -- Nexudus's CreditNote flag is unreliable — it gets set on normal
+          -- invoices that have received credits from a prior invoice (e.g.
+          -- ADP INV-2026.05-0645). Real credit notes are paid/zero-balance
+          -- so the due_amount > 0 AND paid = 0 gates above already exclude
+          -- them.
           AND nci.is_deleted = 0
+          AND ISNULL(nci.processing, 0) = 0
+          AND UPPER(ISNULL(nci.invoice_status, N'')) NOT LIKE N'%PROCESSING%'
           AND nci.due_date >= '2026-03-01'
     ),
     invoice_account_flags AS (
@@ -367,6 +404,9 @@ BEGIN
         company_display_name,
         company_email,
         currency_code,
+        invoice_status,
+        processing,
+        payment_failure_count,
         invoice_date,
         due_date,
         as_of_date_utc,
@@ -404,18 +444,21 @@ BEGIN
             inv.coworker_billing_email
         ) AS company_email,
         inv.currency_code,
+        inv.invoice_status,
+        inv.processing,
+        inv.payment_failure_count,
         CAST(inv.invoice_from_date AS DATE) AS invoice_date,
-        CAST(inv.due_date AS DATE) AS due_date,
+        inv.due_date_local AS due_date,
         CAST(GETUTCDATE() AS DATE) AS as_of_date_utc,
-        DATEDIFF(DAY, CAST(GETUTCDATE() AS DATE), CAST(inv.due_date AS DATE)) AS days_until_due,
+        DATEDIFF(DAY, CAST(GETUTCDATE() AS DATE), inv.due_date_local) AS days_until_due,
         CASE
-            WHEN CAST(inv.due_date AS DATE) < CAST(GETUTCDATE() AS DATE)
-                THEN DATEDIFF(DAY, CAST(inv.due_date AS DATE), CAST(GETUTCDATE() AS DATE))
+            WHEN inv.due_date_local < CAST(GETUTCDATE() AS DATE)
+                THEN DATEDIFF(DAY, inv.due_date_local, CAST(GETUTCDATE() AS DATE))
             ELSE 0
         END AS days_overdue,
         CASE
-            WHEN CAST(inv.due_date AS DATE) < CAST(GETUTCDATE() AS DATE) THEN N'overdue'
-            WHEN CAST(inv.due_date AS DATE) = CAST(GETUTCDATE() AS DATE) THEN N'due_today'
+            WHEN inv.due_date_local < CAST(GETUTCDATE() AS DATE) THEN N'overdue'
+            WHEN inv.due_date_local = CAST(GETUTCDATE() AS DATE) THEN N'due_today'
             ELSE N'upcoming'
         END AS due_state,
         inv.total_amount,
@@ -800,3 +843,27 @@ GO
 --   AND p.is_available = 1
 --   AND p.is_deleted = 0
 -- ORDER BY item_type, p.name;
+
+EXEC gold.sp_refresh_invoice_worklist;
+EXEC gold.sp_refresh_finance_dashboard;
+
+SELECT invoice_number, due_date, invoice_status, processing
+FROM silver.nexudus_coworker_invoices
+WHERE invoice_number IN ('GB-INV-2026.05-0173', 'GB-INV-2026.05-0175');
+
+SELECT invoice_number, due_date, workflow_type, invoice_status, processing
+FROM gold.finance_dashboard_invoice_worklist
+WHERE invoice_number IN ('GB-INV-2026.05-0185', 'GB-INV-2026.05-0186','GB-INV-2026.05-0188');
+
+
+
+-- How many future-signed contracts are out there?
+SELECT active, cancelled, COUNT(*)
+FROM silver.nexudus_contracts
+WHERE is_deleted = 0 AND start_date > GETUTCDATE()
+GROUP BY active, cancelled;
+
+-- Total impact of negative adjustments on current-month revenue
+SELECT SUM(sold_monthly_fee) AS net_adjustment_value, COUNT(*) AS adjustment_count
+FROM gold.vw_landlord_current_contracts
+WHERE is_negative_adjustment = 1;

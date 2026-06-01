@@ -13,6 +13,9 @@ Entities pulled (in order):
   6. resources              -- GET /spaces/resources/{id}
   7. extra_services         -- GET /billing/extraservices
   8. coworker_invoice_lines -- GET /billing/coworkerinvoicelines
+  9. coworker_invoice_histories -- GET /billing/coworkerinvoicehistories
+ 10. tariffs                -- GET /billing/tariffs                  (Phase 2, 2026-05-28)
+ 11. financial_accounts     -- GET /billing/financialaccounts        (Phase 2, 2026-05-28)
 
 Incremental sync:
   Paginated entities (locations, products, contracts, extra_services)
@@ -26,6 +29,10 @@ Incremental sync:
   coworker_invoice_lines fetches lines only for invoices returned by
   the coworker_invoices step (using CoworkerInvoiceLine_CoworkerInvoice
   filter per invoice).
+
+  coworker_invoice_histories fetches histories only for unpaid direct-debit
+  invoices with due dates from the last month onward. These histories drive
+  finance-dashboard suppression while payments are still processing.
 
   Per-record entities (resources, coworkers) are driven by their parent
   entity and cannot use UpdatedSince directly.
@@ -123,6 +130,10 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
             await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
             await _sync_extra_services(client, blob_writer, writer, run_id)
             await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, changed_invoices)
+            await _sync_coworker_invoice_histories(client, blob_writer, writer, run_id)
+            # Phase 2 reference data — small tables, full re-fetch each run.
+            await _sync_tariffs(client, blob_writer, writer, run_id)
+            await _sync_financial_accounts(client, blob_writer, writer, run_id)
 
     logger.info(f"Nexudus -> Bronze sync complete [run_id={run_id}]")
 
@@ -276,6 +287,56 @@ async def _sync_extra_services(
         )
 
 
+async def _sync_tariffs(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    """Phase 2 (2026-05-28): pull Nexudus tariffs.
+
+    Uses the UpdatedSince watermark like the other paginated entities so each
+    nightly run only fetches what's changed. The SHA-256 hash check in
+    BronzeWriter.write_tariffs is the second line of defence — it catches
+    updates where Nexudus's UpdatedOn timestamp was bumped but the actual
+    payload didn't change.
+    """
+    extra_params = _incremental_params("tariffs")
+    async with RunTracker("nexudus", "tariffs", "bronze", metadata=str(run_id)) as run:
+        records = await client.get_all("billing/tariffs", extra_params=extra_params)
+        run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("tariffs", records, run_id)
+        changed, run.rows_written = writer.write_tariffs(records)
+        run.rows_skipped = len(records) - len(changed)
+        logger.info(
+            "Tariffs: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
+        )
+
+
+async def _sync_financial_accounts(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    """Phase 2 (2026-05-28): pull Nexudus financial accounts.
+
+    Same incremental approach as _sync_tariffs above.
+    """
+    extra_params = _incremental_params("financial_accounts")
+    async with RunTracker("nexudus", "financial_accounts", "bronze", metadata=str(run_id)) as run:
+        records = await client.get_all("billing/financialaccounts", extra_params=extra_params)
+        run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("financial_accounts", records, run_id)
+        changed, run.rows_written = writer.write_financial_accounts(records)
+        run.rows_skipped = len(records) - len(changed)
+        logger.info(
+            "Financial accounts: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
+        )
+
+
 async def _sync_coworker_invoices(
     client: NexudusClient,
     blob_writer: BlobWriter,
@@ -396,6 +457,105 @@ async def _sync_coworker_invoice_lines(
             "%s written to bronze, %s errors [blob=%s]",
             len(invoice_ids),
             len(all_lines),
+            run.rows_written,
+            errors,
+            blob_path,
+        )
+
+
+def _load_invoice_history_candidate_ids(lookback_months: int) -> list[int]:
+    """Return unpaid direct-debit invoices due from the recent window onward."""
+    sql = get_sql_client()
+    rows = sql.execute_query(
+        """
+        WITH latest_invoice AS (
+            SELECT source_id, MAX(synced_at) AS latest
+            FROM bronze.nexudus_coworker_invoices
+            GROUP BY source_id
+        ),
+        latest_payload AS (
+            SELECT b.source_id, b.raw_json
+            FROM bronze.nexudus_coworker_invoices b
+            INNER JOIN latest_invoice latest
+                ON latest.source_id = b.source_id
+               AND latest.latest = b.synced_at
+        )
+        SELECT source_id
+        FROM latest_payload
+        WHERE TRY_CONVERT(
+                  DATETIME2,
+                  REPLACE(JSON_VALUE(raw_json, '$.DueDate'), 'Z', ''),
+                  126
+              ) >= DATEADD(MONTH, -?, GETUTCDATE())
+          AND ISNULL(TRY_CONVERT(FLOAT, JSON_VALUE(raw_json, '$.DueAmount')), 0) > 0
+          AND ISNULL(JSON_VALUE(raw_json, '$.Paid'), 'false') <> 'true'
+          AND ISNULL(JSON_VALUE(raw_json, '$.Void'), 'false') <> 'true'
+          AND ISNULL(JSON_VALUE(raw_json, '$.Draft'), 'false') <> 'true'
+          -- Nexudus's CreditNote flag is unreliable (it gets set on normal
+          -- DD invoices like QH-INV-2026.05-0711). We mirror the worklist
+          -- procs and skip the credit_note filter here so flagged-but-real
+          -- DD invoices still get their payment-result history fetched.
+          AND (
+              JSON_VALUE(raw_json, '$.CoworkerEnableGoCardlessPayments') = 'true'
+              OR JSON_VALUE(raw_json, '$.GoCardlessReference') IS NOT NULL
+              OR JSON_VALUE(raw_json, '$.CoworkerRegularPaymentProvider') IS NOT NULL
+          )
+        ORDER BY source_id
+        """,
+        (lookback_months,),
+    )
+    return [int(row["source_id"]) for row in rows if row.get("source_id")]
+
+
+async def _sync_coworker_invoice_histories(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    lookback_months = int(os.getenv("NEXUDUS_INVOICE_HISTORY_LOOKBACK_MONTHS", "1"))
+    invoice_ids = _load_invoice_history_candidate_ids(lookback_months)
+    if not invoice_ids:
+        logger.info("Coworker invoice histories: no candidate invoices, skipping")
+        return
+
+    logger.info(
+        "Coworker invoice histories: fetching histories for %s direct-debit invoices due from last %s month(s)",
+        len(invoice_ids),
+        lookback_months,
+    )
+
+    async with RunTracker("nexudus", "coworker_invoice_histories", "bronze", metadata=str(run_id)) as run:
+        all_histories: list[dict] = []
+        errors = 0
+        tasks = [client.get_coworker_invoice_histories(invoice_id) for invoice_id in invoice_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for invoice_id, result in zip(invoice_ids, results):
+            if isinstance(result, Exception):
+                logger.warning("Invoice histories for %s failed: %s", invoice_id, result)
+                errors += 1
+                continue
+            all_histories.extend(result)
+
+        run.rows_read = len(invoice_ids)
+        run.rows_skipped = errors
+        if all_histories:
+            blob_path = blob_writer.write_snapshot(
+                "coworker_invoice_histories", all_histories, run_id
+            )
+            _changed, run.rows_written = writer.write_coworker_invoice_histories(
+                all_histories
+            )
+        else:
+            blob_path = "none"
+            run.rows_written = 0
+
+        logger.info(
+            "Coworker invoice histories: %s invoices queried, %s history rows fetched, "
+            "%s written to bronze, %s errors [blob=%s]",
+            len(invoice_ids),
+            len(all_histories),
             run.rows_written,
             errors,
             blob_path,

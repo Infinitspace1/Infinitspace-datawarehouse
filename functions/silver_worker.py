@@ -43,6 +43,8 @@ from shared.azure_clients.silver_writer_coworker_invoice_lines import SilverCowo
 from shared.azure_clients.silver_writer_coworkers import SilverCoworkersWriter
 from shared.azure_clients.silver_writer_resources import SilverResourcesWriter
 from shared.azure_clients.silver_writer_extra_services import SilverExtraServicesWriter
+from shared.azure_clients.silver_writer_tariffs import SilverTariffsWriter
+from shared.azure_clients.silver_writer_financial_accounts import SilverFinancialAccountsWriter
 from shared.azure_clients.run_tracker import RunTracker
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,15 @@ _ENTITY_MAP = {
     "coworker_invoice_lines": (
         SilverCoworkerInvoiceLinesWriter,
         lambda r: r.get("coworker_invoice_lines", 0),
+    ),
+    # Phase 2 reference data (2026-05-28) — see silver_nexudus.py.
+    "tariffs": (
+        SilverTariffsWriter,
+        lambda r: r.get("tariffs", 0),
+    ),
+    "financial_accounts": (
+        SilverFinancialAccountsWriter,
+        lambda r: r.get("financial_accounts", 0),
     ),
 }
 

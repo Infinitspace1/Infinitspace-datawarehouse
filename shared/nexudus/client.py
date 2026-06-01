@@ -147,6 +147,18 @@ class NexudusClient:
             extra_params={"CoworkerInvoiceLine_CoworkerInvoice": invoice_source_id},
         )
 
+    async def get_coworker_invoice_histories(self, invoice_source_id: int) -> list[dict]:
+        """
+        Fetch all history entries for a single coworker invoice.
+
+        Endpoint:
+            GET /api/billing/coworkerinvoicehistories?CoworkerInvoiceHistory_CoworkerInvoice={id}
+        """
+        return await self.get_all(
+            "billing/coworkerinvoicehistories",
+            extra_params={"CoworkerInvoiceHistory_CoworkerInvoice": invoice_source_id},
+        )
+
     async def get_invoice_pdf(self, invoice_source_id: int) -> Optional[bytes]:
         """
         Download the PDF for a coworker invoice.
