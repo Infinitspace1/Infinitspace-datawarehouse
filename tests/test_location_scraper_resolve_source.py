@@ -7,6 +7,7 @@ from shared.location_scraper.activities.resolve import resolve_source
 from shared.location_scraper.config import (
     IDEALISTA_ACTOR_ID,
     IMMOBILIENSCOUT_ACTOR_ID,
+    LOOPNET_ACTOR_ID,
     OTODOM_ACTOR_ID,
 )
 
@@ -70,9 +71,27 @@ class TestResolveSource:
         assert "immobilienscout24.de/Suche/de/hessen/frankfurt-am-main/buero-mieten" in cfg.start_url
         assert cfg.run_id == "run-de-2"
 
+    def test_london_loopnet(self):
+        cfg = resolve_source("London", None, "run-uk-1")  # case-insensitive
+        assert cfg.city == "london"
+        assert cfg.country == "uk"
+        assert cfg.country_code == "gb"
+        assert cfg.actor == "loopnet"
+        assert cfg.actor_id == LOOPNET_ACTOR_ID
+        assert cfg.start_url == (
+            "https://www.loopnet.com/search/office-properties/"
+            "london-england--united-kingdom/for-rent/"
+        )
+
+    def test_london_ignores_shape(self):
+        """LoopNet UK uses URL geocoding — shape (Idealista polygon) must be ignored."""
+        with_shape = resolve_source("london", "POLYGON", "x")
+        without = resolve_source("london", None, "x")
+        assert with_shape.start_url == without.start_url
+
     def test_unknown_city_raises(self):
         with pytest.raises(ValueError, match="not recognised"):
-            resolve_source("london", None, "x")
+            resolve_source("atlantis", None, "x")
 
     def test_case_insensitive(self):
         cfg1 = resolve_source("MADRID", None, "x")

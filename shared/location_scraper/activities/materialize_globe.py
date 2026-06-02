@@ -18,7 +18,13 @@ import pyodbc
 
 from shared.gmaps.geocoding import GeocodingCache
 from shared.azure_clients.sql_client import get_sql_client
+from shared.location_scraper.adapters.loopnet import (
+    MIN_SURFACE_M2,
+    available_surface_m2_from_payload,
+    currency_for_country,
+)
 from shared.location_scraper.config import get_country_code_for_city
+from shared.location_scraper.free_geocoding import NominatimGeocodingCache
 from shared.location_scraper.geocoding import geocode_missing_coordinates
 
 logger = logging.getLogger(__name__)
@@ -283,6 +289,9 @@ def _pick_floor(payload: dict[str, Any], source: str) -> str | None:
 
 
 def _pick_currency(payload: dict[str, Any], source: str) -> str | None:
+    if source == "loopnet":
+        # LoopNet has no currency field — derive from country (GB -> GBP, else USD).
+        return currency_for_country(_pick_str(payload, "country", "countryCode"))
     currency = _pick_str(payload, "priceCurrency", "normalized.price.currency", "basicInfo.currency", "currency")
     if currency:
         return currency.upper()
@@ -325,6 +334,30 @@ def _building_key(latitude: Any, longitude: Any, floor: Any) -> tuple[str, str, 
         return None
     floor_key = str(floor) if floor is not None else "null"
     return (f"{float(latitude):.4f}", f"{float(longitude):.4f}", floor_key)
+
+
+def _loopnet_broker_contacts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build globe contact slots from LoopNet's own broker fields.
+
+    LoopNet returns broker contact (incl. email) on every listing, so we skip
+    Lusha for it — but the globe email slots must still be populated. We take up
+    to 3 broker emails, naming the first with `brokerName`.
+    """
+    emails: list[str] = []
+    primary = payload.get("brokerEmail")
+    if primary and str(primary).strip():
+        emails.append(str(primary).strip())
+    for email in payload.get("brokerEmails") or []:
+        s = str(email).strip() if email is not None else ""
+        if s and s not in emails:
+            emails.append(s)
+    name = payload.get("brokerName")
+    company = payload.get("brokerCompany")
+    title = f"Broker — {company}" if company else "Broker"
+    return [
+        {"email": email, "name": name if i == 0 else None, "title": title, "confidence": None}
+        for i, email in enumerate(emails[:3])
+    ]
 
 
 def _contact_slots(contacts: list[dict[str, Any]]) -> tuple:
@@ -382,18 +415,18 @@ def _map_row(
     row: dict[str, Any],
     contacts_by_key: dict[tuple[str, str, str], list[dict[str, Any]]],
     hubspot_exports_by_item: dict[int, dict[str, Any]],
-    geocode_cache: GeocodingCache | None = None,
-) -> tuple:
+    geocode_cache: Any = None,
+) -> tuple | None:
     payload = json.loads(row["payload_json"])
     source = row["source"]
 
     country_default = get_country_code_for_city(row["city"]) or {"otodom": "PL", "immobilienscout": "DE"}.get(source)
     latitude = _pick_float(payload, "basicInfo.address.lat", "sections[3].location.lat", "ubication.latitude", "latitude", "geo_wgs84Lat", "normalized.address.latitude")
     longitude = _pick_float(payload, "basicInfo.address.lon", "sections[3].location.lng", "ubication.longitude", "longitude", "geo_wgs84Lon", "normalized.address.longitude")
-    external_id = _pick_str(payload, "normalized.listingId", "header.id", "basicInfo.id", "adid", "id")
-    listing_url = _pick_str(payload, "normalized.url", "detailWebLink", "propertyUrl", "basicInfo.url", "url")
-    address = _pick_str(payload, "basicInfo.address.line", "normalized.address.formatted", "ubication.title", "street", "location", "basicInfo.address")
-    postal_code = _pick_str(payload, "contactInfo.address.postalCode", "normalized.address.zip", "adTargetingParameters.obj_zipCode")
+    external_id = _pick_str(payload, "normalized.listingId", "header.id", "basicInfo.id", "adid", "id", "propertyId")
+    listing_url = _pick_str(payload, "normalized.url", "detailWebLink", "propertyUrl", "basicInfo.url", "url", "listingUrl", "inferUrl")
+    address = _pick_str(payload, "basicInfo.address.line", "normalized.address.formatted", "ubication.title", "street", "location", "basicInfo.address", "address")
+    postal_code = _pick_str(payload, "contactInfo.address.postalCode", "normalized.address.zip", "adTargetingParameters.obj_zipCode", "zip")
     district = _pick_str(payload, "district", "basicInfo.district", "geo_ot", "adTargetingParameters.obj_regio4", "subdistrict", "basicInfo.neighborhood", "ubication.administrativeAreaLevel3")
     city = _pick_str(payload, "basicInfo.municipality", "normalized.address.region", "normalized.address.city", "city", "ubication.administrativeAreaLevel2") or row["city"]
     country_code = (_pick_str(payload, "countryCode", "normalized.countryCode", "country", "basicInfo.country") or country_default or "").upper()
@@ -416,21 +449,25 @@ def _map_row(
                 address = geocoded.get("formatted_address")
 
     floor = _pick_floor(payload, source)
-    contacts = (
-        contacts_by_key.get(_building_key(latitude, longitude, floor))
-        or contacts_by_key.get(_building_key(latitude, longitude, None))
-        or []
-    )
+    if source == "loopnet":
+        # LoopNet skips Lusha — surface the broker email(s) from the payload.
+        contacts = _loopnet_broker_contacts(payload)
+    else:
+        contacts = (
+            contacts_by_key.get(_building_key(latitude, longitude, floor))
+            or contacts_by_key.get(_building_key(latitude, longitude, None))
+            or []
+        )
     contact_name = (
         _otodom_individual_contact_name(payload)
         if source == "otodom"
-        else _pick_str(payload, "contactInfo.contactName", "normalized.contact.name", "contact.contactData.agent.name", "sellerName", "contactName", "advertiserName")
+        else _pick_str(payload, "contactInfo.contactName", "normalized.contact.name", "contact.contactData.agent.name", "sellerName", "contactName", "advertiserName", "brokerName")
     )
-    company_name = _pick_str(payload, "contactInfo.commercialName", "normalized.contact.company", "contact.contactData.agent.company", "agencyName")
+    company_name = _pick_str(payload, "contactInfo.commercialName", "normalized.contact.company", "contact.contactData.agent.company", "agencyName", "brokerCompany")
     phone = (
         _otodom_phone_for_contact(payload, contact_name)
         if source == "otodom"
-        else _pick_str(payload, "contactInfo.phone1.phoneNumberForMobileDialing", "normalized.contact.phone", "contact.phoneNumbers[0].text", "sellerPhone", "obj_phoneNumber") or _first_seller_phone(payload)
+        else _pick_str(payload, "contactInfo.phone1.phoneNumberForMobileDialing", "normalized.contact.phone", "contact.phoneNumbers[0].text", "sellerPhone", "obj_phoneNumber", "brokerPhone") or _first_seller_phone(payload)
     )
 
     item_index = int(row["item_index"])
@@ -462,6 +499,14 @@ def _map_row(
         "normalized.area.livingSpace",
         "obj_netFloorSpace",
     )
+
+    if source == "loopnet":
+        # Surface comes from "33,889 SF ... Available" (sq ft -> m²), not the
+        # generic numeric paths. Drop anything under 1500 m² — the rest is trash.
+        loopnet_m2 = available_surface_m2_from_payload(payload)
+        if loopnet_m2 is None or loopnet_m2 < MIN_SURFACE_M2:
+            return None
+        surface_m2 = Decimal(str(loopnet_m2))
 
     additional_costs_per_m2: Decimal | None = None
     divisible_from_m2: Decimal | None = None
@@ -542,10 +587,18 @@ def materialize_globe_run(payload: dict[str, Any]) -> dict[str, int]:
         return {"rows_written": 0}
 
     contacts_by_key = _load_lusha_contacts_by_building(sql, rows[0]["source"])
-    geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else None
-    insert_rows = [_map_row(r, contacts_by_key, hubspot_exports_by_item, geocode_cache) for r in rows]
+    # Google Maps when a key is set, else the free Nominatim geocoder.
+    geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else NominatimGeocodingCache()
+    mapped = [_map_row(r, contacts_by_key, hubspot_exports_by_item, geocode_cache) for r in rows]
+    # _map_row returns None for rows that must be dropped (e.g. LoopNet < 1500 m²).
+    insert_rows = [r for r in mapped if r is not None]
+    if not insert_rows:
+        return {"rows_written": 0}
     written = sql.execute_many(_INSERT_ROW, insert_rows)
-    logger.info("location_scraper globe materialized run_id=%s rows=%d", run_id, len(insert_rows))
+    logger.info(
+        "location_scraper globe materialized run_id=%s rows=%d (dropped=%d)",
+        run_id, len(insert_rows), len(mapped) - len(insert_rows),
+    )
     return {"rows_written": len(insert_rows) if written == -1 else int(written)}
 
 

@@ -63,7 +63,13 @@ MONTHLY_CITIES = (
     "dusseldorf",
     "stuttgart",
     "warsaw",
+    "london",
 )
+
+# Sources whose listing payload already carries broker name/company/phone/email,
+# so the Lusha enrichment fan-out is skipped (broker email is persisted + shown
+# on the globe directly). LoopNet returns broker contact on every listing.
+LUSHA_SKIP_SOURCES = {"loopnet"}
 
 
 def _safe_mark_run_failed(run_id: str | None, error: str) -> None:
@@ -268,50 +274,64 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             {"actor": source_config["actor"], "items": raw_items, "city": source_config["city"]},
         )
 
-        # 6. Dedupe agencies
-        agencies: list[dict] = yield context.call_activity("ls_dedupe_agencies", listings)
+        # Steps 6-9 (Lusha enrichment) are skipped for sources that already
+        # carry broker contact + email in the listing payload (e.g. LoopNet):
+        # the broker email is persisted by ls_upsert_sql and surfaced on the
+        # globe directly from the raw payload, so Lusha would be redundant cost.
+        if source_config["actor"] in LUSHA_SKIP_SOURCES:
+            logger.info(
+                "Skipping Lusha enrichment for source=%s city=%s (broker contact comes from the listing)",
+                source_config["actor"],
+                source_config["city"],
+            )
+            enriched_agencies = []
+            enrichment_diag = _summarize_enrichment_diagnostics([])
+            bundles = []
+        else:
+            # 6. Dedupe agencies
+            agencies: list[dict] = yield context.call_activity("ls_dedupe_agencies", listings)
 
-        # 7. Filter out agencies already enriched in SQL
-        new_agencies: list[dict] = yield context.call_activity(
-            "ls_filter_new_agencies",
-            {"agencies": agencies, "listings": listings},
-        )
+            # 7. Filter out agencies already enriched in SQL
+            new_agencies: list[dict] = yield context.call_activity(
+                "ls_filter_new_agencies",
+                {"agencies": agencies, "listings": listings},
+            )
 
-        # 8. Fan-out: enrich each agency in parallel
-        enrich_tasks = [
-            context.call_activity(
-                "ls_enrich_agency",
+            # 8. Fan-out: enrich each agency in parallel
+            enrich_tasks = [
+                context.call_activity(
+                    "ls_enrich_agency",
+                    {
+                        "agency": agency,
+                        "country": source_config["country"],
+                        "country_code": source_config["country_code"],
+                    },
+                )
+                for agency in (new_agencies or [])
+            ]
+            if enrich_tasks:
+                enriched_agencies: list[dict] = (yield context.task_all(enrich_tasks)) or []
+            else:
+                enriched_agencies = []
+            enrichment_diag = _summarize_enrichment_diagnostics(enriched_agencies)
+            logger.info(
+                "Location scraper enrichment summary run_id=%s city=%s %s",
+                run_id,
+                source_config["city"],
+                json.dumps(enrichment_diag, sort_keys=True),
+            )
+            yield context.call_activity(
+                "ls_write_lusha_diagnostics",
                 {
-                    "agency": agency,
-                    "country": source_config["country"],
-                    "country_code": source_config["country_code"],
+                    "run_id": run_id,
+                    "source": source_config["actor"],
+                    "city": source_config["city"],
+                    "enriched_agencies": enriched_agencies,
                 },
             )
-            for agency in (new_agencies or [])
-        ]
-        if enrich_tasks:
-            enriched_agencies: list[dict] = (yield context.task_all(enrich_tasks)) or []
-        else:
-            enriched_agencies = []
-        enrichment_diag = _summarize_enrichment_diagnostics(enriched_agencies)
-        logger.info(
-            "Location scraper enrichment summary run_id=%s city=%s %s",
-            run_id,
-            source_config["city"],
-            json.dumps(enrichment_diag, sort_keys=True),
-        )
-        yield context.call_activity(
-            "ls_write_lusha_diagnostics",
-            {
-                "run_id": run_id,
-                "source": source_config["actor"],
-                "city": source_config["city"],
-                "enriched_agencies": enriched_agencies,
-            },
-        )
 
-        # 9. Consolidate contacts (dedup + top-3 per agency)
-        bundles: list[dict] = yield context.call_activity("ls_consolidate_contacts", enriched_agencies)
+            # 9. Consolidate contacts (dedup + top-3 per agency)
+            bundles: list[dict] = yield context.call_activity("ls_consolidate_contacts", enriched_agencies)
 
         # 10. Upsert buildings, listings, contacts to SQL
         stats: dict = yield context.call_activity(

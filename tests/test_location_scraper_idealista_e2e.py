@@ -140,8 +140,21 @@ def test_normalize_idealista():
     assert listing["days_on_market"] >= 0
 
 
-def test_normalize_idealista_missing_coords():
-    """Items without lat/lon should still be normalized (coords will be None)."""
+def test_normalize_idealista_missing_coords(monkeypatch):
+    """Items without lat/lon should still be normalized.
+
+    With no geocoder available, coordinates stay None. We stub the free geocoder
+    so the test stays offline (no live Nominatim call) and asserts that path.
+    """
+    class _NoGeocode:
+        def get_or_geocode(self, _address):
+            return None
+
+    monkeypatch.setattr(
+        "shared.location_scraper.activities.scrape.NominatimGeocodingCache",
+        _NoGeocode,
+    )
+
     item = dict(RAW_IDEALISTA_ITEM)
     item["ubication"] = {}
     result = normalize_listings({"actor": "idealista", "items": [item], "city": "madrid"})

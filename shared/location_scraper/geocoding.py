@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any
 
 from shared.gmaps.geocoding import GeocodingCache
 
 logger = logging.getLogger(__name__)
+
+
+def get_geocoding_cache():
+    """Return the geocoder to use for filling missing coordinates.
+
+    Uses Google Maps when GOOGLE_MAPS_API_KEY is set, otherwise falls back to
+    the free Nominatim (OpenStreetMap) geocoder. Both expose the same
+    `get_or_geocode(address)` interface.
+    """
+    if os.getenv("GOOGLE_MAPS_API_KEY"):
+        return GeocodingCache()
+    from shared.location_scraper.free_geocoding import NominatimGeocodingCache
+
+    logger.info("GOOGLE_MAPS_API_KEY not set — using free Nominatim geocoder")
+    return NominatimGeocodingCache()
 
 COUNTRY_NAME_BY_SOURCE = {
     "idealista": {
@@ -17,6 +33,7 @@ COUNTRY_NAME_BY_SOURCE = {
         "milan": "Italy",
     },
     "otodom": {"warsaw": "Poland"},
+    "loopnet": {"london": "United Kingdom"},
     "immobilienscout": {
         "berlin": "Germany",
         "munich": "Germany",

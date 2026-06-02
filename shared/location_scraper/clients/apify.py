@@ -24,16 +24,35 @@ def _client() -> ApifyClient:
     return ApifyClient(_APIFY_TOKEN)
 
 
+def _run_field(run: Any, *names: str) -> Any:
+    """
+    Read a field from an Apify run regardless of client version.
+
+    Older apify-client returns a plain dict (subscriptable); newer versions
+    return a typed ``Run`` object (attribute access only). ``names`` lists the
+    candidate keys/attributes in priority order (dict key, then snake_case attr).
+    """
+    for name in names:
+        if isinstance(run, dict):
+            if name in run:
+                return run[name]
+        elif hasattr(run, name):
+            return getattr(run, name)
+    raise KeyError(f"Apify run is missing any of {names!r} (type={type(run).__name__})")
+
+
 def start_run(actor_id: str, run_input: dict) -> dict:
     """
     Start an Apify actor run without waiting for it to finish.
     Returns {"run_id": str, "dataset_id": str}.
     """
     run = _client().actor(actor_id).start(run_input=run_input)
-    logger.info("Apify run started: actor=%s run_id=%s", actor_id, run["id"])
+    run_id = _run_field(run, "id")
+    dataset_id = _run_field(run, "defaultDatasetId", "default_dataset_id")
+    logger.info("Apify run started: actor=%s run_id=%s", actor_id, run_id)
     return {
-        "run_id": run["id"],
-        "dataset_id": run["defaultDatasetId"],
+        "run_id": run_id,
+        "dataset_id": dataset_id,
     }
 
 
@@ -43,7 +62,10 @@ def get_run_status(run_id: str) -> dict:
     Returns {"finished": bool, "succeeded": bool, "status": str}.
     """
     run = _client().run(run_id).get()
-    status = run.get("status", "UNKNOWN")
+    try:
+        status = _run_field(run, "status") or "UNKNOWN"
+    except KeyError:
+        status = "UNKNOWN"
     finished = status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT")
     return {
         "finished": finished,
@@ -68,5 +90,5 @@ def run_sync(actor_id: str, run_input: dict, limit: int = 100) -> list[dict[str,
     within a Durable activity — not from the orchestrator itself.
     """
     run = _client().actor(actor_id).call(run_input=run_input)
-    dataset_id = run["defaultDatasetId"]
+    dataset_id = _run_field(run, "defaultDatasetId", "default_dataset_id")
     return fetch_dataset(dataset_id, limit=limit)
