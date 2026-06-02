@@ -129,13 +129,29 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
 | `dusseldorf` | Germany | Immobilienscout24 |
 | `stuttgart` | Germany | Immobilienscout24 |
 | `london` | UK | LoopNet |
+| `new york` | US | LoopNet |
+| `san francisco` | US | LoopNet |
+| `palo alto` | US | LoopNet |
+| `los angeles` | US | LoopNet |
+| `austin` | US | LoopNet |
+| `seattle` | US | LoopNet |
 
-#### LoopNet (UK) notes
+#### LoopNet (UK + US) notes
 
 - Actor: `memo23/loopnet-scraper-ppe` (`0ZCQONxB3BdyOzrbD`), pay-per-event (~$1.50/1k). The
   $31/mo flat-rate twin (`RuOxoBM1bnc5pQ3TJ`) is intentionally **not** used.
-- City slug must include region + country: `london-england--united-kingdom` — the
-  actor geocodes the search area from the URL, so a bare `london` slug fails.
+- The same actor serves **US and UK**, but the URL shape differs by country
+  (resolved per `COUNTRY_CONFIG` block, same `loopnet` branch in `resolve.py`):
+  - **UK** (`uk`): `…/search/office-properties/{city}-england--united-kingdom/for-rent/`.
+    City slug must include region + country (`london-england--united-kingdom`) — the
+    actor geocodes the search area from the URL, so a bare `london` slug fails.
+  - **US** (`us`): `…/search/office-space/{city}-{state}/for-lease/` (note
+    `office-space` + `for-lease`, not `office-properties` + `for-rent`). City slug is
+    `{city}-{state-abbrev}`, e.g. `new-york-ny`, `san-francisco-ca`, `palo-alto-ca`,
+    `los-angeles-ca`, `austin-tx`, `seattle-wa`. Multi-word city names contain a space
+    (`new york`) — the monthly timer slugifies them (`new-york`) for `run_id`/instance ids.
+  - Currency is derived from the country (GB → GBP, otherwise USD) since LoopNet has no
+    currency field.
 - Areas are in **square feet** → converted to m² (×0.092903). The **≥1500 m²** floor is
   enforced in code (adapter + globe materialization), not via the actor's URL filter
   (which filters total building size, not available area).

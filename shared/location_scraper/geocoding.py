@@ -33,7 +33,15 @@ COUNTRY_NAME_BY_SOURCE = {
         "milan": "Italy",
     },
     "otodom": {"warsaw": "Poland"},
-    "loopnet": {"london": "United Kingdom"},
+    "loopnet": {
+        "london": "United Kingdom",
+        "new york": "United States",
+        "san francisco": "United States",
+        "palo alto": "United States",
+        "los angeles": "United States",
+        "austin": "United States",
+        "seattle": "United States",
+    },
     "immobilienscout": {
         "berlin": "Germany",
         "munich": "Germany",
