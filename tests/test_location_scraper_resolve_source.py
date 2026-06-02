@@ -89,6 +89,47 @@ class TestResolveSource:
         without = resolve_source("london", None, "x")
         assert with_shape.start_url == without.start_url
 
+    def test_new_york_loopnet_us(self):
+        cfg = resolve_source("New York", None, "run-us-1")  # case-insensitive
+        assert cfg.city == "new york"
+        assert cfg.country == "us"
+        assert cfg.country_code == "us"
+        assert cfg.actor == "loopnet"
+        assert cfg.actor_id == LOOPNET_ACTOR_ID
+        assert cfg.start_url == (
+            "https://www.loopnet.com/search/office-space/new-york-ny/for-lease/"
+        )
+
+    def test_san_francisco_loopnet_us(self):
+        cfg = resolve_source("san francisco", None, "x")
+        assert cfg.country == "us"
+        assert cfg.start_url == (
+            "https://www.loopnet.com/search/office-space/san-francisco-ca/for-lease/"
+        )
+
+    def test_us_cities_all_resolve(self):
+        expected = {
+            "new york": "new-york-ny",
+            "san francisco": "san-francisco-ca",
+            "palo alto": "palo-alto-ca",
+            "los angeles": "los-angeles-ca",
+            "austin": "austin-tx",
+            "seattle": "seattle-wa",
+        }
+        for city, slug in expected.items():
+            cfg = resolve_source(city, None, "x")
+            assert cfg.actor == "loopnet"
+            assert cfg.country == "us"
+            assert cfg.start_url == (
+                f"https://www.loopnet.com/search/office-space/{slug}/for-lease/"
+            )
+
+    def test_us_loopnet_ignores_shape(self):
+        """LoopNet US uses URL geocoding — Idealista polygon shape must be ignored."""
+        with_shape = resolve_source("austin", "POLYGON", "x")
+        without = resolve_source("austin", None, "x")
+        assert with_shape.start_url == without.start_url
+
     def test_unknown_city_raises(self):
         with pytest.raises(ValueError, match="not recognised"):
             resolve_source("atlantis", None, "x")

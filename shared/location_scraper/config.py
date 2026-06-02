@@ -95,6 +95,30 @@ COUNTRY_CONFIG: dict[str, dict] = {
             "london": "london-england--united-kingdom",
         },
     },
+    "us": {
+        "domain": "https://www.loopnet.com",
+        "language": "en",
+        # US LoopNet uses a different property path + listing-type than UK:
+        # `/search/office-space/{city}-{state}/for-lease/` (UK is
+        # `office-properties/.../for-rent`). Same actor, same domain.
+        "property_path": "office-space",
+        "filter_suffix": "for-lease",
+        "actor": "loopnet",
+        "actor_id": LOOPNET_ACTOR_ID,
+        "country_code": "us",
+        # LoopNet US office listings. City slug is `{city}-{state-abbrev}`,
+        # e.g. `new-york-ny` — the actor geocodes the search area from the URL.
+        # The >=1500 m² floor is enforced in the adapter (LoopNet's URL size
+        # filter is unreliable: it filters total building size, not available area).
+        "cities": {
+            "new york": "new-york-ny",
+            "san francisco": "san-francisco-ca",
+            "palo alto": "palo-alto-ca",
+            "los angeles": "los-angeles-ca",
+            "austin": "austin-tx",
+            "seattle": "seattle-wa",
+        },
+    },
 }
 
 # Job titles passed to Lusha's contact search (from n8n "Extract Contact" node)

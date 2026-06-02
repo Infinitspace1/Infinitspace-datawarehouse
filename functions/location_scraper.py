@@ -64,6 +64,13 @@ MONTHLY_CITIES = (
     "stuttgart",
     "warsaw",
     "london",
+    # US (LoopNet)
+    "new york",
+    "san francisco",
+    "palo alto",
+    "los angeles",
+    "austin",
+    "seattle",
 )
 
 # Sources whose listing payload already carries broker name/company/phone/email,
@@ -183,8 +190,12 @@ async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
 
     started = []
     for city in MONTHLY_CITIES:
-        run_id = f"monthly-{city}-{month_key}"
-        instance_id = f"location-scraper-monthly-{city}-{month_key}"
+        # Slugify for IDs/keys — some cities (e.g. "new york") contain spaces,
+        # which are unsafe in Durable instance ids and SQL run_id keys. The
+        # orchestrator still receives the original `city` for resolve matching.
+        city_slug = city.replace(" ", "-")
+        run_id = f"monthly-{city_slug}-{month_key}"
+        instance_id = f"location-scraper-monthly-{city_slug}-{month_key}"
         existing = await client.get_status(instance_id)
         existing_status = str(getattr(existing, "runtime_status", "")) if existing else ""
         if existing:
