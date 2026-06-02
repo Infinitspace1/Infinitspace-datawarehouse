@@ -14,7 +14,7 @@ msal
 
 # Durable Functions (location scraper orchestrator)
 azure-functions-durable>=1.2.9
-apify-client>=1.7.0
+apify-client==2.5.0
 
 # Real Estate — CoStar PDF extractor
 anthropic>=0.40.0

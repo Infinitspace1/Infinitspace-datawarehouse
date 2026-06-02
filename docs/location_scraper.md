@@ -2,7 +2,7 @@
 
 Replaces the n8n "Location Scraper" workflow (`jfCPRkxxpDRLC7Rm`).
 
-Scrapes commercial office listings from **Idealista** (Spain / Italy), **Otodom** (Poland), and **Immobilienscout24** (Germany), enriches them with contact data via **Lusha**, and persists everything to Azure SQL under the `bronze` schema.
+Scrapes commercial office listings from **Idealista** (Spain / Italy), **Otodom** (Poland), **Immobilienscout24** (Germany), and **LoopNet** (UK — London), enriches them with contact data via **Lusha**, and persists everything to Azure SQL under the `bronze` schema.
 
 ---
 
@@ -65,7 +65,7 @@ sequenceDiagram
 
 `location_scraper_monthly` runs on `LOCATION_SCRAPER_MONTHLY_SCHEDULE`, default `0 0 1 1 * *` (01:00 UTC on the first day of each month). It starts one Durable orchestration per city with `unlimited_items=true`, so the Apify actor input omits `maxItems` and the dataset fetch reads all returned items.
 
-Scheduled cities: `barcelona`, `madrid`, `milan`, `berlin`, `munich`, `hamburg`, `cologne`, `frankfurt`, `dusseldorf`, `stuttgart`, `warsaw`.
+Scheduled cities: `barcelona`, `madrid`, `milan`, `berlin`, `munich`, `hamburg`, `cologne`, `frankfurt`, `dusseldorf`, `stuttgart`, `warsaw`, `london`.
 
 ---
 
@@ -128,6 +128,25 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
 | `frankfurt` | Germany | Immobilienscout24 |
 | `dusseldorf` | Germany | Immobilienscout24 |
 | `stuttgart` | Germany | Immobilienscout24 |
+| `london` | UK | LoopNet |
+
+#### LoopNet (UK) notes
+
+- Actor: `memo23/loopnet-scraper-ppe` (`0ZCQONxB3BdyOzrbD`), pay-per-event (~$1.50/1k). The
+  $31/mo flat-rate twin (`RuOxoBM1bnc5pQ3TJ`) is intentionally **not** used.
+- City slug must include region + country: `london-england--united-kingdom` — the
+  actor geocodes the search area from the URL, so a bare `london` slug fails.
+- Areas are in **square feet** → converted to m² (×0.092903). The **≥1500 m²** floor is
+  enforced in code (adapter + globe materialization), not via the actor's URL filter
+  (which filters total building size, not available area).
+- LoopNet payloads carry **no coordinates** → filled by the geocode fallback. Broker
+  name / company / phone / **email** come directly from the payload.
+- **Lusha is fully skipped for LoopNet** (`LUSHA_SKIP_SOURCES` in
+  `functions/location_scraper.py`): the orchestrator bypasses dedupe/enrich/consolidate.
+  The broker contact is still persisted to `bronze.n8n_location_scraper_contacts`
+  (`source='scraper'`) by `ls_upsert_sql`, and the broker email(s) are surfaced in the
+  globe's email slots via `_loopnet_broker_contacts` in `materialize_globe.py`
+  (email coverage observed at 100% on ≥1500 m² London listings).
 
 ---
 
@@ -252,6 +271,8 @@ For raw JSON field discovery (before building/changing a globe view), run:
 | `LUSHA_API_KEY` | Yes | Lusha API key (sent as `api_key` header) |
 | `LOCATION_SCRAPER_MAX_ITEMS` | No | Common max items cap applied to manually triggered scraper actors (`idealista`, `otodom`, `immobilienscout`). If unset, actor defaults are used (100 / 200 / 100). Monthly scheduled runs explicitly omit `maxItems`. |
 | `LOCATION_SCRAPER_MONTHLY_SCHEDULE` | No | NCRONTAB schedule for the monthly all-city scrape; default `0 0 1 1 * *`. |
+| `GOOGLE_MAPS_API_KEY` | No | Geocoding for listings without coordinates (e.g. LoopNet). If unset, falls back to the **free Nominatim (OpenStreetMap)** geocoder automatically. |
+| `NOMINATIM_URL` / `NOMINATIM_USER_AGENT` | No | Override the free geocoder endpoint / User-Agent (defaults to the public OSM endpoint). |
 | `AZURE_SQL_CONNECTION_STRING` | Yes | Full ODBC connection string (or use SERVER+DATABASE+UID+PWD) |
 | `AzureWebJobsStorage` | Yes | Storage account connection string (Durable Functions state) |
 | `ENABLE_LOCATION_SCRAPER_FUNCTIONS` | Yes | Set to `1` to register functions |
@@ -328,18 +349,23 @@ Required GitHub secrets: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTI
 The following Apify actors existed in the original n8n workflow as **disabled dead code** and have not been ported:
 
 - Rightmove UK (`OtFA20rCfQZatC6Nt`)
-- Loopnet 🇺🇸 (`RuOxoBM1bnc5pQ3TJ`)
 - Crexi 🇺🇸 (`JeaJthm26KstkYpr6`)
 - Zoopla UK (`YnypKXp7X4cey27F8`)
-- Immobilienscout24 DE (`ciTdHfgOkkwfEzTE9`)
 
 Use the "Adding a new source" guide above to re-introduce any of them.
+
+> **LoopNet** has since been wired in (London / UK) via the pay-per-event actor
+> `memo23/loopnet-scraper-ppe` (`0ZCQONxB3BdyOzrbD`) — see the "LoopNet (UK) notes"
+> above. The original flat-rate actor (`RuOxoBM1bnc5pQ3TJ`) referenced here was
+> dropped in favour of the pay-per-event twin.
 
 ---
 
 ## Open questions
 
-1. **Loopnet `customBody` hardcoded `"new-york-ny"`** — the n8n Loopnet actor input always used `new-york-ny` regardless of the `City` input field. Confirm whether this was intentional (fixed geography) or a bug before re-introducing Loopnet.
+1. ~~**Loopnet `customBody` hardcoded `"new-york-ny"`**~~ — *Resolved.* The new LoopNet
+   integration builds the search URL per-city from `COUNTRY_CONFIG` (London uses
+   `london-england--united-kingdom`); the old hardcoded body is not used.
 
 2. **`Insert listing` and `Insert contact` run on every upsert or insert only?** — In n8n these nodes ran only on the INSERT path (new buildings). The UPDATE path only appended a new listing snapshot with no contact write. This behaviour is preserved here. Confirm whether contacts should also be refreshed/updated when a building's price changes.
 

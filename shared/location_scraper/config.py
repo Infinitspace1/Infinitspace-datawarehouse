@@ -13,6 +13,9 @@ import os
 IDEALISTA_ACTOR_ID = "OTe82JNUGa93aVcRc"
 OTODOM_ACTOR_ID = "ir34sMIv8mrbL0ojO"
 IMMOBILIENSCOUT_ACTOR_ID = "ciTdHfgOkkwfEzTE9"
+# memo23 pay-per-event LoopNet actor (US + UK). The $31/mo flat-rate twin
+# (RuOxoBM1bnc5pQ3TJ) is deliberately NOT used.
+LOOPNET_ACTOR_ID = "0ZCQONxB3BdyOzrbD"
 GOOGLE_SEARCH_ACTOR_ID = "nFJndFXA5zjCTuudP"
 
 COUNTRY_CONFIG: dict[str, dict] = {
@@ -73,6 +76,23 @@ COUNTRY_CONFIG: dict[str, dict] = {
             "frankfurt": "hessen/frankfurt-am-main",
             "dusseldorf": "nordrhein-westfalen/duesseldorf",
             "stuttgart": "baden-wuerttemberg/stuttgart",
+        },
+    },
+    "uk": {
+        "domain": "https://www.loopnet.com",
+        "language": "en",
+        "property_path": "office-properties",
+        "filter_suffix": "for-rent",
+        "actor": "loopnet",
+        "actor_id": LOOPNET_ACTOR_ID,
+        "country_code": "gb",
+        # LoopNet UK office listings. City slug MUST include the region +
+        # `--united-kingdom`, e.g. `london-england--united-kingdom`, otherwise
+        # the actor's geocoder cannot resolve the search area.
+        # The >=1500 m² floor is enforced in the adapter (LoopNet's URL size
+        # filter is unreliable: it filters total building size, not available area).
+        "cities": {
+            "london": "london-england--united-kingdom",
         },
     },
 }

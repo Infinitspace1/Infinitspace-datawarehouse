@@ -239,21 +239,47 @@ def write_logs(stats: dict) -> None:
 
 
 def mark_run_failed(run_id: str, error: str) -> None:
-    """Update the log row to 'failed' on orchestrator error."""
+    """Update the log row to 'failed' on orchestrator error.
+
+    Persists the error text to ``error_message`` so failures are visible in SQL.
+    Falls back to a column-less update if the migration
+    (``location_scraper_logs_error_message.sql``) has not been applied yet.
+    """
     sql = get_sql_client()
-    affected = sql.execute_non_query(
-        "UPDATE bronze.n8n_location_scraper_logs "
-        "SET status = 'failed', updated_at = GETDATE() "
-        "WHERE run_id = ?",
-        (run_id,),
-    )
-    if affected == 0:
-        sql.execute_non_query(
-            "INSERT INTO bronze.n8n_location_scraper_logs "
-            "(run_id, city, run_date, source, buildings_found, buildings_new, buildings_updated, status, updated_at) "
-            "VALUES (?, '', ?, '', 0, 0, 0, 'failed', GETDATE())",
-            (run_id, date.today().isoformat()),
+    error_text = (error or "")[:4000]
+    try:
+        affected = sql.execute_non_query(
+            "UPDATE bronze.n8n_location_scraper_logs "
+            "SET status = 'failed', error_message = ?, updated_at = GETDATE() "
+            "WHERE run_id = ?",
+            (error_text, run_id),
         )
+        insert_with_error = True
+    except Exception:
+        # error_message column not present yet — degrade gracefully.
+        affected = sql.execute_non_query(
+            "UPDATE bronze.n8n_location_scraper_logs "
+            "SET status = 'failed', updated_at = GETDATE() "
+            "WHERE run_id = ?",
+            (run_id,),
+        )
+        insert_with_error = False
+
+    if affected == 0:
+        if insert_with_error:
+            sql.execute_non_query(
+                "INSERT INTO bronze.n8n_location_scraper_logs "
+                "(run_id, city, run_date, source, buildings_found, buildings_new, buildings_updated, status, error_message, updated_at) "
+                "VALUES (?, '', ?, '', 0, 0, 0, 'failed', ?, GETDATE())",
+                (run_id, date.today().isoformat(), error_text),
+            )
+        else:
+            sql.execute_non_query(
+                "INSERT INTO bronze.n8n_location_scraper_logs "
+                "(run_id, city, run_date, source, buildings_found, buildings_new, buildings_updated, status, updated_at) "
+                "VALUES (?, '', ?, '', 0, 0, 0, 'failed', GETDATE())",
+                (run_id, date.today().isoformat()),
+            )
     logger.error("location_scraper run_id=%s failed: %s", run_id, error)
 
 

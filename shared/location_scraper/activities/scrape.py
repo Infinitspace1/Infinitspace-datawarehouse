@@ -13,6 +13,7 @@ from shared.gmaps.geocoding import GeocodingCache
 from shared.location_scraper import clients as _c
 from shared.location_scraper.adapters.registry import ADAPTER_REGISTRY
 from shared.location_scraper.clients import apify as apify_client
+from shared.location_scraper.free_geocoding import NominatimGeocodingCache
 from shared.location_scraper.geocoding import geocode_missing_coordinates
 from shared.location_scraper.models import Listing, SourceConfig
 
@@ -81,7 +82,8 @@ def normalize_listings(payload: dict) -> list[dict]:
 
     adapter = ADAPTER_REGISTRY[actor]
     results = []
-    geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else None
+    # Google Maps when a key is set, else the free Nominatim geocoder.
+    geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else NominatimGeocodingCache()
     geocoded_count = 0
     for raw in items:
         try:

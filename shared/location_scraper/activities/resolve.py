@@ -33,7 +33,10 @@ def resolve_source(
         property_path = cfg["property_path"]
         filter_suffix = cfg["filter_suffix"]
 
-        if actor == "otodom":
+        if actor == "loopnet":
+            # LoopNet UK: /search/office-properties/{city}-england--united-kingdom/for-rent/
+            start_url = f"{domain}/search/{property_path}/{city_slug}/{filter_suffix}/"
+        elif actor == "otodom":
             # Otodom does not support polygon search via URL.
             start_url = f"{domain}/{language}/{property_path}/{city_slug}?{filter_suffix}"
         elif actor == "immobilienscout":
