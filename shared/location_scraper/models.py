@@ -16,7 +16,14 @@ class Listing:
     district: Optional[str]
     postal_code: Optional[str]
     address: Optional[str]
-    available_surface_m2: Optional[float]
+    # Canonical surface, always in m² — used for sorting, cross-source comparison
+    # and the LoopNet >=1500 m² guardrail.
+    surface_m2: Optional[float]
+    # Surface in the unit we want to *show* (sqft for UK/US sources, m² elsewhere)
+    # plus the unit label. Lets the dashboard/emails display the local unit without
+    # any conversion. `surface_unit` is 'sqft' or 'm2'.
+    surface_display: Optional[float]
+    surface_unit: Optional[str]
     floor: Optional[str]
     status: Optional[str]
     is_exterior: Optional[bool]
@@ -53,7 +60,9 @@ class Listing:
             "district": self.district,
             "postal_code": self.postal_code,
             "address": self.address,
-            "available_surface_m2": self.available_surface_m2,
+            "surface_m2": self.surface_m2,
+            "surface_display": self.surface_display,
+            "surface_unit": self.surface_unit,
             "floor": self.floor,
             "status": self.status,
             "is_exterior": self.is_exterior,
@@ -76,7 +85,18 @@ class Listing:
 
     @staticmethod
     def from_dict(d: dict) -> "Listing":
-        return Listing(**{k: d.get(k) for k in Listing.__dataclass_fields__})  # type: ignore[attr-defined]
+        values = {k: d.get(k) for k in Listing.__dataclass_fields__}  # type: ignore[attr-defined]
+        # Backward compat: queue messages produced before the surface_unit
+        # migration only carry `available_surface_m2`. Map it onto the new
+        # canonical/display fields so in-flight messages don't blow up.
+        if values.get("surface_m2") is None and "available_surface_m2" in d:
+            legacy = d.get("available_surface_m2")
+            values["surface_m2"] = legacy
+            if values.get("surface_display") is None:
+                values["surface_display"] = legacy
+            if values.get("surface_unit") is None:
+                values["surface_unit"] = "m2"
+        return Listing(**values)
 
 
 @dataclass

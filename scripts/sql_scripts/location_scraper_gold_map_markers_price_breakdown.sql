@@ -23,6 +23,16 @@ BEGIN
         ALTER TABLE gold.location_scraper_map_markers ADD price_kind NVARCHAR(50) NULL;
     IF COL_LENGTH(N'gold.location_scraper_map_markers', N'price_monthly_is_estimated') IS NULL
         ALTER TABLE gold.location_scraper_map_markers ADD price_monthly_is_estimated BIT NULL;
+
+    -- Surface in the display unit (sqft for UK/US sources, m² elsewhere) + the unit label.
+    IF COL_LENGTH(N'gold.location_scraper_map_markers', N'total_surface_display') IS NULL
+        ALTER TABLE gold.location_scraper_map_markers ADD total_surface_display DECIMAL(18,2) NULL;
+    IF COL_LENGTH(N'gold.location_scraper_map_markers', N'min_surface_display') IS NULL
+        ALTER TABLE gold.location_scraper_map_markers ADD min_surface_display DECIMAL(18,2) NULL;
+    IF COL_LENGTH(N'gold.location_scraper_map_markers', N'max_surface_display') IS NULL
+        ALTER TABLE gold.location_scraper_map_markers ADD max_surface_display DECIMAL(18,2) NULL;
+    IF COL_LENGTH(N'gold.location_scraper_map_markers', N'surface_unit') IS NULL
+        ALTER TABLE gold.location_scraper_map_markers ADD surface_unit NVARCHAR(10) NULL;
 END
 GO
 
@@ -96,6 +106,15 @@ BEGIN
             MAX(surface_m2) OVER (
                 PARTITION BY source, run_city, run_id, marker_latitude, marker_longitude
             ) AS max_surface_m2,
+            SUM(surface_display) OVER (
+                PARTITION BY source, run_city, run_id, marker_latitude, marker_longitude
+            ) AS total_surface_display,
+            MIN(surface_display) OVER (
+                PARTITION BY source, run_city, run_id, marker_latitude, marker_longitude
+            ) AS min_surface_display,
+            MAX(surface_display) OVER (
+                PARTITION BY source, run_city, run_id, marker_latitude, marker_longitude
+            ) AS max_surface_display,
             ROW_NUMBER() OVER (
                 PARTITION BY source, run_city, run_id, marker_latitude, marker_longitude
                 ORDER BY
@@ -117,6 +136,7 @@ BEGIN
         representative_item_index, listing_count,
         min_price_monthly, max_price_monthly,
         total_surface_m2, min_surface_m2, max_surface_m2,
+        total_surface_display, min_surface_display, max_surface_display, surface_unit,
         external_id, listing_url,
         latitude, longitude,
         address, postal_code, district, city, country_code,
@@ -136,6 +156,7 @@ BEGIN
         item_index, listing_count,
         min_price_monthly, max_price_monthly,
         total_surface_m2, min_surface_m2, max_surface_m2,
+        total_surface_display, min_surface_display, max_surface_display, surface_unit,
         external_id, listing_url,
         latitude, longitude,
         address, postal_code, district, city, country_code,
@@ -148,6 +169,10 @@ BEGIN
         min_divisible_from_m2_w, price_kind, price_monthly_is_estimated,
         GETUTCDATE()
     FROM ranked
-    WHERE marker_rank = 1;
+    -- Only keep buildings we can actually email: the representative row is ranked
+    -- to prefer rows with lusha_email_1, so a non-null value here means at least
+    -- one listing at this marker has a contact email.
+    WHERE marker_rank = 1
+      AND lusha_email_1 IS NOT NULL;
 END
 GO

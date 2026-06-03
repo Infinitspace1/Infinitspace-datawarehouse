@@ -29,6 +29,8 @@ BEGIN
         price_monthly  DECIMAL(18,2)   NULL,
         price_per_m2   DECIMAL(18,2)   NULL,
         surface_m2     DECIMAL(18,2)   NULL,
+        surface_display DECIMAL(18,2)  NULL,   -- value in display unit (sqft for UK/US, else m²)
+        surface_unit   NVARCHAR(10)    NULL,   -- 'sqft' | 'm2'
         currency       NVARCHAR(20)    NULL,
 
         contact_name   NVARCHAR(255)   NULL,
@@ -92,6 +94,11 @@ BEGIN
         ALTER TABLE silver.location_scraper_globe_v2 ADD hubspot_exported BIT NOT NULL CONSTRAINT DF_location_scraper_globe_v2_hubspot_exported DEFAULT 0;
     IF COL_LENGTH(N'silver.location_scraper_globe_v2', N'hubspot_re_location_id') IS NULL
         ALTER TABLE silver.location_scraper_globe_v2 ADD hubspot_re_location_id NVARCHAR(64) NULL;
+
+    IF COL_LENGTH(N'silver.location_scraper_globe_v2', N'surface_display') IS NULL
+        ALTER TABLE silver.location_scraper_globe_v2 ADD surface_display DECIMAL(18,2) NULL;
+    IF COL_LENGTH(N'silver.location_scraper_globe_v2', N'surface_unit') IS NULL
+        ALTER TABLE silver.location_scraper_globe_v2 ADD surface_unit NVARCHAR(10) NULL;
 END
 GO
 

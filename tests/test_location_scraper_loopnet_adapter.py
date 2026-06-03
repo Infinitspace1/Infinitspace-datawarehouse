@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
 from shared.location_scraper.adapters.loopnet import (
     LoopnetAdapter,
     available_surface_m2_from_payload,
+    available_surface_sqft_from_payload,
     currency_for_country,
 )
 from shared.location_scraper.config import LOOPNET_ACTOR_ID
@@ -61,6 +62,15 @@ def test_surface_falls_back_to_summed_spaces():
     assert round(available_surface_m2_from_payload(payload)) == 2044
 
 
+def test_native_sqft_preserved():
+    # Display value keeps LoopNet's native square footage verbatim.
+    assert available_surface_sqft_from_payload(
+        {"header": {"subtext": "29,270 SF of Office Space Available"}}
+    ) == 29270.0
+    payload = {"spaces": [{"size": "10,000 SF"}, {"size": "12,000 SF"}]}
+    assert available_surface_sqft_from_payload(payload) == 22000.0
+
+
 def test_currency_by_country():
     assert currency_for_country("GB") == "GBP"
     assert currency_for_country("United Kingdom") == "GBP"
@@ -75,7 +85,10 @@ def test_normalize_maps_core_fields_uk():
     assert listing.city == "london"
     assert listing.external_id == "12345678"
     assert listing.postal_code == "WC1V 7AP"
-    assert round(listing.available_surface_m2) == 2719
+    assert round(listing.surface_m2) == 2719
+    # UK/US listings display square feet (the native LoopNet figure), not m².
+    assert listing.surface_unit == "sqft"
+    assert listing.surface_display == 29270.0
     assert listing.currency == "GBP"
     assert listing.contact_name == "Jane Broker"
     assert listing.company_name == "Savills"

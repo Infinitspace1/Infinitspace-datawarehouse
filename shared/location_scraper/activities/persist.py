@@ -66,12 +66,13 @@ OUTPUT $action AS action, COALESCE(inserted.id, deleted.id) AS id;
 _INSERT_LISTING = """
 INSERT INTO bronze.n8n_location_scraper_listings (
     id, building_id, run_id, status,
-    available_surface_m2, price_monthly, price_per_m2, currency,
+    surface_m2, surface_display, surface_unit,
+    price_monthly, price_per_m2, currency,
     energy_class, days_on_market, first_listed_date,
     last_updated_date, first_time_extract, last_seen_date
 )
 OUTPUT inserted.id
-VALUES (NEWID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (NEWID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _MERGE_CONTACT = """
@@ -236,7 +237,8 @@ def upsert_sql(payload: dict) -> dict:
                     _INSERT_LISTING,
                     (
                         str(building_id), run_id, listing.status,
-                        listing.available_surface_m2, listing.price_monthly,
+                        listing.surface_m2, listing.surface_display, listing.surface_unit,
+                        listing.price_monthly,
                         listing.price_per_m2, listing.currency,
                         listing.energy_class, listing.days_on_market,
                         listing.first_listed_date, listing.last_updated_date,
@@ -273,7 +275,8 @@ def upsert_sql(payload: dict) -> dict:
                     _INSERT_LISTING,
                     (
                         str(existing["id"]), run_id, listing.status,
-                        listing.available_surface_m2, listing.price_monthly,
+                        listing.surface_m2, listing.surface_display, listing.surface_unit,
+                        listing.price_monthly,
                         listing.price_per_m2, listing.currency,
                         listing.energy_class, listing.days_on_market,
                         listing.first_listed_date, listing.last_updated_date,
