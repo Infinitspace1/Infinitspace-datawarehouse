@@ -120,7 +120,8 @@ def test_simulated_germany_scrape_pipeline(city: str, city_label: str, url_fragm
         listing = listings[0]
         assert listing["source"] == "immobilienscout"
         assert listing["city"] == city_label.lower()
-        assert listing["available_surface_m2"] == 2068.0
+        assert listing["surface_m2"] == 2068.0
+        assert listing["surface_unit"] == "m2"
         assert listing["price_per_m2"] == 30.0
 
         # 4) Simulate agency/contact enrichment flow.

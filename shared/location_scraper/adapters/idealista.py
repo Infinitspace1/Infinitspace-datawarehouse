@@ -90,6 +90,8 @@ class IdealistaAdapter:
         raw_energy = _get(raw_item, "energyCertification/energyConsumption/type")
         energy_class = None if raw_energy in (None, "", "inProcess") else raw_energy
 
+        area = _parse_num(_get(raw_item, "basicInfo/size"))
+
         return Listing(
             source="idealista",
             city=city,
@@ -101,7 +103,9 @@ class IdealistaAdapter:
             district=_get(raw_item, "basicInfo/district"),
             postal_code=_get(raw_item, "contactInfo/address/postalCode"),
             address=_get(raw_item, "ubication/title"),
-            available_surface_m2=_parse_num(_get(raw_item, "basicInfo/size")),
+            surface_m2=area,
+            surface_display=area,
+            surface_unit="m2",
             floor=str(_get(raw_item, "basicInfo/floor")) if _get(raw_item, "basicInfo/floor") is not None else None,
             status=_get(raw_item, "basicInfo/status"),
             is_exterior=_get(raw_item, "basicInfo/exterior"),

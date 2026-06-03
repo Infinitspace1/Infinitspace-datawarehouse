@@ -21,6 +21,7 @@ from shared.azure_clients.sql_client import get_sql_client
 from shared.location_scraper.adapters.loopnet import (
     MIN_SURFACE_M2,
     available_surface_m2_from_payload,
+    available_surface_sqft_from_payload,
     currency_for_country,
 )
 from shared.location_scraper.config import get_country_code_for_city
@@ -89,7 +90,7 @@ INSERT INTO silver.location_scraper_globe_v2 (
     external_id, listing_url,
     latitude, longitude,
     address, postal_code, district, city, country_code,
-    price_monthly, price_per_m2, surface_m2, currency,
+    price_monthly, price_per_m2, surface_m2, surface_display, surface_unit, currency,
     additional_costs_per_m2, total_price_per_m2,
     divisible_from_m2, price_kind, price_monthly_is_estimated,
     contact_name, company_name, phone,
@@ -98,7 +99,7 @@ INSERT INTO silver.location_scraper_globe_v2 (
     lusha_email_3, lusha_contact_3, lusha_title_3, lusha_confidence_3,
     hubspot_exported, hubspot_re_location_id,
     refreshed_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?, ?,
           ?, ?, ?,
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, GETUTCDATE())
@@ -531,6 +532,18 @@ def _map_row(
         price_monthly = (price_per_m2 * surface_m2).quantize(Decimal("0.01"))
         price_monthly_is_estimated = 1
 
+    # Display surface: LoopNet (UK/US) shows the native square footage, every
+    # other source is already metric so display == m².
+    if source == "loopnet":
+        surface_sqft = available_surface_sqft_from_payload(payload)
+        surface_display = (
+            Decimal(str(round(surface_sqft, 2))) if surface_sqft is not None else None
+        )
+        surface_unit = "sqft"
+    else:
+        surface_display = surface_m2
+        surface_unit = "m2"
+
     return (
         row["run_id"],
         item_index,
@@ -549,6 +562,8 @@ def _map_row(
         price_monthly,
         price_per_m2,
         surface_m2,
+        surface_display,
+        surface_unit,
         _pick_currency(payload, source),
         additional_costs_per_m2,
         total_price_per_m2,

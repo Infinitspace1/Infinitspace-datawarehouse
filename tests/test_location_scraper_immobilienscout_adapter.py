@@ -80,7 +80,10 @@ def test_normalize_maps_core_fields():
     listing = adapter.normalize(raw, "berlin")
     assert listing is not None
     assert listing.source == "immobilienscout"
-    assert listing.available_surface_m2 == 1850.0
+    assert listing.surface_m2 == 1850.0
+    # German listings stay metric: display == m², unit 'm2'.
+    assert listing.surface_display == 1850.0
+    assert listing.surface_unit == "m2"
     assert listing.price_monthly == 25500.0
     assert listing.city == "berlin"
     assert listing.web_link == "https://www.immobilienscout24.de/expose/160531543"
@@ -110,7 +113,8 @@ def test_normalize_maps_flattened_csv_shape():
     assert listing is not None
     assert listing.external_id == "167325674"
     assert listing.city == "berlin"
-    assert listing.available_surface_m2 == 2068.0
+    assert listing.surface_m2 == 2068.0
+    assert listing.surface_unit == "m2"
     assert listing.price_per_m2 == 30.0
     assert listing.contact_name == "Frau Malina Trockel"
     assert listing.company_name == "Savills Immobilien Beratungs-GmbH - Office Agency"
@@ -140,7 +144,7 @@ def test_normalize_maps_nested_apify_json_shape():
     listing = adapter.normalize(raw, "munich")
     assert listing is not None
     assert listing.external_id == "167325674"
-    assert listing.available_surface_m2 == 1800.0
+    assert listing.surface_m2 == 1800.0
     assert listing.city == "münchen"
 
 

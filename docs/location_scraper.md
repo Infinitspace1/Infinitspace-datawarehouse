@@ -217,7 +217,9 @@ CREATE TABLE bronze.n8n_location_scraper_listings (
         REFERENCES bronze.n8n_location_scraper_buildings(id),
     run_id              NVARCHAR(100),
     status              NVARCHAR(50),
-    available_surface_m2 DECIMAL(10,2),
+    surface_m2          DECIMAL(10,2),   -- canonical, always m²
+    surface_display     DECIMAL(12,2),   -- value in display unit (sqft for UK/US, else m²)
+    surface_unit        NVARCHAR(10),    -- 'sqft' | 'm2'
     price_monthly       DECIMAL(12,2),
     price_per_m2        DECIMAL(10,2),
     currency            NVARCHAR(10),
