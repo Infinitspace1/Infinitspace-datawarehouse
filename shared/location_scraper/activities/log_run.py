@@ -24,6 +24,7 @@ SET
     buildings_new    = ?,
     buildings_updated= ?,
     status           = 'completed',
+    error_message    = NULL,
     updated_at       = GETDATE()
 WHERE run_id = ?
 """
@@ -56,6 +57,7 @@ WHEN MATCHED THEN
         buildings_new = 0,
         buildings_updated = 0,
         status = 'running',
+        error_message = NULL,
         updated_at = GETDATE()
 WHEN NOT MATCHED THEN
     INSERT (run_id, city, run_date, source, buildings_found, buildings_new, buildings_updated, status, updated_at)
@@ -92,6 +94,24 @@ def init_run_log(run_id: str, city: str) -> None:
     mark_stale_running_failed()
     today = date.today().isoformat()
     sql.execute_non_query(_UPSERT_RUNNING_LOG, (run_id, city, today, run_id, city, today))
+
+
+def completed_run_ids(run_ids: list[str]) -> set[str]:
+    """Return the subset of run_ids whose log row is already 'completed'.
+
+    Used by the monthly parent orchestrator to skip cities already scraped this
+    month, so a re-trigger only retries failed/missing cities.
+    """
+    if not run_ids:
+        return set()
+    sql = get_sql_client()
+    placeholders = ",".join("?" for _ in run_ids)
+    rows = sql.execute_query(
+        "SELECT run_id FROM bronze.n8n_location_scraper_logs "
+        f"WHERE status = 'completed' AND run_id IN ({placeholders})",
+        tuple(run_ids),
+    )
+    return {row["run_id"] for row in (rows or [])}
 
 
 _DELETE_RUN_QUALITY = "DELETE FROM bronze.location_scraper_run_quality WHERE run_id = ?"

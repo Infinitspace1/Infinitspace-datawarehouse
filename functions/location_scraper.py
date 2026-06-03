@@ -3,8 +3,11 @@ Location Scraper — Azure Durable Functions module.
 
 Functions registered here:
   - location_scraper_http   POST /api/scrape  (HTTP starter)
-  - location_scraper_monthly  (monthly timer starter)
-  - location_scraper_orch   (Durable orchestrator)
+  - location_scraper_monthly  (monthly timer starter — starts the parent)
+  - location_scraper_monthly_orch (parent orchestrator — sequential waves)
+  - location_scraper_orch   (Durable orchestrator — one city)
+  - ls_init_run_log         (activity — RUNNING log row per city)
+  - ls_cities_needing_run   (activity — skip cities already completed this month)
   - ls_resolve_source       (activity)
   - ls_start_apify_run      (activity)
   - ls_check_apify_run      (activity)
@@ -77,6 +80,18 @@ MONTHLY_CITIES = (
 # so the Lusha enrichment fan-out is skipped (broker email is persisted + shown
 # on the globe directly). LoopNet returns broker contact on every listing.
 LUSHA_SKIP_SOURCES = {"loopnet"}
+
+# Monthly run processes cities in sequential waves of this size so that only a
+# handful of (memory-heavy) Apify datasets are loaded at once — prevents the
+# worker OOM (exit code 137) seen when all cities fan out simultaneously.
+# Override via LOCATION_SCRAPER_WAVE_SIZE.
+def _wave_size() -> int:
+    raw = (os.getenv("LOCATION_SCRAPER_WAVE_SIZE") or "3").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return value if value > 0 else 3
 
 
 def _safe_mark_run_failed(run_id: str | None, error: str) -> None:
@@ -181,71 +196,140 @@ async def location_scraper_http(
 @bp.timer_trigger(schedule=MONTHLY_SCHEDULE, arg_name="timer", run_on_startup=False)
 @bp.durable_client_input(client_name="client")
 async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
-    """Start one unlimited scrape orchestration per configured city each month."""
+    """Start the monthly parent orchestrator (one instance per month).
+
+    The parent (``location_scraper_monthly_orch``) processes cities in sequential
+    waves so only a few memory-heavy Apify datasets load at once (avoids the
+    worker OOM seen with a full fan-out), and skips cities already completed this
+    month so a re-trigger only retries failed/missing ones.
+    """
     now = datetime.now(timezone.utc)
     month_key = now.strftime("%Y-%m")
 
     if timer.past_due:
         logger.warning("Monthly location scraper timer is past due")
 
-    started = []
-    for city in MONTHLY_CITIES:
-        # Slugify for IDs/keys — some cities (e.g. "new york") contain spaces,
-        # which are unsafe in Durable instance ids and SQL run_id keys. The
-        # orchestrator still receives the original `city` for resolve matching.
-        city_slug = city.replace(" ", "-")
-        run_id = f"monthly-{city_slug}-{month_key}"
-        instance_id = f"location-scraper-monthly-{city_slug}-{month_key}"
-        existing = await client.get_status(instance_id)
-        existing_status = str(getattr(existing, "runtime_status", "")) if existing else ""
-        # Only an in-progress or already-succeeded run blocks a re-run for this
-        # month. A Failed/Terminated/Canceled instance (e.g. a monthly run that
-        # crashed) must NOT block — re-triggering should retry that city.
-        # runtime_status stringifies as e.g. "OrchestrationRuntimeStatus.Failed",
-        # so compare on the trailing name, case-insensitively.
-        status_name = existing_status.split(".")[-1].lower()
-        blocking_statuses = {"running", "pending", "completed", "continuedasnew", "suspended"}
-        if existing and status_name in blocking_statuses:
-            logger.info(
-                "Monthly location scraper instance already running/succeeded; skipping "
-                "city=%s instance_id=%s status=%s",
-                city,
-                instance_id,
-                existing_status,
+    instance_id = f"location-scraper-monthly-{month_key}"
+    existing = await client.get_status(instance_id)
+    existing_status = str(getattr(existing, "runtime_status", "")) if existing else ""
+    # Only an in-progress parent blocks. A completed/failed parent is purged and
+    # restarted — the parent itself skips cities already completed this month
+    # (SQL-based idempotency), so a re-run only retries failed/missing cities.
+    # runtime_status stringifies as e.g. "OrchestrationRuntimeStatus.Running".
+    status_name = existing_status.split(".")[-1].lower()
+    if existing and status_name in {"running", "pending", "suspended"}:
+        logger.info(
+            "Monthly location scraper parent already in progress; skipping. "
+            "instance_id=%s status=%s",
+            instance_id,
+            existing_status,
+        )
+        return
+    if existing:
+        # Purge the terminal parent so start_new can reuse the same instance_id.
+        try:
+            await client.purge_instance_history(instance_id)
+        except Exception:
+            logger.warning("Could not purge prior monthly parent instance %s", instance_id)
+
+    await client.start_new(
+        "location_scraper_monthly_orch",
+        instance_id,
+        {
+            "month_key": month_key,
+            "cities": list(MONTHLY_CITIES),
+            "wave_size": _wave_size(),
+        },
+    )
+    logger.info(
+        "Monthly location scraper parent started instance_id=%s month=%s wave_size=%d",
+        instance_id,
+        month_key,
+        _wave_size(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parent orchestrator — sequential waves of cities (OOM-safe fan-out)
+# ---------------------------------------------------------------------------
+
+@bp.orchestration_trigger(context_name="context")
+def location_scraper_monthly_orch(context: df.DurableOrchestrationContext):
+    """Run the monthly cities in sequential waves of ``wave_size``.
+
+    Each wave fans out its cities concurrently (via sub-orchestrations) and the
+    next wave only starts once the current one finishes — so at most ``wave_size``
+    Apify datasets are in memory at any time. A city failure is isolated to its
+    wave (caught, logged) and does not block later waves; it stays non-completed
+    in SQL so the next monthly run retries it.
+    """
+    payload: dict = context.get_input() or {}
+    month_key: str = payload["month_key"]
+    cities: list = payload.get("cities") or list(MONTHLY_CITIES)
+    wave_size: int = int(payload.get("wave_size") or 3)
+    force_full: bool = bool(payload.get("force_full"))
+
+    # Slugify here (orchestrator) so run_id/labels stay deterministic; cities
+    # such as "new york" carry a space that is unsafe in run_id keys.
+    candidates = [
+        {"city": c, "run_id": f"monthly-{c.replace(' ', '-')}-{month_key}"}
+        for c in cities
+    ]
+
+    todo: list = yield context.call_activity(
+        "ls_cities_needing_run",
+        {"candidates": candidates, "force_full": force_full},
+    )
+
+    summary = {
+        "month_key": month_key,
+        "cities_total": len(cities),
+        "cities_run": len(todo),
+        "waves": 0,
+        "waves_with_failures": 0,
+    }
+
+    for start in range(0, len(todo), wave_size):
+        wave = todo[start : start + wave_size]
+        summary["waves"] += 1
+
+        tasks = []
+        for entry in wave:
+            # Mark the run RUNNING before its sub-orchestration starts.
+            yield context.call_activity(
+                "ls_init_run_log",
+                {"run_id": entry["run_id"], "city": entry["city"]},
             )
-            continue
-        if existing:
-            logger.info(
-                "Monthly location scraper instance exists in non-blocking state (%s); "
-                "re-running city=%s instance_id=%s",
-                existing_status,
-                city,
-                instance_id,
-            )
-            # Purge the failed/terminal instance history so start_new can reuse
-            # the same instance_id cleanly (no manual Durable purge required).
-            try:
-                await client.purge_instance_history(instance_id)
-            except Exception:
-                logger.warning(
-                    "Could not purge prior instance history for %s", instance_id
+            # No explicit instance_id → Durable assigns a unique child id; the
+            # month-scoped run_id is what drives SQL/gold de-duplication.
+            tasks.append(
+                context.call_sub_orchestrator(
+                    "location_scraper_orch",
+                    {
+                        "city": entry["city"],
+                        "shape": None,
+                        "run_id": entry["run_id"],
+                        "unlimited_items": True,
+                    },
                 )
+            )
 
         try:
-            log_act.init_run_log(run_id, city)
+            yield context.task_all(tasks)
         except Exception:
-            logger.exception("Could not insert monthly log row for run_id=%s", run_id)
+            # One or more cities in this wave failed (each already recorded its
+            # own failure in SQL). Continue with the next wave regardless.
+            summary["waves_with_failures"] += 1
+            if not context.is_replaying:
+                logger.warning(
+                    "Monthly wave %d had failures (cities=%s); continuing",
+                    summary["waves"],
+                    [e["city"] for e in wave],
+                )
 
-        orchestrator_input = {
-            "city": city,
-            "shape": None,
-            "run_id": run_id,
-            "unlimited_items": True,
-        }
-        await client.start_new("location_scraper_orch", instance_id, orchestrator_input)
-        started.append({"city": city, "run_id": run_id, "instance_id": instance_id})
-
-    logger.info("Monthly location scraper started %d city runs: %s", len(started), started)
+    if not context.is_replaying:
+        logger.info("Monthly location scraper parent complete: %s", json.dumps(summary, sort_keys=True))
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +578,33 @@ def ls_mark_run_failed(payload: dict) -> None:
     if not run_id:
         return
     _safe_mark_run_failed(run_id, payload.get("error", "unknown error"))
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_init_run_log(payload: dict) -> None:
+    """Upsert a RUNNING log row for a monthly city before its sub-orchestration."""
+    try:
+        log_act.init_run_log(payload["run_id"], payload["city"])
+    except Exception:
+        logger.exception("Could not init monthly log row for run_id=%s", payload.get("run_id"))
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_cities_needing_run(payload: dict) -> list:
+    """Return the subset of candidate cities not yet completed this month.
+
+    payload = {"candidates": [{"city": str, "run_id": str}, ...], "force_full": bool}
+    With force_full, returns all candidates (full re-scrape).
+    """
+    candidates = payload.get("candidates") or []
+    if payload.get("force_full"):
+        return candidates
+    try:
+        completed = log_act.completed_run_ids([c["run_id"] for c in candidates])
+    except Exception:
+        logger.exception("Could not query completed monthly runs; running all candidates")
+        return candidates
+    return [c for c in candidates if c["run_id"] not in completed]
 
 
 @bp.activity_trigger(input_name="payload")
