@@ -198,14 +198,38 @@ async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
         instance_id = f"location-scraper-monthly-{city_slug}-{month_key}"
         existing = await client.get_status(instance_id)
         existing_status = str(getattr(existing, "runtime_status", "")) if existing else ""
-        if existing:
+        # Only an in-progress or already-succeeded run blocks a re-run for this
+        # month. A Failed/Terminated/Canceled instance (e.g. a monthly run that
+        # crashed) must NOT block — re-triggering should retry that city.
+        # runtime_status stringifies as e.g. "OrchestrationRuntimeStatus.Failed",
+        # so compare on the trailing name, case-insensitively.
+        status_name = existing_status.split(".")[-1].lower()
+        blocking_statuses = {"running", "pending", "completed", "continuedasnew", "suspended"}
+        if existing and status_name in blocking_statuses:
             logger.info(
-                "Monthly location scraper instance already exists; skipping city=%s instance_id=%s status=%s",
+                "Monthly location scraper instance already running/succeeded; skipping "
+                "city=%s instance_id=%s status=%s",
                 city,
                 instance_id,
                 existing_status,
             )
             continue
+        if existing:
+            logger.info(
+                "Monthly location scraper instance exists in non-blocking state (%s); "
+                "re-running city=%s instance_id=%s",
+                existing_status,
+                city,
+                instance_id,
+            )
+            # Purge the failed/terminal instance history so start_new can reuse
+            # the same instance_id cleanly (no manual Durable purge required).
+            try:
+                await client.purge_instance_history(instance_id)
+            except Exception:
+                logger.warning(
+                    "Could not purge prior instance history for %s", instance_id
+                )
 
         try:
             log_act.init_run_log(run_id, city)
