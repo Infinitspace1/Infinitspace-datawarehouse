@@ -211,36 +211,49 @@ async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
 
     instance_id = f"location-scraper-monthly-{month_key}"
     existing = await client.get_status(instance_id)
-    existing_status = str(getattr(existing, "runtime_status", "")) if existing else ""
-    # Only an in-progress parent blocks. A completed/failed parent is purged and
-    # restarted — the parent itself skips cities already completed this month
-    # (SQL-based idempotency), so a re-run only retries failed/missing cities.
-    # runtime_status stringifies as e.g. "OrchestrationRuntimeStatus.Running".
-    status_name = existing_status.split(".")[-1].lower()
-    if existing and status_name in {"running", "pending", "suspended"}:
-        logger.info(
-            "Monthly location scraper parent already in progress; skipping. "
-            "instance_id=%s status=%s",
-            instance_id,
-            existing_status,
-        )
-        return
     if existing:
-        # Purge the terminal parent so start_new can reuse the same instance_id.
+        existing_status = str(getattr(existing, "runtime_status", ""))
+        status_name = existing_status.split(".")[-1].lower()
+        # A (re-)trigger always supersedes the current parent. If it is still in
+        # progress, TERMINATE it first — otherwise a hung/stuck parent would
+        # silently block every Test/Run forever (the previous "skip if running"
+        # behaviour). Then purge so start_new can reuse the same instance_id.
+        # SQL idempotency (ls_cities_needing_run) means the fresh parent only
+        # re-runs cities not yet completed this month, so superseding is safe.
+        if status_name in {"running", "pending", "suspended"}:
+            logger.info(
+                "Terminating in-progress monthly parent before re-run. "
+                "instance_id=%s status=%s",
+                instance_id,
+                existing_status,
+            )
+            try:
+                await client.terminate(instance_id, "Superseded by a new monthly trigger")
+            except Exception:
+                logger.warning("Could not terminate monthly parent %s", instance_id)
         try:
             await client.purge_instance_history(instance_id)
         except Exception:
             logger.warning("Could not purge prior monthly parent instance %s", instance_id)
 
-    await client.start_new(
-        "location_scraper_monthly_orch",
-        instance_id,
-        {
-            "month_key": month_key,
-            "cities": list(MONTHLY_CITIES),
-            "wave_size": _wave_size(),
-        },
-    )
+    try:
+        await client.start_new(
+            "location_scraper_monthly_orch",
+            instance_id,
+            {
+                "month_key": month_key,
+                "cities": list(MONTHLY_CITIES),
+                "wave_size": _wave_size(),
+            },
+        )
+    except Exception:
+        # Rare terminate/purge race: the old instance was not fully cleared yet.
+        # The next trigger will start cleanly (it is now terminated + purged).
+        logger.exception(
+            "Could not start monthly parent %s (terminate/purge race?) — re-trigger once",
+            instance_id,
+        )
+        return
     logger.info(
         "Monthly location scraper parent started instance_id=%s month=%s wave_size=%d",
         instance_id,
