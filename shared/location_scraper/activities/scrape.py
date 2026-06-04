@@ -73,19 +73,33 @@ def fetch_dataset(run_info: dict) -> list[dict[str, Any]]:
 def normalize_listings(payload: dict) -> list[dict]:
     """
     Dispatch raw Apify items through the source adapter.
-    payload = {"actor": str, "items": [...], "city": str}
+
+    payload = {"actor": str, "city": str, "items": [...]}   # in-memory items (tests / back-compat)
+           or {"actor": str, "city": str, "run_id": str}    # streamed: read raw back from SQL
+
+    When ``items`` is absent the raw payloads are read page-by-page from
+    ``bronze.location_scraper_raw`` (where the streaming fetch persisted them),
+    so the full dataset never transits the Durable orchestrator — this is the
+    worker-OOM fix for large cities.
+
     Returns a list of Listing.to_dict() dicts (JSON-serialisable for Durable).
     """
     actor = payload["actor"]
-    items: list[dict] = payload["items"]
     city: str = payload["city"]
+    items = payload.get("items")
+    if items is None:
+        from shared.location_scraper.activities.raw_payload import read_raw_items
+
+        items = read_raw_items(payload["run_id"])
 
     adapter = ADAPTER_REGISTRY[actor]
     results = []
     # Google Maps when a key is set, else the free Nominatim geocoder.
     geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else NominatimGeocodingCache()
     geocoded_count = 0
+    seen = 0
     for raw in items:
+        seen += 1
         try:
             listing = adapter.normalize(raw, city)
             if listing is not None:
@@ -97,7 +111,7 @@ def normalize_listings(payload: dict) -> list[dict]:
     logger.info(
         "Normalized %d/%d items for actor=%s city=%s geocoded_missing_coords=%d",
         len(results),
-        len(items),
+        seen,
         actor,
         city,
         geocoded_count,

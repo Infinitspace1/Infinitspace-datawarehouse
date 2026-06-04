@@ -83,6 +83,23 @@ def fetch_dataset(dataset_id: str, limit: int | None = None) -> list[dict[str, A
     return items
 
 
+def iterate_dataset(dataset_id: str, limit: int | None = None):
+    """Yield items from an Apify dataset one at a time.
+
+    Unlike ``fetch_dataset`` this never materialises the full list in memory —
+    the caller can stream items straight to storage. ``dataset.iterate_items``
+    paginates under the hood, so peak memory stays at roughly one page rather
+    than the whole dataset. Used by the streaming raw-persist path that keeps
+    large datasets out of the Durable orchestrator (worker OOM fix)."""
+    dataset = _client().dataset(dataset_id)
+    iterator = dataset.iterate_items(limit=limit) if limit else dataset.iterate_items()
+    count = 0
+    for item in iterator:
+        count += 1
+        yield item
+    logger.info("Iterated %d items from dataset %s", count, dataset_id)
+
+
 def run_sync(actor_id: str, run_input: dict, limit: int = 100) -> list[dict[str, Any]]:
     """
     Start an actor and block until completion, then return dataset items.

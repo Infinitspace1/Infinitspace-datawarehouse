@@ -11,9 +11,10 @@ Functions registered here:
   - ls_resolve_source       (activity)
   - ls_start_apify_run      (activity)
   - ls_check_apify_run      (activity)
-  - ls_fetch_dataset        (activity)
-  - ls_persist_raw          (activity — full Apify JSON per row)
-  - ls_normalize            (activity)
+  - ls_fetch_and_persist_raw (activity — streams Apify dataset → bronze.location_scraper_raw)
+  - ls_fetch_dataset        (activity — legacy, no longer on the hot path)
+  - ls_persist_raw          (activity — legacy, no longer on the hot path)
+  - ls_normalize            (activity — reads raw back from SQL by run_id)
   - ls_dedupe_agencies      (activity)
   - ls_filter_new_agencies  (activity)
   - ls_enrich_agency        (activity — one per agency, fan-out target)
@@ -386,24 +387,32 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
                 f"Apify run failed with status={status.get('status')} run_id={run_info.get('run_id')}"
             )
 
-        # 4. Download dataset
-        raw_items: list[dict] = yield context.call_activity("ls_fetch_dataset", run_info)
-
-        # 4b. Persist full raw payloads (bronze.location_scraper_raw)
-        yield context.call_activity(
-            "ls_persist_raw",
+        # 4 + 4b. Stream the Apify dataset straight into bronze.location_scraper_raw.
+        # The full dataset is deliberately NOT returned to the orchestrator: doing
+        # so serialised the whole payload into the orchestration history and
+        # re-materialised it on every replay (and again as input to persist +
+        # normalize), which OOM-killed the worker on large cities. Only a row
+        # count comes back here.
+        raw_summary: dict = yield context.call_activity(
+            "ls_fetch_and_persist_raw",
             {
                 "run_id": run_id,
+                "dataset_id": run_info["dataset_id"],
                 "source": source_config["actor"],
                 "city": source_config["city"],
-                "items": raw_items,
             },
         )
+        raw_item_count: int = int((raw_summary or {}).get("item_count", 0))
 
-        # 5. Normalize via source adapter
+        # 5. Normalize via source adapter — reads raw payloads back from SQL by
+        # run_id (paged), so the dataset never transits the orchestrator.
         listings: list[dict] = yield context.call_activity(
             "ls_normalize",
-            {"actor": source_config["actor"], "items": raw_items, "city": source_config["city"]},
+            {
+                "actor": source_config["actor"],
+                "run_id": run_id,
+                "city": source_config["city"],
+            },
         )
 
         # Steps 6-9 (Lusha enrichment) are skipped for sources that already
@@ -473,7 +482,7 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
         stats["enrichment_diagnostics"] = enrichment_diag
         stats.update(
             compute_run_quality_payload(
-                raw_item_count=len(raw_items or []),
+                raw_item_count=raw_item_count,
                 listings=listings,
                 bundles=bundles,
                 enrichment_diag=enrichment_diag,
@@ -526,10 +535,27 @@ def ls_fetch_dataset(run_info: dict) -> list:
 
 @bp.activity_trigger(input_name="payload")
 def ls_persist_raw(payload: dict) -> dict:
+    # Legacy: retained for back-compat. The orchestrator now uses
+    # ls_fetch_and_persist_raw (streaming) instead of ls_fetch_dataset +
+    # ls_persist_raw, so this is no longer on the hot path.
     try:
         return raw_act.persist_raw_items(payload)
     except Exception as exc:
         _safe_mark_run_failed(payload.get("run_id"), f"ls_persist_raw failed: {exc}")
+        raise
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_fetch_and_persist_raw(payload: dict) -> dict:
+    """Stream the Apify dataset straight into bronze.location_scraper_raw.
+
+    Replaces the ls_fetch_dataset -> ls_persist_raw pair so the full dataset
+    never transits the orchestrator history (worker-OOM fix on large cities).
+    """
+    try:
+        return raw_act.fetch_and_persist_raw(payload)
+    except Exception as exc:
+        _safe_mark_run_failed(payload.get("run_id"), f"ls_fetch_and_persist_raw failed: {exc}")
         raise
 
 
