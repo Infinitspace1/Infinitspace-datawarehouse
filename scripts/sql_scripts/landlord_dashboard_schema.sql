@@ -759,7 +759,17 @@ po_kpi_monthly AS (
         location_source_id,
         SUM(net_sold)    AS po_net_sold,
         SUM(po_list)     AS po_list_total,
-        SUM(po_capacity) AS po_capacity_total
+        SUM(po_capacity) AS po_capacity_total,
+        -- PLAIN (per-tenant) averages: average each member's own €/desk rate so
+        -- every tenant counts equally, regardless of how many desks they hold.
+        -- This matches the "Average" row at the bottom of the dashboard popup.
+        -- (The desk-weighted SUM/SUM totals above are retained for
+        -- discount_monthly_value and any reconciliation that needs them.)
+        AVG(CAST(net_sold AS FLOAT) / NULLIF(po_capacity, 0))           AS avg_sold_rate,
+        AVG(CAST(po_list  AS FLOAT) / NULLIF(po_capacity, 0))           AS avg_list_rate,
+        AVG(CASE WHEN po_list > 0
+                 THEN (CAST(po_list AS FLOAT) - net_sold) / po_list
+            END)                                                        AS avg_discount_rate
     FROM po_members_monthly
     GROUP BY month_start, location_source_id
 ),
@@ -827,28 +837,17 @@ SELECT
     ISNULL(ma.sold_monthly_revenue, 0)          AS sold_monthly_revenue,
     ISNULL(ma.list_monthly_revenue, 0)          AS list_monthly_revenue,
 
-    -- ── Per-workstation pricing KPIs (PRIVATE OFFICES ONLY, formula D) ────
-    -- Numerator   = SUM(net sold) per PO member with net sold > 0
-    -- Denominator = SUM(PO desks) over the same set of members
-    -- "Net sold" = member's gross pure-PO sold + their own negative-fee
-    -- adjustment contracts (Nexudus stores discounts as separate negative
-    -- rows). Fully-comped members (net = 0) are dropped so their desks
-    -- don't deflate the per-WS average. Mirrors the dashboard popup.
-    CAST(
-        ISNULL(pk.po_net_sold, 0)
-        / NULLIF(ISNULL(pk.po_capacity_total, 0), 0)
-        AS DECIMAL(18,2)
-    )                                           AS avg_sold_price_per_ws,
-    CAST(
-        ISNULL(pk.po_list_total, 0)
-        / NULLIF(ISNULL(pk.po_capacity_total, 0), 0)
-        AS DECIMAL(18,2)
-    )                                           AS avg_list_price_per_ws,
-    CAST(
-        (ISNULL(pk.po_list_total, 0) - ISNULL(pk.po_net_sold, 0))
-        / NULLIF(ISNULL(pk.po_list_total, 0), 0)
-        AS DECIMAL(9,4)
-    )                                           AS avg_discount_pct,
+    -- ── Per-workstation pricing KPIs (PRIVATE OFFICES ONLY) ──────────────
+    -- PLAIN per-tenant average: each PO member's own €/desk rate is computed
+    -- first (net sold ÷ that member's PO desks), then those rates are averaged
+    -- giving every tenant equal weight. This matches the "Average" row at the
+    -- bottom of the dashboard popup. "Net sold" = member's gross pure-PO sold +
+    -- their own negative-fee adjustment contracts (Nexudus stores discounts as
+    -- separate negative rows). Fully-comped members (net = 0) are dropped so
+    -- their desks don't deflate the average.
+    CAST(ISNULL(pk.avg_sold_rate, 0) AS DECIMAL(18,2)) AS avg_sold_price_per_ws,
+    CAST(ISNULL(pk.avg_list_rate, 0) AS DECIMAL(18,2)) AS avg_list_price_per_ws,
+    CAST(ISNULL(pk.avg_discount_rate, 0) AS DECIMAL(9,4)) AS avg_discount_pct,
     CAST(
         ISNULL(pk.po_list_total, 0) - ISNULL(pk.po_net_sold, 0)
         AS DECIMAL(18,2)
@@ -1145,25 +1144,25 @@ SELECT
     lt.sold_monthly_revenue,
     lt.list_monthly_revenue,
 
-    -- ── Per-WS pricing KPIs (PRIVATE OFFICES ONLY, formula D) ─────────────
-    -- avg_sold_price_per_ws = SUM(member net sold) / SUM(member PO desks)
-    --                         over PO members with net sold > 0
-    -- avg_list_price_per_ws = SUM(member PO list)  / SUM(member PO desks)
-    -- Match what's visible in the popup table row-by-row.
+    -- ── Per-WS pricing KPIs (PRIVATE OFFICES ONLY) ───────────────────────
+    -- PLAIN per-tenant average: average each PO member's own €/desk rate so
+    -- every tenant counts equally regardless of office size. Matches the
+    -- "Average" row at the bottom of the dashboard popup.
     CAST(
-        ISNULL((SELECT SUM(net_sold)    FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
-        / NULLIF((SELECT SUM(po_capacity) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
+        ISNULL((SELECT AVG(CAST(net_sold AS FLOAT) / NULLIF(po_capacity, 0))
+                  FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
         AS DECIMAL(18,2)
     ) AS avg_sold_price_per_ws,
     CAST(
-        ISNULL((SELECT SUM(po_list)     FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
-        / NULLIF((SELECT SUM(po_capacity) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
+        ISNULL((SELECT AVG(CAST(po_list AS FLOAT) / NULLIF(po_capacity, 0))
+                  FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
         AS DECIMAL(18,2)
     ) AS avg_list_price_per_ws,
     CAST(
-        ((SELECT SUM(po_list)    FROM po_members pm WHERE pm.location_source_id = lt.location_source_id)
-         - (SELECT SUM(net_sold) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id))
-        / NULLIF((SELECT SUM(po_list) FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
+        ISNULL((SELECT AVG(CASE WHEN po_list > 0
+                                THEN (CAST(po_list AS FLOAT) - net_sold) / po_list
+                           END)
+                  FROM po_members pm WHERE pm.location_source_id = lt.location_source_id), 0)
         AS DECIMAL(9,4)
     ) AS avg_discount_pct,
     CAST(
@@ -1958,3 +1957,9 @@ WHERE invoice_number IN ('GB-INV-2026.05-0188', 'GB-INV-2026.05-0186');
 SELECT *
 FROM gold.finance_dashboard_invoice_worklist
 WHERE location_name = 'Amsterdam - Center - Herengracht 471'
+
+
+EXEC gold.sp_refresh_finance_dashboard
+
+
+SELECT COUNT(1) FROM gold.finance_dashboard_invoice_worklist
