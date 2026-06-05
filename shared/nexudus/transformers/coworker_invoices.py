@@ -56,6 +56,19 @@ _FAILED_PAYMENT_TOKENS = (
     "CHARGED BACK",
     "CHARGEBACK",
 )
+# Nexudus sometimes records a payment-result whose Description starts with
+# "AWAITING:" even though the underlying event is a hard error, not an
+# in-flight collection. The dominant case is
+#   "AWAITING: Exception of type '...NotPreAuthFoundException' was thrown."
+# which means the customer has NO valid direct-debit mandate/pre-authorization,
+# so the payment can never clear. These arrive with IsProblem=false, so without
+# special handling they're classified as "awaiting" → processing=True → the
+# finance worklist hides the invoice forever (observed 2026-06-05: 75 unpaid,
+# genuinely-overdue invoices suppressed, incl. the May London-Aldgate
+# memberships). Treat any exception/no-pre-auth result as a FAILURE so the
+# invoice stays visible and chaseable; genuine "submitted to the banks" /
+# "currently processing" awaits are unaffected.
+_PAYMENT_EXCEPTION_TOKENS = ("EXCEPTION OF TYPE", "NOTPREAUTH", "NO PRE-AUTH")
 
 
 def _str(value: Any) -> Optional[str]:
@@ -153,7 +166,21 @@ def _history_description(history: dict) -> str:
     return (_str(history.get("Description")) or "").strip()
 
 
+def _is_exception_payment_result(history: dict) -> bool:
+    """A payment-result that is really a processing error (no valid mandate /
+    pre-authorization), even when Nexudus prefixes it "AWAITING:". These never
+    clear, so they must count as failures rather than in-flight collections."""
+    text = _history_description(history).upper()
+    return any(token in text for token in _PAYMENT_EXCEPTION_TOKENS)
+
+
 def _is_awaiting_payment_result(history: dict) -> bool:
+    # An "AWAITING:"-prefixed exception (e.g. NotPreAuthFoundException = no valid
+    # direct-debit mandate) is a hard failure, not an in-flight collection.
+    # Never treat it as awaiting, or the invoice is suppressed from the worklist
+    # indefinitely.
+    if _is_exception_payment_result(history):
+        return False
     text = _history_description(history).upper()
     return any(text.startswith(f"{prefix}:") or text == prefix for prefix in _AWAITING_PAYMENT_PREFIXES)
 
@@ -161,6 +188,8 @@ def _is_awaiting_payment_result(history: dict) -> bool:
 def _is_failed_payment_result(history: dict) -> bool:
     text = _history_description(history).upper()
     if _bit(history.get("IsProblem")):
+        return True
+    if _is_exception_payment_result(history):
         return True
     return (
         any(text.startswith(f"{prefix}:") or text == prefix for prefix in _FAILED_PAYMENT_PREFIXES)

@@ -160,6 +160,34 @@ class TestXeroNexudusInvoiceLinking(unittest.TestCase):
         self.assertTrue(row["processing"])
         self.assertEqual(row["payment_failure_count"], 1)
 
+    def test_transform_coworker_invoice_awaiting_exception_is_not_processing(self):
+        # Nexudus prefixes no-mandate errors "AWAITING:" with IsProblem=false.
+        # These can never clear, so they must surface as a failure (visible),
+        # not be hidden as an in-flight collection.
+        raw = {
+            "Id": 1,
+            "InvoiceNumber": "INV-2026.05-7322",
+            "Paid": False,
+            "Void": False,
+            "CreditNote": False,
+        }
+        histories = [
+            {
+                "Name": "Payment Result",
+                "Description": (
+                    "AWAITING: Exception of type 'Nexudus.Coworking."
+                    "CoworkerPaymentProcessing.Exceptions.NotPreAuthFoundException' "
+                    "was thrown."
+                ),
+                "IsProblem": False,
+                "CreatedOn": "2026-05-22T04:57:45Z",
+            }
+        ]
+        row = transform_coworker_invoice(raw, bronze_id=1, sync_run_id="sync-1", histories=histories)
+        self.assertEqual(row["invoice_status"], "Payment Failed")
+        self.assertFalse(row["processing"])
+        self.assertEqual(row["payment_failure_count"], 1)
+
     def test_transform_coworker_maps_email_and_billing_fields(self):
         raw = {
             "Id": 1419974207,
