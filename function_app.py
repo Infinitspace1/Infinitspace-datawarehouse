@@ -14,6 +14,7 @@ App settings:
   - ENABLE_ADMIN_FUNCTIONS=0                default
   - ENABLE_REAL_ESTATE_FUNCTIONS=0          default
   - ENABLE_LOCATION_SCRAPER_FUNCTIONS=0     default
+  - ENABLE_COMPETENCE_FUNCTIONS=0           default (needs FIREBASE_CREDENTIALS)
 """
 from __future__ import annotations
 
@@ -95,3 +96,12 @@ if _env_flag("ENABLE_LOCATION_SCRAPER_FUNCTIONS", False):
     from functions.location_scraper import bp as location_scraper_bp
 
     app.register_functions(location_scraper_bp)
+
+
+# Daily Firebase competence_new -> bronze -> silver sync (TeamAndy competitors).
+# Gated separately (default off) so the daily timer only runs once
+# FIREBASE_CREDENTIALS is configured — otherwise it would fail every day.
+if _env_flag("ENABLE_COMPETENCE_FUNCTIONS", False):
+    from functions.competence_sync import bp as competence_bp
+
+    app.register_functions(competence_bp)

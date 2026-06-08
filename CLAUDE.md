@@ -54,6 +54,12 @@ Default ETL execution order in UTC:
 12. `06:00` `sync_health_report` (emails green/red daily report via Microsoft Graph)
 13. `10:00` `refresh_finance_dashboard_recheck` (re-runs the same guarded rebuild after the early-morning data settles, so an under-built 05:30 worklist is republished in full)
 
+Optional gated surface (not in the default deployment):
+
+- `Mon-Sat 04:30` `competence_sync` (Firebase `competence_new` -> bronze -> silver; **incremental** — only competitors changed since the last run, via an `updated_at` collection-group watermark)
+- `Sun 04:00` `competence_full_reconcile` (full read of `competence_new` + soft-delete reconcile; deletes can only be observed by a full pass)
+- both only when `ENABLE_COMPETENCE_FUNCTIONS=1` and a Firebase credential is set; the incremental read needs a Firestore index on `competitors.updated_at`
+
 Important operational caveat:
 
 - `bronze_to_silver` is schedule-based, not dependency-aware
@@ -128,6 +134,14 @@ refresh_finance_dashboard (timer, 05:30 UTC) + refresh_finance_dashboard_recheck
   -> gold.finance_dashboard_user_access (BambooHR -> Nexudus locations)
   -> gold.finance_dashboard_invoice_worklist (Nexudus invoices, Nexudus-only)
   -> guardrail: roll back + fail the run if the worklist collapses < 50% of the live count
+
+Firebase competence_new (optional, ENABLE_COMPETENCE_FUNCTIONS=1)
+  -> competence_sync (timer, Mon-Sat 04:30 UTC)        incremental (updated_at watermark)
+  -> competence_full_reconcile (timer, Sun 04:00 UTC)  full read + soft-delete
+  -> bronze.competence_lists
+  -> bronze.competence_competitors
+  -> silver.competence_lists
+  -> silver.competence_competitors        (is_deleted reconciled weekly)
 ```
 
 ---
@@ -147,6 +161,7 @@ Default ETL deployment:
 - `ENABLE_ADMIN_FUNCTIONS=0`
 - `ENABLE_REAL_ESTATE_FUNCTIONS=0`
 - `ENABLE_LOCATION_SCRAPER_FUNCTIONS=0`
+- `ENABLE_COMPETENCE_FUNCTIONS=0`
 
 Optional admin deployment:
 
@@ -199,6 +214,7 @@ Infinitspace-datawarehouse/
     real_estate_costar_worker.py
     replyio_sync.py
     sync_health_report.py
+    competence_sync.py
   shared/
     azure_clients/
       sql_client.py
@@ -233,6 +249,12 @@ Infinitspace-datawarehouse/
       client.py
       transformers/
         employees.py
+    firebase/
+      __init__.py
+      client.py              (get_firestore_client — firebase-admin, FIREBASE_CREDENTIALS)
+      competence.py          (read_competence — competence_new lists + competitors)
+      transformers/
+        competence.py        (pure transform_competence_list / transform_competitor)
     xero/
       oauth.py
       flow.py
@@ -349,6 +371,8 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `location_scraper_http` | `functions/location_scraper.py` | HTTP POST | `/api/scrape` | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — Durable Functions starter; returns 202 |
 | `location_scraper_orch` | `functions/location_scraper.py` | orchestration | — | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — Durable orchestrator |
 | `ls_*` (11 activities) | `functions/location_scraper.py` | activity | — | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — resolve / scrape / enrich / persist / log |
+| `competence_sync` | `functions/competence_sync.py` | timer | `0 30 4 * * 1-6` | only when `ENABLE_COMPETENCE_FUNCTIONS=1` — **incremental** Firebase `competence_new` -> bronze + silver (`updated_at` watermark); needs a Firebase credential + a Firestore index on `competitors.updated_at` |
+| `competence_full_reconcile` | `functions/competence_sync.py` | timer | `0 0 4 * * 0` | only when `ENABLE_COMPETENCE_FUNCTIONS=1` — weekly full read of `competence_new` + soft-delete reconcile |
 
 ---
 
@@ -376,6 +400,8 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - `bronze.nexudus_coworker_invoice_lines`
 - `bronze.replyio_sequence_steps`
 - `bronze.replyio_sequence_step_performance`
+- `bronze.competence_lists` — Firebase `competence_new` parent list docs (string `source_id` = Firestore doc id)
+- `bronze.competence_competitors` — Firebase `competence_new` competitor docs (string `source_id` = `{list_id}::{competitor_doc_id}`)
 
 Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only history.
 
@@ -402,6 +428,8 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
 - `silver.location_neighborhoods`
 - `silver.xero_overdue_invoice_contacts` — view joining overdue Xero invoices to Nexudus customer email data
 - `silver.bamboohr_employees` — join key: `work_email` → `silver.nexudus_coworkers.email`; carries `is_deleted`/`deleted_at` reconciled daily by `bamboohr_sync`
+- `silver.competence_lists` — Firebase `competence_new` lists; carries `is_deleted`/`deleted_at` reconciled weekly by `competence_full_reconcile`
+- `silver.competence_competitors` — competitor records (title, address, city, lat/lng, website, placeId, category); `list_source_id` → `silver.competence_lists.source_id`; carries `is_deleted`/`deleted_at`
 
 ### AVA
 
@@ -763,6 +791,15 @@ LOCATION_SCRAPER_WAVE_SIZE=3  # monthly cities scraped per sequential wave (OOM 
 # Function registration
 ENABLE_ETL_FUNCTIONS=1
 ENABLE_ADMIN_FUNCTIONS=0
+ENABLE_COMPETENCE_FUNCTIONS=0
+
+# Firebase competence_new sync (TeamAndy competitors). Provide ONE of:
+#   FIREBASE_CREDENTIALS: service-account JSON as a string (Azure app setting; same
+#     value the TeamAndy scraping services use). If not valid JSON it is read as a path.
+#   FIREBASE_SERVICE_ACCOUNT_KEY_FILE: a local path to, or a download URL for, the
+#     service-account key file (the TeamAndy backend stores a Google Drive URL here).
+FIREBASE_CREDENTIALS=...
+# FIREBASE_SERVICE_ACCOUNT_KEY_FILE=C:\path\to\serviceAccountKey.json
 
 # Schedule overrides
 NEXUDUS_SYNC_SCHEDULE="0 0 2 * * *"
@@ -781,6 +818,10 @@ FINANCE_DASHBOARD_RECHECK_SCHEDULE="0 0 10 * * *"        # second guarded rebuil
 FINANCE_DASHBOARD_MIN_WORKLIST_RATIO=0.5                  # guardrail: reject a rebuild below this fraction of the live worklist count
 FINANCE_DASHBOARD_GUARDRAIL_MIN_BASELINE=20               # skip guardrail when the live count is smaller than this
 REPLYIO_SYNC_SCHEDULE="0 30 5 * * *"
+COMPETENCE_SYNC_SCHEDULE="0 30 4 * * 1-6"                # incremental read, Mon-Sat
+COMPETENCE_FULL_SYNC_SCHEDULE="0 0 4 * * 0"              # weekly full read + soft-delete reconcile, Sun
+COMPETENCE_INCREMENTAL_OVERLAP_MINUTES=60                # re-read buffer before last run start (clock-skew guard)
+COMPETENCE_RECONCILE_MIN_IDS=10                          # reconcile safety floor (skip if fewer competitors fetched)
 ```
 
 ---
@@ -798,6 +839,18 @@ Recommended order:
 .\venv\Scripts\python.exe scripts\python_scripts\test_products_silver.py --write
 .\venv\Scripts\python.exe scripts\python_scripts\test_contracts_silver.py --write
 .\venv\Scripts\python.exe scripts\python_scripts\test_extra_services_silver.py --write
+```
+
+Firebase competence_new sync validation:
+
+```powershell
+# 1. Apply schema once: run scripts/sql_scripts/competence_schema.sql against the warehouse DB
+# 2. Unit tests (no creds / no DB)
+.\venv\Scripts\python.exe -m unittest tests.test_competence_transformer
+# 3. Dry run — connect to Firestore, read + transform, no writes (needs FIREBASE_CREDENTIALS)
+.\venv\Scripts\python.exe scripts\python_scripts\test_competence_sync.py
+# 4. Full local run — Firestore -> bronze -> silver -> reconcile (needs FIREBASE_CREDENTIALS + SQL)
+.\venv\Scripts\python.exe scripts\python_scripts\test_competence_sync.py --write
 ```
 
 Nexudus billing validation:
@@ -971,6 +1024,7 @@ az functionapp config appsettings set `
 | Soft-delete / source reconciliation | done | `is_deleted`/`deleted_at` on all Nexudus + BambooHR silver tables; daily `nexudus_invoice_reconcile` (invoices + cascaded lines), daily roster reconcile inside `bamboohr_sync`, weekly `nexudus_silver_reconcile` for other entities |
 | Sync health report email | done | daily 06:00 UTC via Microsoft Graph; subject `[OK]`/`[FAIL]`; green/red table per entity + record-level error summary; sends to `SYNC_REPORT_RECIPIENTS` from `GRAPH_SENDER_UPN` |
 | Location Scraper (Idealista + Otodom + IS24 + LoopNet) | done | HTTP-triggered Durable Functions pipeline; `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1`; Idealista (ES/IT) + Otodom (PL) + Immobilienscout24 (DE) + LoopNet (UK/London + US: New York, San Francisco, Palo Alto, Los Angeles, Austin, Seattle); Lusha enrichment via fan-out; free Nominatim geocode fallback when no `GOOGLE_MAPS_API_KEY`; bronze schema; see `docs/location_scraper.md` |
+| Firebase competence_new sync | done | Optional (`ENABLE_COMPETENCE_FUNCTIONS=1` + Firebase credential); **incremental** `competence_sync` (Mon-Sat 04:30 UTC — only competitors changed since last run via an `updated_at` collection-group watermark) + weekly `competence_full_reconcile` (Sun 04:00 UTC — full read + soft-delete). Reads Firestore `competence_new` (parent lists + `competitors` subcollection, v1 array fallback) → `bronze.competence_*` → `silver.competence_*`. Needs a Firestore index on `competitors.updated_at` (full-read fallback while it builds); reuses AI-teamandy firebase-admin logic |
 
 ---
 
@@ -988,7 +1042,8 @@ After any material project change:
 
 ---
 
-Last updated: 2026-06-03 (Location Scraper — **`host.json` activity concurrency lowered 10 → 2 to stop worker OOM (`python exited with code 137`)**. Even with sequential waves of 3, `maxConcurrentActivityFunctions=10` let up to ~6 memory-heavy activities (`ls_fetch_dataset`/`ls_persist_raw` load the full Apify payload set) run at once → the Python worker was SIGKILL'd for OOM (German IS24 cities + austin failed with a *NULL* `error_message`: a hard OOM kill dies before it can log). `maxConcurrentActivityFunctions` is now **2**, so at most 2 big datasets are in memory at any time, regardless of wave composition. `maxConcurrentOrchestratorFunctions` stays 5 (orchestrators are lightweight; memory lives in activities). Trade-off: the monthly batch runs more serially (fine — it is a once-a-month job). If a *single* huge city still OOMs alone, the next lever is capping its items (`LOCATION_SCRAPER_MAX_ITEMS`) or bumping the plan instance size. NB deploy = push to `main` (GitHub Actions).)
+Last updated: 2026-06-08 (Firebase `competence_new` sync — **new daily Firestore → bronze → silver pipeline for TeamAndy competitor data, gated behind `ENABLE_COMPETENCE_FUNCTIONS` (default off) + `FIREBASE_CREDENTIALS`**. New `functions/competence_sync.py` (two timers: **incremental** Mon-Sat 04:30 UTC + **weekly full reconcile** Sun 04:00 UTC) mirrors the self-contained `bamboohr_sync` pattern: reads Firestore collection `competence_new` (per-country parent lists + their `competitors` subcollection, with a legacy in-doc `competitors` array fallback) via new `shared/firebase/client.py` (firebase-admin; credentials from the `FIREBASE_CREDENTIALS` env var parsed as service-account JSON, or `FIREBASE_SERVICE_ACCOUNT_KEY_FILE` (a local path or a Google Drive download URL, fetched in-memory) — the same connection logic the AI-teamandy services use) and `shared/firebase/competence.py` (reader; the competitor bronze key is the composite `{list_id}::{competitor_doc_id}` so the same placeId appearing under multiple lists stays distinct). Writes `bronze.competence_lists` + `bronze.competence_competitors` (string `source_id`, latest-payload MERGE with SHA-256 hash-dedup — `shared/azure_clients/competence_bronze_writer.py`), then `silver.competence_lists` + `silver.competence_competitors` (pure transformers in `shared/firebase/transformers/competence.py`; writer `shared/azure_clients/silver_writer_competence.py` reuses `load_latest_bronze_rows`), then (weekly only, in `competence_full_reconcile`) a full-read soft-delete reconcile (`is_deleted`/`deleted_at`, `COMPETENCE_RECONCILE_MIN_IDS` safety floor). The daily `competence_sync` is **incremental** — it reads only competitors whose `updated_at` advanced since the last run via a Firestore collection-group watermark (needs a one-time COLLECTION_GROUP index on `competitors.updated_at`; falls back to a full read while the index builds), so it never re-imports all 15k; bronze SHA-256 hash-dedup + the silver watermark mean only new/changed rows are written either way. Each step tracked in `meta.sync_runs` under source_name `competence`. SQL DDL: `scripts/sql_scripts/competence_schema.sql` (run once; NVARCHAR(450) string keys). New dep `firebase-admin>=6.5.0,<7` (resolved to 6.9.0). Validation: `scripts/python_scripts/test_competence_sync.py` (`--dry-run`/`--write`) + `tests/test_competence_transformer.py` (10 tests pass; module imports + blueprint registration verified). Gated separately (not in the default ETL deployment) so the daily timer only runs once creds exist. `sync_health_report` now includes competence in its expected-daily check (`("competence","competence","silver")`) **only when `ENABLE_COMPETENCE_FUNCTIONS=1`**, so a disabled feature is never flagged "never started"; the weekly `competence_reconcile` is deliberately excluded from the daily check. NB deploy = push to `main` (GitHub Actions), then set `FIREBASE_CREDENTIALS` + `ENABLE_COMPETENCE_FUNCTIONS=1` on `func-infinitspace-etl`.)
+Previous: 2026-06-03 (Location Scraper — **`host.json` activity concurrency lowered 10 → 2 to stop worker OOM (`python exited with code 137`)**. Even with sequential waves of 3, `maxConcurrentActivityFunctions=10` let up to ~6 memory-heavy activities (`ls_fetch_dataset`/`ls_persist_raw` load the full Apify payload set) run at once → the Python worker was SIGKILL'd for OOM (German IS24 cities + austin failed with a *NULL* `error_message`: a hard OOM kill dies before it can log). `maxConcurrentActivityFunctions` is now **2**, so at most 2 big datasets are in memory at any time, regardless of wave composition. `maxConcurrentOrchestratorFunctions` stays 5 (orchestrators are lightweight; memory lives in activities). Trade-off: the monthly batch runs more serially (fine — it is a once-a-month job). If a *single* huge city still OOMs alone, the next lever is capping its items (`LOCATION_SCRAPER_MAX_ITEMS`) or bumping the plan instance size. NB deploy = push to `main` (GitHub Actions).)
 Previous: 2026-06-03 (Location Scraper — **monthly run now batched into sequential waves of 3 cities (fixes worker OOM / exit 137) + SQL-based retry of only failed cities** [+ follow-up fix: a re-trigger now terminates a hung parent instead of skipping it]. Problem: the monthly timer fanned out all 18 cities at once; with `host.json` `maxConcurrentActivityFunctions=10`, several memory-heavy Apify datasets (`ls_fetch_dataset`/`ls_persist_raw` load the full payload set — e.g. madrid 633 buildings) loaded simultaneously and the Python worker was SIGKILL'd for OOM (`python exited with code 137`). Solution in [functions/location_scraper.py](functions/location_scraper.py): the timer no longer starts 18 orchestrations directly — it starts **one parent orchestrator** `location_scraper_monthly_orch` (instance_id `location-scraper-monthly-{YYYY-MM}`, one per month). The parent processes cities in **sequential waves** of `_wave_size()` (default 3, env `LOCATION_SCRAPER_WAVE_SIZE`): each wave fans out its cities as **sub-orchestrations** (`call_sub_orchestrator("location_scraper_orch", …)`, no explicit child instance_id → Durable auto-assigns; the month-scoped `run_id` drives SQL/gold de-dup) and `task_all` waits before the next wave — so at most `wave_size` datasets are in memory at once. A wave failure is caught (try/except around `task_all`) and logged (`is_replaying`-guarded), so one failed city doesn't block later waves. **Retry semantics**: new activity `ls_cities_needing_run` queries `bronze.n8n_location_scraper_logs` (new helper `log_run.completed_run_ids`) and the parent **skips cities already `completed` this month**, so a re-trigger only retries failed/missing cities (no wasted Apify credits). New activity `ls_init_run_log` writes the per-city RUNNING row from inside the parent (orchestrators can't do I/O directly). **Parent-level lock** (replaces the per-city lock from the previous entry): a (re-)trigger always supersedes the current parent — a `running`/`pending`/`suspended` parent is **terminated** (`client.terminate`) then purged, a `completed`/`failed` parent is purged, and a fresh parent is started; SQL idempotency handles the rest, so a manual portal **Test/Run** always re-runs (retrying only failed cities). NB: the earlier "skip if running" variant deadlocked — a hung parent silently blocked every Test/Run (`Monthly location scraper parent already in progress; skipping`); terminating fixes that. Also: `log_run._UPDATE_LOG` and `_UPSERT_RUNNING_LOG` now clear `error_message` on success/re-run, so `completed` rows no longer carry a stale error (previously a city that failed then succeeded on retry showed `completed` with the old error text). No schema change (uses existing `error_message` column). Tests: 40 pass (resolve/loopnet/IS24/run_quality); module imports clean. NB still needs `func azure functionapp publish func-infinitspace-etl --python` — i.e. merge to `main` (GitHub Actions `main_func-infinitspace-etl.yml` deploys on push to `main`). Per-city `POST /api/scrape` path unchanged.)
 Previous: 2026-06-03 (Location Scraper — **monthly re-run no longer blocked by a failed run (idempotency lock relaxed) + auto-purge of failed Durable instances**. Problem: the `location_scraper_monthly` timer skipped any city whose Durable instance already existed *in any state*, including `Failed`. So once a monthly run crashed (e.g. the surface_unit deploy skew below), re-triggering the timer skipped those cities forever — the only fix was a manual Durable purge. Solution in [functions/location_scraper.py](functions/location_scraper.py): the per-city skip now only triggers when the existing instance is in a **blocking** state (`running`/`pending`/`completed`/`continuedasnew`/`suspended` — i.e. in-progress or already-succeeded). A `Failed`/`Terminated`/`Canceled` instance is **non-blocking**: the timer logs it, calls `client.purge_instance_history(instance_id)` to clear the stale history, then re-runs the city under the same `instance_id`. `runtime_status` is compared on its trailing name, case-insensitively (`OrchestrationRuntimeStatus.Failed` → `failed`). Net effect: a failed city auto-retries on the next monthly fire **or** on a manual portal **Test/Run**, with no manual purge ever needed. Monthly idempotency for *successful*/*in-progress* runs is unchanged (still one run per city per month). No SQL/schema change. NB still needs `func azure functionapp publish func-infinitspace-etl --python` to deploy.)
 Previous: 2026-06-03 (Location Scraper — **surface display unit (sqft for UK/US) + gold email-only filter**. Problem: every layer stored surface in m² only, but LoopNet (UK/US) listings are quoted in **square feet** — both outreach emails and the dashboard must show the local unit. Solution: keep a canonical m² *and* carry the display value + unit. **New columns across 3 layers** (`available_surface_m2` → renamed `surface_m2` in bronze; globe v2 / gold already used `surface_m2`): `surface_m2` (canonical m², used for sort/compare + the LoopNet ≥1500 m² guardrail), `surface_display` (value in display unit: native sqft for loopnet, = m² for idealista/otodom/IS24), `surface_unit` (`'sqft'`|`'m2'`). Code: [models.py](shared/location_scraper/models.py) (`Listing` fields + `from_dict` **backward-compat shim** mapping legacy `available_surface_m2` queue messages); [adapters/loopnet.py](shared/location_scraper/adapters/loopnet.py) new `available_surface_sqft_from_payload` (native sqft; `available_surface_m2_from_payload` now derives m² from it) → `surface_unit='sqft'`; the 3 EU adapters set `surface_display=surface_m2`, `surface_unit='m2'`; [activities/persist.py](shared/location_scraper/activities/persist.py) (`_INSERT_LISTING`); [activities/materialize_globe.py](shared/location_scraper/activities/materialize_globe.py) (`_map_row` computes display/unit, `_INSERT_ROW`). **Gold now keeps only buildings with a contact email** — `gold.sp_refresh_location_scraper_map_markers` gained `WHERE marker_rank = 1 AND lusha_email_1 IS NOT NULL` (the representative row is ranked to prefer rows with an email, so this drops markers where no listing has any email; `lusha_email_*` slots carry both Lusha emails and LoopNet broker emails). Gold also gains `total/min/max_surface_display` + `surface_unit`. **SQL**: schema source-of-truth updated in `location_scraper_schema.sql`, `location_scraper_globe_materialized_v2.sql`, `location_scraper_gold_map_markers_price_breakdown.sql`; new migration `scripts/sql_scripts/location_scraper_surface_unit_migration.sql` does the bronze rename + adds the silver columns + **backfills history** (loopnet rows: `unit='sqft'`, `display = surface_m2 / 0.092903`; others: `unit='m2'`, `display = surface_m2`). **Apply order**: (1) surface_unit_migration.sql, (2) globe_materialized_v2.sql, (3) gold_map_markers_price_breakdown.sql, (4) `EXEC gold.sp_refresh_location_scraper_map_markers`. Tests updated (loopnet/IS24/idealista/berlin) — 74 pass; the 7 berlin_simulation failures remain pre-existing (city/region fixture mismatch, unrelated). NB still needs `func azure functionapp publish func-infinitspace-etl --python`. Idealista/Otodom/IS24 normalization logic otherwise unchanged.)

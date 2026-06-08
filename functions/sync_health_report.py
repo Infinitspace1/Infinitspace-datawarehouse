@@ -53,6 +53,26 @@ _EXPECTED_DAILY: frozenset[tuple[str, str, str]] = frozenset([
 ])
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _expected_daily() -> frozenset[tuple[str, str, str]]:
+    """Expected-daily set, augmented with optional surfaces only when they are
+    enabled — so a disabled feature is never flagged as 'never started'."""
+    expected = set(_EXPECTED_DAILY)
+    if _env_flag("ENABLE_COMPETENCE_FUNCTIONS", False):
+        # competence runs every day (incremental competence_sync Mon-Sat +
+        # competence_full_reconcile Sun); the silver step is the representative
+        # "the pipeline completed" signal. The weekly competence_reconcile is
+        # deliberately NOT expected daily (it only runs on Sundays).
+        expected.add(("competence", "competence", "silver"))
+    return frozenset(expected)
+
+
 def _parse_recipients() -> list[str]:
     raw = os.getenv("SYNC_REPORT_RECIPIENTS", DEFAULT_RECIPIENTS)
     return [a.strip() for a in raw.split(",") if a.strip()]
@@ -278,7 +298,7 @@ async def sync_health_report(timer: func.TimerRequest) -> None:
     try:
         runs = _fetch_runs(lookback_hours)
         errors = _fetch_error_summary(lookback_hours)
-        missing = _find_missing_runs(runs, _EXPECTED_DAILY)
+        missing = _find_missing_runs(runs, _expected_daily())
         as_of = datetime.now(timezone.utc)
 
         body, failed, running, success, n_missing = _render_html(
