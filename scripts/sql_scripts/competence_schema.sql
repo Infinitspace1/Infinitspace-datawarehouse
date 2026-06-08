@@ -94,7 +94,8 @@ CREATE TABLE silver.competence_competitors (
     street             NVARCHAR(500)    NULL,
     city               NVARCHAR(200)    NULL,
     postal_code        NVARCHAR(50)     NULL,
-    country_code       NVARCHAR(8)      NULL,       -- from last_seen_country_code
+    country            NVARCHAR(200)    NULL,       -- country NAME, derived from the parent list (NL_AUTO -> Netherlands)
+    country_code       NVARCHAR(8)      NULL,       -- own last_seen_country_code, else inherited from the parent list
     phone              NVARCHAR(100)    NULL,
     website            NVARCHAR(1000)   NULL,
     google_maps_url    NVARCHAR(1000)   NULL,
@@ -112,8 +113,9 @@ CREATE TABLE silver.competence_competitors (
     CONSTRAINT pk_silver_competence_competitors PRIMARY KEY (source_id)
 );
 
-CREATE INDEX ix_silver_competence_competitors_list    ON silver.competence_competitors (list_source_id);
-CREATE INDEX ix_silver_competence_competitors_place   ON silver.competence_competitors (place_id);
-CREATE INDEX ix_silver_competence_competitors_city    ON silver.competence_competitors (city);
-CREATE INDEX ix_silver_competence_competitors_country ON silver.competence_competitors (country_code);
+CREATE INDEX ix_silver_competence_competitors_list         ON silver.competence_competitors (list_source_id);
+CREATE INDEX ix_silver_competence_competitors_place        ON silver.competence_competitors (place_id);
+CREATE INDEX ix_silver_competence_competitors_city         ON silver.competence_competitors (city);
+CREATE INDEX ix_silver_competence_competitors_country      ON silver.competence_competitors (country_code);
+CREATE INDEX ix_silver_competence_competitors_country_name ON silver.competence_competitors (country);
 GO

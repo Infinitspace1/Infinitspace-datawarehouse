@@ -58,7 +58,8 @@ _COMPETITORS_MERGE_SQL = """
         ON target.source_id = source.source_id
     WHEN MATCHED THEN UPDATE SET
         list_source_id = ?, place_id = ?, title = ?, category_name = ?,
-        address = ?, street = ?, city = ?, postal_code = ?, country_code = ?,
+        address = ?, street = ?, city = ?, postal_code = ?,
+        country = ?, country_code = ?,
         phone = ?, website = ?, google_maps_url = ?,
         latitude = ?, longitude = ?,
         last_seen_at = ?, last_seen_in_city = ?,
@@ -68,7 +69,8 @@ _COMPETITORS_MERGE_SQL = """
         last_synced_at = GETUTCDATE()
     WHEN NOT MATCHED THEN INSERT (
         source_id, list_source_id, place_id, title, category_name,
-        address, street, city, postal_code, country_code,
+        address, street, city, postal_code,
+        country, country_code,
         phone, website, google_maps_url,
         latitude, longitude,
         last_seen_at, last_seen_in_city,
@@ -76,7 +78,8 @@ _COMPETITORS_MERGE_SQL = """
         bronze_id, sync_run_id
     ) VALUES (
         ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?,
         ?, ?, ?,
         ?, ?,
         ?, ?,
@@ -133,6 +136,14 @@ class SilverCompetenceWriter:
 
     # ── Competitors ──────────────────────────────────────────
 
+    def _load_list_country_map(self) -> dict[str, tuple]:
+        """{ list source_id -> (country_name, country_code) } from every silver
+        list, so competitors can inherit the country of their parent list."""
+        rows = self.sql.execute_query(
+            "SELECT source_id, country, country_code FROM silver.competence_lists"
+        )
+        return {r["source_id"]: (r["country"], r["country_code"]) for r in rows}
+
     def _sync_competitors(self) -> tuple[int, int, int]:
         rows = load_latest_bronze_rows(
             "bronze.competence_competitors",
@@ -140,12 +151,20 @@ class SilverCompetenceWriter:
             entity=SILVER_ENTITY,
             columns="b.id, b.source_id, b.list_source_id, b.raw_json",
         )
+        # Cleanup step: competitors carry no reliable country of their own, so
+        # derive it from each one's per-country parent list. Lists are synced
+        # just before this (and are only ~tens of rows), so silver.competence_lists
+        # is the authoritative, complete country lookup for every parent.
+        # Skip the lookup query entirely on no-op incremental runs (no changes).
+        list_country = self._load_list_country_map() if rows else {}
         params_list, errors = [], 0
         for row in rows:
             try:
                 raw = json.loads(row["raw_json"])
+                list_name, list_code = list_country.get(row["list_source_id"], (None, None))
                 rec = transform_competitor(
-                    raw, row["source_id"], row["list_source_id"], row["id"], self.sync_run_id
+                    raw, row["source_id"], row["list_source_id"], row["id"], self.sync_run_id,
+                    list_country_name=list_name, list_country_code=list_code,
                 )
                 params_list.append(self._competitor_params(rec))
             except Exception as exc:
@@ -175,7 +194,8 @@ class SilverCompetenceWriter:
     def _competitor_params(self, r: dict) -> tuple:
         vals = (
             r["list_source_id"], r["place_id"], r["title"], r["category_name"],
-            r["address"], r["street"], r["city"], r["postal_code"], r["country_code"],
+            r["address"], r["street"], r["city"], r["postal_code"],
+            r["country"], r["country_code"],
             r["phone"], r["website"], r["google_maps_url"],
             r["latitude"], r["longitude"],
             r["last_seen_at"], r["last_seen_in_city"],

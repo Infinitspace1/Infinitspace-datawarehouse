@@ -3,6 +3,7 @@ from datetime import datetime
 
 from shared.firebase.transformers.competence import (
     _parse_dt,
+    resolve_competitor_country,
     transform_competence_list,
     transform_competitor,
 )
@@ -64,6 +65,7 @@ class TestTransformCompetitor(unittest.TestCase):
         self.assertEqual(r["category_name"], "coworking space")
         self.assertEqual(r["postal_code"], "1082 MA")
         self.assertEqual(r["country_code"], "NL")  # from last_seen_country_code
+        self.assertEqual(r["country"], "Netherlands")  # named from the code
         self.assertEqual(r["google_maps_url"], "https://maps.google.com/?cid=123")
         self.assertEqual(r["bronze_id"], 7)
 
@@ -85,6 +87,59 @@ class TestTransformCompetitor(unittest.TestCase):
         r = transform_competitor(_competitor(), "x", "NL_AUTO", 1, "x")
         self.assertIsInstance(r["last_seen_at"], datetime)
         self.assertEqual(r["last_seen_at"].year, 2026)
+
+
+class TestCountryEnrichment(unittest.TestCase):
+
+    def test_inherits_country_from_parent_list_when_own_empty(self):
+        # The real-world case being fixed: competitor has no own country code.
+        comp = _competitor(last_seen_country_code=None)
+        r = transform_competitor(
+            comp, "ES_AUTO::x", "ES_AUTO", 1, "run",
+            list_country_name="Spain", list_country_code="ES",
+        )
+        self.assertEqual(r["country"], "Spain")
+        self.assertEqual(r["country_code"], "ES")
+
+    def test_own_code_wins_over_list_code(self):
+        name, code = resolve_competitor_country("NL", "ES_AUTO", "Spain", "ES")
+        self.assertEqual(code, "NL")           # own observed code wins
+        self.assertEqual(name, "Netherlands")  # name realigned to the resolved code
+
+    def test_list_name_used_when_codes_agree(self):
+        # List name is authoritative when its code matches the resolved code,
+        # even if the ISO map would phrase it differently.
+        name, code = resolve_competitor_country(None, "GB_AUTO", "UK / Britain", "GB")
+        self.assertEqual(code, "GB")
+        self.assertEqual(name, "UK / Britain")
+
+    def test_code_from_list_id_prefix_fallback(self):
+        # No own code, no list passed -> derive ISO2 from the list id prefix.
+        name, code = resolve_competitor_country(None, "PL_AUTO", None, None)
+        self.assertEqual(code, "PL")
+        self.assertEqual(name, "Poland")
+
+    def test_code_derived_from_list_name_when_no_code(self):
+        # The real competence_new shape: random list id, country NAME only, no code.
+        name, code = resolve_competitor_country(None, "x9JY0OQhB6GalxIomfYK", "United Kingdom", None)
+        self.assertEqual(code, "GB")
+        self.assertEqual(name, "United Kingdom")
+
+    def test_usa_alias_canonicalised(self):
+        # Two lists spell it "USA" and "United States"; both must converge.
+        n1, c1 = resolve_competitor_country(None, "3kK83ODpBn6uZmUJCKvg", "USA", None)
+        n2, c2 = resolve_competitor_country(None, "61QWwMDzrtU4YwzsWfF6", "United States", None)
+        self.assertEqual((n1, c1), ("United States", "US"))
+        self.assertEqual((n2, c2), ("United States", "US"))
+
+    def test_uk_normalised_to_gb(self):
+        _name, code = resolve_competitor_country("uk", "GB_AUTO", None, None)
+        self.assertEqual(code, "GB")
+
+    def test_unresolvable_returns_none(self):
+        name, code = resolve_competitor_country(None, "weird-list-id", None, None)
+        self.assertIsNone(name)
+        self.assertIsNone(code)
 
 
 class TestTransformCompetenceList(unittest.TestCase):
