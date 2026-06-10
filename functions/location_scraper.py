@@ -182,6 +182,10 @@ async def location_scraper_http(
         "city": city,
         "shape": shape,
         "run_id": run_id,
+        # On-demand sourcing has no item cap, same as the monthly job — we want
+        # every available building, not just Apify's first 100. Pass
+        # "unlimited_items": false in the request body to re-enable the cap.
+        "unlimited_items": bool(body.get("unlimited_items", True)),
     }
 
     instance_id = await client.start_new("location_scraper_orch", None, orchestrator_input)
