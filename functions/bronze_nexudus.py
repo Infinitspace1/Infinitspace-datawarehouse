@@ -9,7 +9,7 @@ Entities pulled (in order):
   2. products               -- GET /sys/floorplandesks (all item types)
   3. contracts              -- GET /billing/coworkercontracts
   4. coworker_invoices      -- GET /billing/coworkerinvoices
-  5. coworkers              -- GET /spaces/coworkers/{id}
+  5. coworkers              -- GET /spaces/coworkers
   6. resources              -- GET /spaces/resources/{id}
   7. extra_services         -- GET /billing/extraservices
   8. coworker_invoice_lines -- GET /billing/coworkerinvoicelines
@@ -21,10 +21,10 @@ Entities pulled (in order):
  14. event_products         -- GET /content/eventproducts            (Events, 2026-06-10)
 
 Incremental sync:
-  Paginated entities (locations, products, contracts, extra_services)
-  use the UpdatedSince watermark from meta.sync_runs.  First run does
-  a full fetch; subsequent runs only fetch records updated since the
-  last successful bronze run for that entity.
+  Paginated entities (locations, products, contracts, coworkers,
+  extra_services) use the UpdatedSince watermark from meta.sync_runs.
+  First run does a full fetch; subsequent runs only fetch records
+  updated since the last successful bronze run for that entity.
 
   coworker_invoices uses from_CoworkerInvoice_UpdatedOn with a 3-day
   lookback window — no watermark dependency.
@@ -37,8 +37,8 @@ Incremental sync:
   invoices with due dates from the last month onward. These histories drive
   finance-dashboard suppression while payments are still processing.
 
-  Per-record entities (resources, coworkers) are driven by their parent
-  entity and cannot use UpdatedSince directly.
+  Per-record entities (resources) are driven by their parent entity and
+  cannot use UpdatedSince directly.
 
 Change detection:
   All entity writers compare SHA-256 hashes of incoming payloads against
@@ -128,8 +128,8 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
             locations = await _sync_locations(client, blob_writer, writer, run_id)
             products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
             await _sync_contracts(client, blob_writer, writer, run_id, products)
-            changed_invoices, coworker_ids = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
-            await _sync_coworkers(client, blob_writer, writer, run_id, coworker_ids)
+            changed_invoices = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
+            await _sync_coworkers(client, blob_writer, writer, run_id)
             await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
             await _sync_extra_services(client, blob_writer, writer, run_id)
             await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, changed_invoices)
@@ -415,7 +415,7 @@ async def _sync_coworker_invoices(
     writer: BronzeWriter,
     run_id: uuid.UUID,
     lookback_days: int | None = None,
-) -> tuple[list[dict], list[int]]:
+) -> list[dict]:
     days = lookback_days if lookback_days is not None else int(
         os.getenv("NEXUDUS_INVOICE_LOOKBACK_DAYS", "2")
     )
@@ -431,14 +431,11 @@ async def _sync_coworker_invoices(
         blob_path = blob_writer.write_snapshot("coworker_invoices", records, run_id)
         changed, run.rows_written = writer.write_coworker_invoices(records)
         run.rows_skipped = len(records) - len(changed)
-        coworker_ids = sorted({int(r["CoworkerId"]) for r in changed if r.get("CoworkerId")})
         logger.info(
-            "Coworker invoices: %s fetched, %s changed, %s skipped, %s written to bronze. "
-            "Distinct coworker ids from changed: %s [blob=%s]",
-            run.rows_read, len(changed), run.rows_skipped, run.rows_written,
-            len(coworker_ids), blob_path,
+            "Coworker invoices: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
         )
-        return changed, coworker_ids
+        return changed
 
 
 async def _sync_coworkers(
@@ -446,32 +443,27 @@ async def _sync_coworkers(
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
-    coworker_ids: list[int],
+    force_full: bool = False,
 ) -> None:
-    """Coworkers are fetched per-ID from invoices — no UpdatedSince support."""
-    if not coworker_ids:
-        logger.info("Coworkers: no CoworkerIds found in changed invoices, skipping")
-        return
+    """Full coworker list via GET /spaces/coworkers (UpdatedSince watermark).
 
+    Until 2026-06-10 coworkers were fetched per-ID from invoice CoworkerIds,
+    which silently dropped anyone never invoiced (leads, team members billed
+    through their company, event guests). The paginated list endpoint covers
+    every coworker record; `force_full` skips the watermark for backfills.
+    """
+    extra_params = {} if force_full else _incremental_params("coworkers")
+    if force_full:
+        logger.info("Coworkers: force_full — fetching the complete list")
     async with RunTracker("nexudus", "coworkers", "bronze", metadata=str(run_id)) as run:
-        run.rows_read = len(coworker_ids)
-        tasks = [client.get_coworker(coworker_id) for coworker_id in coworker_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        records = []
-        for coworker_id, result in zip(coworker_ids, results):
-            if isinstance(result, Exception):
-                logger.warning("Coworker %s failed: %s", coworker_id, result)
-                run.rows_skipped += 1
-                continue
-            if result:
-                records.append(result)
-
+        records = await client.get_all("spaces/coworkers", extra_params=extra_params)
+        run.rows_read = len(records)
         blob_path = blob_writer.write_snapshot("coworkers", records, run_id)
-        _changed, run.rows_written = writer.write_coworkers(records)
+        changed, run.rows_written = writer.write_coworkers(records)
+        run.rows_skipped = len(records) - len(changed)
         logger.info(
-            "Coworkers: %s attempted, %s written, %s skipped [blob=%s]",
-            run.rows_read, run.rows_written, run.rows_skipped, blob_path,
+            "Coworkers: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
         )
 
 
