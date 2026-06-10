@@ -45,6 +45,9 @@ from shared.azure_clients.silver_writer_resources import SilverResourcesWriter
 from shared.azure_clients.silver_writer_extra_services import SilverExtraServicesWriter
 from shared.azure_clients.silver_writer_tariffs import SilverTariffsWriter
 from shared.azure_clients.silver_writer_financial_accounts import SilverFinancialAccountsWriter
+from shared.azure_clients.silver_writer_calendar_events import SilverCalendarEventsWriter
+from shared.azure_clients.silver_writer_event_attendees import SilverEventAttendeesWriter
+from shared.azure_clients.silver_writer_event_products import SilverEventProductsWriter
 from shared.azure_clients.run_tracker import RunTracker
 
 logger = logging.getLogger(__name__)
@@ -96,6 +99,19 @@ _ENTITY_MAP = {
     "financial_accounts": (
         SilverFinancialAccountsWriter,
         lambda r: r.get("financial_accounts", 0),
+    ),
+    # Events (2026-06-10) — see silver_nexudus.py.
+    "calendar_events": (
+        SilverCalendarEventsWriter,
+        lambda r: r.get("calendar_events", 0),
+    ),
+    "event_attendees": (
+        SilverEventAttendeesWriter,
+        lambda r: r.get("event_attendees", 0),
+    ),
+    "event_products": (
+        SilverEventProductsWriter,
+        lambda r: r.get("event_products", 0),
     ),
 }
 

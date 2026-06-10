@@ -16,6 +16,9 @@ Entities pulled (in order):
   9. coworker_invoice_histories -- GET /billing/coworkerinvoicehistories
  10. tariffs                -- GET /billing/tariffs                  (Phase 2, 2026-05-28)
  11. financial_accounts     -- GET /billing/financialaccounts        (Phase 2, 2026-05-28)
+ 12. calendar_events        -- GET /content/calendarevents           (Events, 2026-06-10)
+ 13. event_attendees        -- GET /content/eventattendees           (Events, 2026-06-10)
+ 14. event_products         -- GET /content/eventproducts            (Events, 2026-06-10)
 
 Incremental sync:
   Paginated entities (locations, products, contracts, extra_services)
@@ -134,6 +137,10 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
             # Phase 2 reference data — small tables, full re-fetch each run.
             await _sync_tariffs(client, blob_writer, writer, run_id)
             await _sync_financial_accounts(client, blob_writer, writer, run_id)
+            # Events (2026-06-10): calendar events + attendees + ticket products.
+            await _sync_calendar_events(client, blob_writer, writer, run_id)
+            await _sync_event_attendees(client, blob_writer, writer, run_id)
+            await _sync_event_products(client, blob_writer, writer, run_id)
 
     logger.info(f"Nexudus -> Bronze sync complete [run_id={run_id}]")
 
@@ -333,6 +340,71 @@ async def _sync_financial_accounts(
         run.rows_skipped = len(records) - len(changed)
         logger.info(
             "Financial accounts: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
+        )
+
+
+async def _sync_calendar_events(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    """Events (2026-06-10): pull Nexudus calendar events.
+
+    Small table (~750 records). Uses the UpdatedSince watermark like the
+    other paginated entities; the SHA-256 hash check in
+    BronzeWriter.write_calendar_events skips unchanged payloads.
+    """
+    extra_params = _incremental_params("calendar_events")
+    async with RunTracker("nexudus", "calendar_events", "bronze", metadata=str(run_id)) as run:
+        records = await client.get_all("content/calendarevents", extra_params=extra_params)
+        run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("calendar_events", records, run_id)
+        changed, run.rows_written = writer.write_calendar_events(records)
+        run.rows_skipped = len(records) - len(changed)
+        logger.info(
+            "Calendar events: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
+        )
+
+
+async def _sync_event_attendees(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    """Events (2026-06-10): pull Nexudus event attendees (ticket registrations)."""
+    extra_params = _incremental_params("event_attendees")
+    async with RunTracker("nexudus", "event_attendees", "bronze", metadata=str(run_id)) as run:
+        records = await client.get_all("content/eventattendees", extra_params=extra_params)
+        run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("event_attendees", records, run_id)
+        changed, run.rows_written = writer.write_event_attendees(records)
+        run.rows_skipped = len(records) - len(changed)
+        logger.info(
+            "Event attendees: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
+        )
+
+
+async def _sync_event_products(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    """Events (2026-06-10): pull Nexudus event products (ticket types per event)."""
+    extra_params = _incremental_params("event_products")
+    async with RunTracker("nexudus", "event_products", "bronze", metadata=str(run_id)) as run:
+        records = await client.get_all("content/eventproducts", extra_params=extra_params)
+        run.rows_read = len(records)
+        blob_path = blob_writer.write_snapshot("event_products", records, run_id)
+        changed, run.rows_written = writer.write_event_products(records)
+        run.rows_skipped = len(records) - len(changed)
+        logger.info(
+            "Event products: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
             run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
         )
 

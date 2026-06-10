@@ -15,6 +15,8 @@ App settings:
   - ENABLE_REAL_ESTATE_FUNCTIONS=0          default
   - ENABLE_LOCATION_SCRAPER_FUNCTIONS=0     default
   - ENABLE_COMPETENCE_FUNCTIONS=0           default (needs FIREBASE_CREDENTIALS)
+  - ENABLE_HUBSPOT_FUNCTIONS=0              default (needs HUBSPOT_ACCESS_TOKEN)
+  - ENABLE_EVENTBRITE_FUNCTIONS=0           default (needs EVENTBRITE_PRIVATE_TOKEN)
 """
 from __future__ import annotations
 
@@ -105,3 +107,21 @@ if _env_flag("ENABLE_COMPETENCE_FUNCTIONS", False):
     from functions.competence_sync import bp as competence_bp
 
     app.register_functions(competence_bp)
+
+
+# Daily HubSpot marketing emails -> bronze -> silver sync (content + KPI stats).
+# Gated separately (default off) so the daily timer only runs once
+# HUBSPOT_ACCESS_TOKEN is configured — otherwise it would fail every day.
+if _env_flag("ENABLE_HUBSPOT_FUNCTIONS", False):
+    from functions.hubspot_sync import bp as hubspot_bp
+
+    app.register_functions(hubspot_bp)
+
+
+# Daily Eventbrite events -> bronze -> silver sync (all orgs, all statuses).
+# Gated separately (default off) so the daily timer only runs once
+# EVENTBRITE_PRIVATE_TOKEN is configured — otherwise it would fail every day.
+if _env_flag("ENABLE_EVENTBRITE_FUNCTIONS", False):
+    from functions.eventbrite_sync import bp as eventbrite_bp
+
+    app.register_functions(eventbrite_bp)
