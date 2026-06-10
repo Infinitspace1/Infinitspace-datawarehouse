@@ -403,6 +403,8 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
 - `silver.location_neighborhoods`
 - `silver.xero_overdue_invoice_contacts` — view joining overdue Xero invoices to Nexudus customer email data
 - `silver.bamboohr_employees` — join key: `work_email` → `silver.nexudus_coworkers.email`; carries `is_deleted`/`deleted_at` reconciled daily by `bamboohr_sync`
+- `silver.eventbrite_events` — fully flattened Eventbrite event rows; venue and ticket availability objects are scalar columns, with raw JSON retained only in `bronze.eventbrite_events.raw_json`
+- `silver.hubspot_marketing_emails` — fully flattened HubSpot marketing email rows; stats and content/widget objects are scalar columns, with raw JSON retained only in `bronze.hubspot_marketing_emails.raw_json`
 
 ### AVA
 

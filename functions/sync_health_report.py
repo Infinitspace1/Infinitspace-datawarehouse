@@ -70,6 +70,14 @@ def _expected_daily() -> frozenset[tuple[str, str, str]]:
         # "the pipeline completed" signal. The weekly competence_reconcile is
         # deliberately NOT expected daily (it only runs on Sundays).
         expected.add(("competence", "competence", "silver"))
+    if _env_flag("ENABLE_HUBSPOT_FUNCTIONS", False):
+        # hubspot_sync runs daily at 05:45; the silver step is the
+        # representative "the pipeline completed" signal.
+        expected.add(("hubspot", "marketing_emails", "silver"))
+    if _env_flag("ENABLE_EVENTBRITE_FUNCTIONS", False):
+        # eventbrite_sync runs daily at 05:50; the silver step is the
+        # representative "the pipeline completed" signal.
+        expected.add(("eventbrite", "events", "silver"))
     return frozenset(expected)
 
 

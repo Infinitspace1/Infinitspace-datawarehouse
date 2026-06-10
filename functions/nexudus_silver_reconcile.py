@@ -13,6 +13,9 @@ Entities covered here:
   - silver.nexudus_extra_services  (billing/extraservices)
   - silver.nexudus_resources       (spaces/resources)
   - silver.nexudus_coworkers       (spaces/coworkers)
+  - silver.nexudus_calendar_events (content/calendarevents)
+  - silver.nexudus_event_attendees (content/eventattendees)
+  - silver.nexudus_event_products  (content/eventproducts)
 
 Not covered here (handled elsewhere):
   - silver.nexudus_coworker_invoices       -> nexudus_invoice_reconcile (daily)
@@ -64,6 +67,10 @@ ENTITIES: tuple[EntityConfig, ...] = (
     EntityConfig("extra_services", "silver.nexudus_extra_services", "billing/extraservices",    min_ids=1),
     EntityConfig("resources",      "silver.nexudus_resources",      "spaces/resources",         min_ids=10),
     EntityConfig("coworkers",      "silver.nexudus_coworkers",      "spaces/coworkers",         min_ids=10),
+    # Events (2026-06-10) — calendar events + attendees + ticket products.
+    EntityConfig("calendar_events", "silver.nexudus_calendar_events", "content/calendarevents",  min_ids=10),
+    EntityConfig("event_attendees", "silver.nexudus_event_attendees", "content/eventattendees",  min_ids=10),
+    EntityConfig("event_products",  "silver.nexudus_event_products",  "content/eventproducts",   min_ids=5),
 )
 
 

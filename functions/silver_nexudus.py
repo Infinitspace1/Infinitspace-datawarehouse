@@ -48,6 +48,10 @@ ENTITIES = [
     # landlord dashboard's tariff → financial-account filter.
     "tariffs",
     "financial_accounts",
+    # Events (2026-06-10) — calendar events + attendees + ticket products.
+    "calendar_events",
+    "event_attendees",
+    "event_products",
 ]
 
 

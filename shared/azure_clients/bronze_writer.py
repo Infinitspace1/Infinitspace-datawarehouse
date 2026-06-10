@@ -402,6 +402,102 @@ class BronzeWriter:
         )
         return changed, written
 
+    def write_calendar_events(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_calendar_events"""
+        table = "bronze.nexudus_calendar_events"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                r.get("BusinessId"),
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written
+
+    def write_event_attendees(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_event_attendees"""
+        table = "bronze.nexudus_event_attendees"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                r.get("BusinessId"),
+                r.get("CalendarEventId"),
+                r.get("CoworkerId"),
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "calendar_event_id", "coworker_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "calendar_event_id", "coworker_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written
+
+    def write_event_products(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_event_products
+
+        EventProduct payloads carry no BusinessId — location is resolved
+        downstream via CalendarEventId -> calendar_events.BusinessId.
+        """
+        table = "bronze.nexudus_event_products"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                r.get("CalendarEventId"),
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "calendar_event_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "calendar_event_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written
+
     def write_tariffs(self, records: list[dict]) -> tuple[list[dict], int]:
         """bronze.nexudus_tariffs — Phase 2 (2026-05-28).
 

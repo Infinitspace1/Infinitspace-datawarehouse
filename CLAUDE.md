@@ -15,11 +15,13 @@ InfinitSpace Data Warehouse is a Python 3.11 Azure Functions ETL project that mo
 
 Primary sources today:
 
-- Nexudus API
+- Nexudus API (incl. events: calendar events, attendees, ticket products)
 - Xero API
 - CoStar PDF extractor (Real Estate HTTP function)
 - Google Maps enrichment utilities exist but are not part of the scheduled Function App
 - Location Scraper (HTTP-triggered Durable Functions pipeline — Idealista + Otodom)
+- HubSpot Marketing Email API (gated, `ENABLE_HUBSPOT_FUNCTIONS=1`)
+- Eventbrite API (gated, `ENABLE_EVENTBRITE_FUNCTIONS=1`)
 
 Platform:
 
@@ -59,6 +61,8 @@ Optional gated surface (not in the default deployment):
 - `Mon-Sat 04:30` `competence_sync` (Firebase `competence_new` -> bronze -> silver; **incremental** — only competitors changed since the last run, via an `updated_at` collection-group watermark)
 - `Sun 04:00` `competence_full_reconcile` (full read of `competence_new` + soft-delete reconcile; deletes can only be observed by a full pass)
 - both only when `ENABLE_COMPETENCE_FUNCTIONS=1` and a Firebase credential is set; the incremental read needs a Firestore index on `competitors.updated_at`
+- `05:45` `hubspot_sync` (marketing emails + KPI stats -> bronze -> silver + embedded soft-delete reconcile; only when `ENABLE_HUBSPOT_FUNCTIONS=1` and `HUBSPOT_ACCESS_TOKEN` is set)
+- `05:50` `eventbrite_sync` (all events, all orgs/statuses, with venue/ticket expansions -> bronze -> silver + embedded soft-delete reconcile; only when `ENABLE_EVENTBRITE_FUNCTIONS=1` and `EVENTBRITE_PRIVATE_TOKEN` is set)
 
 Important operational caveat:
 
@@ -81,11 +85,14 @@ Nexudus API
   -> bronze.nexudus_resources
   -> bronze.nexudus_extra_services
   -> bronze.nexudus_coworker_invoice_lines (per-invoice line items)
+  -> bronze.nexudus_calendar_events     (incremental via UpdatedSince watermark)
+  -> bronze.nexudus_event_attendees     (incremental via UpdatedSince watermark)
+  -> bronze.nexudus_event_products      (incremental via UpdatedSince watermark)
   -> blob snapshots (nexudus-raw-snapshots container)
 
 bronze_to_silver
   -> Azure Storage Queue: silver-sync-tasks
-  -> silver_entity_worker x 8
+  -> silver_entity_worker x 13
   -> silver.nexudus_locations
   -> silver.nexudus_location_hours
   -> silver.nexudus_products
@@ -95,6 +102,9 @@ bronze_to_silver
   -> silver.nexudus_resources
   -> silver.nexudus_extra_services
   -> silver.nexudus_coworker_invoice_lines
+  -> silver.nexudus_calendar_events     (location via BusinessId)
+  -> silver.nexudus_event_attendees     (links: event, coworker, ticket, invoice)
+  -> silver.nexudus_event_products      (location inherited from parent event)
 
 nexudus_invoice_pdf_cache (timer, 03:30 UTC)
   -> downloads PDFs from Nexudus API for recent invoices missing pdf_blob_path (last 2 days)
@@ -142,6 +152,19 @@ Firebase competence_new (optional, ENABLE_COMPETENCE_FUNCTIONS=1)
   -> bronze.competence_competitors
   -> silver.competence_lists
   -> silver.competence_competitors        (is_deleted reconciled weekly)
+
+HubSpot Marketing Email API (optional, ENABLE_HUBSPOT_FUNCTIONS=1)
+  -> hubspot_sync (timer, 05:45 UTC)      full fetch + includeStats (stats keep changing)
+  -> bronze.hubspot_marketing_emails      (latest-payload MERGE, SHA-256 hash-dedup)
+  -> silver.hubspot_marketing_emails      (subject/body/content + KPI counters & ratios;
+                                           is_deleted reconciled daily, embedded)
+
+Eventbrite API (optional, ENABLE_EVENTBRITE_FUNCTIONS=1)
+  -> eventbrite_sync (timer, 05:50 UTC)   /users/me/organizations -> per-org events
+                                          (status=all, expand=venue,ticket_availability,...)
+  -> bronze.eventbrite_events             (latest-payload MERGE, SHA-256 hash-dedup)
+  -> silver.eventbrite_events             (schedule/venue/tickets flattened;
+                                           is_deleted reconciled daily, embedded)
 ```
 
 ---
@@ -215,6 +238,8 @@ Infinitspace-datawarehouse/
     replyio_sync.py
     sync_health_report.py
     competence_sync.py
+    hubspot_sync.py
+    eventbrite_sync.py
   shared/
     azure_clients/
       sql_client.py
@@ -231,6 +256,13 @@ Infinitspace-datawarehouse/
       silver_writer_coworker_invoices.py
       silver_writer_coworker_invoice_lines.py
       silver_writer_coworkers.py
+      silver_writer_calendar_events.py
+      silver_writer_event_attendees.py
+      silver_writer_event_products.py
+      hubspot_bronze_writer.py
+      silver_writer_hubspot.py
+      eventbrite_bronze_writer.py
+      silver_writer_eventbrite.py
     nexudus/
       auth.py
       client.py
@@ -244,11 +276,24 @@ Infinitspace-datawarehouse/
         coworker_invoices.py
         coworker_invoice_lines.py
         coworkers.py
+        calendar_events.py
+        event_attendees.py
+        event_products.py
     bamboohr/
       __init__.py
       client.py
       transformers/
         employees.py
+    hubspot/
+      __init__.py
+      client.py              (Marketing Email API v3, HUBSPOT_ACCESS_TOKEN)
+      transformers/
+        marketing_emails.py
+    eventbrite/
+      __init__.py
+      client.py              (API v3, EVENTBRITE_PRIVATE_TOKEN, continuation pagination)
+      transformers/
+        events.py
     firebase/
       __init__.py
       client.py              (get_firestore_client — firebase-admin, FIREBASE_CREDENTIALS)
@@ -308,6 +353,11 @@ Infinitspace-datawarehouse/
       backfill_xero_pdfs.py
       test_competence_sync.py
       backfill_competence_competitor_country.py   (one-off: fill silver competitor country/country_code)
+      test_events_sync.py                         (Nexudus events: dry-run / --write end-to-end)
+      inspect_nexudus_events.py                   (field-shape discovery for the event endpoints)
+      test_hubspot_sync.py                        (HubSpot: dry-run incl. stats key inventory / --write)
+      test_eventbrite_sync.py                     (Eventbrite: dry-run / --write)
+      apply_schema_script.py                      (apply a GO-batched .sql script to the warehouse DB)
     sql_scripts/
       bronze_layer.sql
       bronze_upsert_constraints.sql
@@ -328,6 +378,9 @@ Infinitspace-datawarehouse/
       xero_pdf_blob_migration.sql
       competence_schema.sql
       competence_competitor_country_migration.sql   (adds silver competitor country column)
+      nexudus_events_schema.sql                     (bronze + silver: calendar_events, event_attendees, event_products)
+      hubspot_marketing_emails_schema.sql           (bronze + silver)
+      eventbrite_events_schema.sql                  (bronze + silver)
       test.sql
   tests/
     test_ava_refresh.py
@@ -336,6 +389,9 @@ Infinitspace-datawarehouse/
     test_xero_integration.py
     test_xero_tenant_directory.py
     test_xero_nexudus_invoice_linking.py
+    test_nexudus_event_transformers.py
+    test_hubspot_transformer.py
+    test_eventbrite_transformer.py
   docs/
     deploy.md
     silver_table_relationships.md
@@ -377,6 +433,8 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `ls_*` (11 activities) | `functions/location_scraper.py` | activity | — | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — resolve / scrape / enrich / persist / log |
 | `competence_sync` | `functions/competence_sync.py` | timer | `0 30 4 * * 1-6` | only when `ENABLE_COMPETENCE_FUNCTIONS=1` — **incremental** Firebase `competence_new` -> bronze + silver (`updated_at` watermark); needs a Firebase credential + a Firestore index on `competitors.updated_at` |
 | `competence_full_reconcile` | `functions/competence_sync.py` | timer | `0 0 4 * * 0` | only when `ENABLE_COMPETENCE_FUNCTIONS=1` — weekly full read of `competence_new` + soft-delete reconcile |
+| `hubspot_sync` | `functions/hubspot_sync.py` | timer | `0 45 5 * * *` | only when `ENABLE_HUBSPOT_FUNCTIONS=1` — marketing emails (content + KPI stats) -> bronze + silver + embedded daily soft-delete reconcile; needs `HUBSPOT_ACCESS_TOKEN` |
+| `eventbrite_sync` | `functions/eventbrite_sync.py` | timer | `0 50 5 * * *` | only when `ENABLE_EVENTBRITE_FUNCTIONS=1` — all events (all orgs/statuses, venue+ticket expansions) -> bronze + silver + embedded daily soft-delete reconcile; needs `EVENTBRITE_PRIVATE_TOKEN` |
 
 ---
 
@@ -406,6 +464,11 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - `bronze.replyio_sequence_step_performance`
 - `bronze.competence_lists` — Firebase `competence_new` parent list docs (string `source_id` = Firestore doc id)
 - `bronze.competence_competitors` — Firebase `competence_new` competitor docs (string `source_id` = `{list_id}::{competitor_doc_id}`)
+- `bronze.nexudus_calendar_events` — `location_id` denorm (BusinessId)
+- `bronze.nexudus_event_attendees` — `location_id`/`calendar_event_id`/`coworker_id` denorms
+- `bronze.nexudus_event_products` — `calendar_event_id` denorm (payload has no BusinessId)
+- `bronze.hubspot_marketing_emails` — string `source_id` (HubSpot email id), latest-payload MERGE
+- `bronze.eventbrite_events` — string `source_id` (Eventbrite event id), latest-payload MERGE
 
 Nexudus bronze rows are latest-payload upserts on `source_id`, not append-only history.
 
@@ -434,6 +497,11 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
 - `silver.bamboohr_employees` — join key: `work_email` → `silver.nexudus_coworkers.email`; carries `is_deleted`/`deleted_at` reconciled daily by `bamboohr_sync`
 - `silver.competence_lists` — Firebase `competence_new` lists; carries `is_deleted`/`deleted_at` reconciled weekly by `competence_full_reconcile`
 - `silver.competence_competitors` — competitor records (title, address, city, lat/lng, website, placeId, category); `list_source_id` → `silver.competence_lists.source_id`; carries `is_deleted`/`deleted_at`. `country` (NAME) + `country_code` are filled by a cleanup step from the per-country parent list (competitor docs carry no reliable country of their own) — see [Competence country enrichment](#competence-country-enrichment)
+- `silver.nexudus_calendar_events` — `location_source_id` → locations; optional `resource_source_id` → resources; reconciled weekly
+- `silver.nexudus_event_attendees` — `calendar_event_source_id` → calendar_events; `coworker_source_id` → coworkers (NULL for external guests); `event_product_source_id` → event_products; `coworker_invoice_source_id` → coworker_invoices; `location_source_id` → locations; reconciled weekly
+- `silver.nexudus_event_products` — ticket types: `calendar_event_source_id` → calendar_events; `location_source_id` inherited from the parent event by the silver writer (payload has no BusinessId); allocation/sales counters; reconciled weekly
+- `silver.hubspot_marketing_emails` — subject, plain-text body + full `content_json`, campaign link, KPI counters (`stat_*`) and ratios (`open_rate`, `click_rate`, ...) + full `stats_json`; `is_deleted` reconciled daily inside `hubspot_sync`
+- `silver.eventbrite_events` — schedule (UTC + local + tz), status, capacity, venue (name/address/city/country/lat/lng + `venue_json`), ticket price range + availability (+ `ticket_availability_json`), organizer; `is_deleted` reconciled daily inside `eventbrite_sync`
 
 ### AVA
 
@@ -657,6 +725,11 @@ Schedule + cadence per entity:
 | `nexudus_extra_services` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
 | `nexudus_resources` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
 | `nexudus_coworkers` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `nexudus_calendar_events` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `nexudus_event_attendees` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `nexudus_event_products` | `nexudus_silver_reconcile` | weekly Sun 01:00 | ≤7d |
+| `hubspot_marketing_emails` | embedded in `hubspot_sync` | daily 05:45 | ≤24h |
+| `eventbrite_events` | embedded in `eventbrite_sync` | daily 05:50 | ≤24h |
 | `xero_invoices` | none — Xero sets `invoice_status = 'DELETED'`, existing sync picks it up | daily | ≤24h (status-based) |
 
 Invoice reconcile window: default 365 days of `due_date` (configurable via
@@ -827,6 +900,19 @@ LOCATION_SCRAPER_WAVE_SIZE=3  # monthly cities scraped per sequential wave (OOM 
 ENABLE_ETL_FUNCTIONS=1
 ENABLE_ADMIN_FUNCTIONS=0
 ENABLE_COMPETENCE_FUNCTIONS=0
+ENABLE_HUBSPOT_FUNCTIONS=0
+ENABLE_EVENTBRITE_FUNCTIONS=0
+
+# HubSpot (marketing emails sync; private app token with the `content` scope)
+HUBSPOT_ACCESS_TOKEN=...
+HUBSPOT_SYNC_SCHEDULE="0 45 5 * * *"
+HUBSPOT_RECONCILE_MIN_IDS=5
+
+# Eventbrite (private token from https://www.eventbrite.com/platform/api-keys)
+EVENTBRITE_PRIVATE_TOKEN=...
+# EVENTBRITE_ORGANIZATION_ID=...     # optional: pin one org (default: all accessible orgs)
+EVENTBRITE_SYNC_SCHEDULE="0 50 5 * * *"
+EVENTBRITE_RECONCILE_MIN_IDS=1
 
 # Firebase competence_new sync (TeamAndy competitors). Provide ONE of:
 #   FIREBASE_CREDENTIALS: service-account JSON as a string (Azure app setting; same
@@ -891,6 +977,48 @@ Firebase competence_new sync validation:
 # 5. One-off backfill of country/country_code on existing competitor rows (needs SQL only)
 .\venv\Scripts\python.exe scripts\python_scripts\backfill_competence_competitor_country.py --dry-run
 .\venv\Scripts\python.exe scripts\python_scripts\backfill_competence_competitor_country.py
+```
+
+Nexudus events validation (calendar_events / event_attendees / event_products):
+
+```powershell
+# Unit tests (no creds / no DB)
+.\venv\Scripts\python.exe -m unittest tests.test_nexudus_event_transformers
+# Field-shape discovery against the live API (needs Nexudus creds)
+.\venv\Scripts\python.exe scripts\python_scripts\inspect_nexudus_events.py
+# Dry run — fetch + transform samples, no SQL writes
+.\venv\Scripts\python.exe scripts\python_scripts\test_events_sync.py
+# Full local run — bronze -> silver (needs Nexudus creds + SQL; schema from
+# scripts/sql_scripts/nexudus_events_schema.sql — already applied to prod 2026-06-10)
+.\venv\Scripts\python.exe scripts\python_scripts\test_events_sync.py --write
+```
+
+HubSpot marketing emails validation:
+
+```powershell
+# 1. Apply schema once: scripts/sql_scripts/hubspot_marketing_emails_schema.sql
+#    (already applied to prod 2026-06-10)
+.\venv\Scripts\python.exe scripts\python_scripts\apply_schema_script.py scripts/sql_scripts/hubspot_marketing_emails_schema.sql
+# 2. Unit tests (no creds / no DB)
+.\venv\Scripts\python.exe -m unittest tests.test_hubspot_transformer
+# 3. Dry run — fetch + print stats key inventory + transformed sample (needs HUBSPOT_ACCESS_TOKEN)
+.\venv\Scripts\python.exe scripts\python_scripts\test_hubspot_sync.py
+# 4. Full local run — HubSpot -> bronze -> silver -> reconcile (needs SQL too)
+.\venv\Scripts\python.exe scripts\python_scripts\test_hubspot_sync.py --write
+```
+
+Eventbrite validation:
+
+```powershell
+# 1. Apply schema once: scripts/sql_scripts/eventbrite_events_schema.sql
+#    (already applied to prod 2026-06-10)
+.\venv\Scripts\python.exe scripts\python_scripts\apply_schema_script.py scripts/sql_scripts/eventbrite_events_schema.sql
+# 2. Unit tests (no creds / no DB)
+.\venv\Scripts\python.exe -m unittest tests.test_eventbrite_transformer
+# 3. Dry run — list orgs + fetch events + transformed sample (needs EVENTBRITE_PRIVATE_TOKEN)
+.\venv\Scripts\python.exe scripts\python_scripts\test_eventbrite_sync.py
+# 4. Full local run — Eventbrite -> bronze -> silver -> reconcile (needs SQL too)
+.\venv\Scripts\python.exe scripts\python_scripts\test_eventbrite_sync.py --write
 ```
 
 Nexudus billing validation:
@@ -1064,6 +1192,9 @@ az functionapp config appsettings set `
 | Soft-delete / source reconciliation | done | `is_deleted`/`deleted_at` on all Nexudus + BambooHR silver tables; daily `nexudus_invoice_reconcile` (invoices + cascaded lines), daily roster reconcile inside `bamboohr_sync`, weekly `nexudus_silver_reconcile` for other entities |
 | Sync health report email | done | daily 06:00 UTC via Microsoft Graph; subject `[OK]`/`[FAIL]`; green/red table per entity + record-level error summary; sends to `SYNC_REPORT_RECIPIENTS` from `GRAPH_SENDER_UPN` |
 | Location Scraper (Idealista + Otodom + IS24 + LoopNet) | done | HTTP-triggered Durable Functions pipeline; `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1`; Idealista (ES/IT) + Otodom (PL) + Immobilienscout24 (DE) + LoopNet (UK/London + US: New York, San Francisco, Palo Alto, Los Angeles, Austin, Seattle); Lusha enrichment via fan-out; free Nominatim geocode fallback when no `GOOGLE_MAPS_API_KEY`; bronze schema; see `docs/location_scraper.md` |
+| Nexudus events (calendar events + attendees + ticket products) | done | bronze + silver via the standard fanout (3 new entities in `nexudus_to_bronze` / queue worker); linking: event → location (BusinessId), attendee → event/coworker/ticket/invoice, product → event (+ location inherited from parent event); weekly soft-delete via `nexudus_silver_reconcile`; schema applied to prod + backfilled 2026-06-10 (729 events / 1,553 attendees / 205 products) |
+| HubSpot marketing emails sync | done (code) | Optional (`ENABLE_HUBSPOT_FUNCTIONS=1` + `HUBSPOT_ACCESS_TOKEN`); daily 05:45 UTC full fetch with `includeStats=true`; silver carries subject/body/content + KPI counters & ratios + raw `stats_json`; schema applied to prod 2026-06-10; waiting on a private-app token to enable |
+| Eventbrite events sync | done (code) | Optional (`ENABLE_EVENTBRITE_FUNCTIONS=1` + `EVENTBRITE_PRIVATE_TOKEN`); daily 05:50 UTC, all orgs + all statuses with venue/ticket/organizer expansions; schema applied to prod 2026-06-10; waiting on a private token to enable |
 | Firebase competence_new sync | done | Optional (`ENABLE_COMPETENCE_FUNCTIONS=1` + Firebase credential); **incremental** `competence_sync` (Mon-Sat 04:30 UTC — only competitors changed since last run via an `updated_at` collection-group watermark) + weekly `competence_full_reconcile` (Sun 04:00 UTC — full read + soft-delete). Reads Firestore `competence_new` (parent lists + `competitors` subcollection, v1 array fallback) → `bronze.competence_*` → `silver.competence_*`. Needs a Firestore index on `competitors.updated_at` (full-read fallback while it builds); reuses AI-teamandy firebase-admin logic. Competitor `country`/`country_code` are enriched from the per-country parent list in a cleanup step between bronze and silver (one-off backfill script for existing rows) |
 
 ---
@@ -1082,7 +1213,8 @@ After any material project change:
 
 ---
 
-Last updated: 2026-06-08 (Competence competitor **country enrichment** — `silver.competence_competitors` competitors carried no usable country (`last_seen_country_code` is mostly empty in Firestore), so a **cleanup step between bronze and silver** now fills both `country` (NAME, new column) and `country_code` from each competitor's **per-country parent list** (`NL_AUTO` → Netherlands / NL). New pure resolver `resolve_competitor_country()` in [shared/firebase/transformers/competence.py](shared/firebase/transformers/competence.py). **Real-data shape (confirmed against prod):** all 30 `competence_new` parent lists carry a free-text country NAME and **no** `country_code`, and their ids are random Firestore doc ids (not `NL_AUTO`) — so the country NAME is what fills the code. Code precedence = competitor's own `last_seen_country_code` → parent list `country_code` → **list country name mapped to ISO2** (name→ISO2 alias map, the path that actually fires) → ISO2 from a `XX_AUTO` list-id prefix. Name precedence = parent list `country` name (authoritative) → canonical ISO name; `UK`→`GB`, and names are canonicalised ("USA" + "United States" → "United States" / `US`). `transform_competitor` gained optional `list_country_name`/`list_country_code` params; [shared/azure_clients/silver_writer_competence.py](shared/azure_clients/silver_writer_competence.py) `_sync_competitors` builds a `{list_source_id → (country, country_code)}` map from `silver.competence_lists` (synced first in the same run, so complete) and passes each parent's country in, and the competitor MERGE/`_competitor_params` now write `country` (44 placeholders, parity-checked). **Schema**: new `country NVARCHAR(200) NULL` column + index on `silver.competence_competitors` — source-of-truth `scripts/sql_scripts/competence_schema.sql` updated + idempotent migration `scripts/sql_scripts/competence_competitor_country_migration.sql` for existing DBs. **One-off backfill**: `scripts/python_scripts/backfill_competence_competitor_country.py` (`--dry-run`/`--all`/`--limit`) reuses the same resolver so backfilled rows match the sync exactly; uses the existing silver `country_code` as the competitor's "own" code, skips already-correct rows (idempotent). Only watermark-changed rows are re-enriched by the nightly sync, hence the backfill for history. Tests: `tests/test_competence_transformer.py` +8 (18 pass) covering inherit-from-list, own-code-wins, list-name-when-codes-agree, prefix fallback, name→ISO2, USA canonicalisation, UK→GB, unresolvable→NULL; modules import clean. **Applied to prod 2026-06-08:** migration run (added `country` column + index) and backfill executed — all 15,319 active competitor rows now carry `country` + `country_code`, 0 unresolved (NL 3689, US 3354, GB 2592, DE 1999, FR 1829, CA 549, ES 534, PL 350, PT 220, FI 203). Still TODO: deploy code = push to `main` (GitHub Actions) so the nightly sync keeps new/changed rows enriched. No Firestore/index change; competence stays gated behind `ENABLE_COMPETENCE_FUNCTIONS`.)
+Last updated: 2026-06-10 (Three new sources: **Nexudus events + HubSpot marketing emails + Eventbrite events**, all bronze + silver. **(1) Nexudus events** — 3 new entities through the standard pipeline: `nexudus_to_bronze` gained `_sync_calendar_events` / `_sync_event_attendees` / `_sync_event_products` (GET `/content/calendarevents|eventattendees|eventproducts`, `UpdatedSince` watermark + SHA-256 hash-dedup like the other paginated entities), 3 new `BronzeWriter.write_*` methods, 3 pure transformers ([shared/nexudus/transformers/calendar_events.py](shared/nexudus/transformers/calendar_events.py), `event_attendees.py`, `event_products.py` — field mappings verified against live payloads via `scripts/python_scripts/inspect_nexudus_events.py`), 3 silver writers, and the queue fanout (`silver_nexudus.ENTITIES`, `silver_worker._ENTITY_MAP`) is now **13 entities**. **Linking**: `calendar_events.location_source_id` = BusinessId → locations (+ optional `resource_source_id`); `event_attendees` links event/coworker (NULL for external guests)/ticket (`event_product_source_id`)/invoice (`coworker_invoice_source_id`); `event_products` (= ticket types, with allocation/sales) link their event, and — because the EventProduct payload carries **no BusinessId** — the silver writer resolves `location_source_id` from the latest bronze calendar events (`{event_id → location_id}` map; bronze always completes before the silver fanout). All 3 added to the weekly `nexudus_silver_reconcile` (soft-delete, `content/*` endpoints). DDL `scripts/sql_scripts/nexudus_events_schema.sql` **applied to prod + fully backfilled 2026-06-10** via `scripts/python_scripts/test_events_sync.py --write`: 729 events / 1,553 attendees / 205 products, 0 errors; 100% attendee+product→event joins, 205/205 products got a location, 721/729 events join silver locations. **(2) HubSpot marketing emails** — new gated surface (`ENABLE_HUBSPOT_FUNCTIONS=1` + `HUBSPOT_ACCESS_TOKEN` private-app token with `content` scope, **not yet created**): `functions/hubspot_sync.py` (timer 05:45 UTC) mirrors the self-contained `bamboohr_sync` pattern — full fetch of `GET /marketing/v3/emails?includeStats=true` (full by design: stats keep changing; bronze hash-dedup keeps it cheap) → `bronze.hubspot_marketing_emails` (string source_id, latest-payload MERGE) → `silver.hubspot_marketing_emails` (name/subject/state/type, campaign link, from/reply-to, `body_plain_text` + full `content_json` + `web_version_url`, 13 KPI counters `stat_*` + 8 ratios `open_rate` etc. **+ raw `stats_json`** so an upstream stats-key rename can never lose data; counters/ratios are read case-insensitively with fallbacks) → embedded daily soft-delete reconcile (floor `HUBSPOT_RECONCILE_MIN_IDS=5`). The `--dry-run` of `scripts/python_scripts/test_hubspot_sync.py` prints the live stats key inventory to verify the mapping once a token exists. **(3) Eventbrite events** — new gated surface (`ENABLE_EVENTBRITE_FUNCTIONS=1` + `EVENTBRITE_PRIVATE_TOKEN`, **not yet created** — copy the private token from eventbrite.com/platform/api-keys, no OAuth flow needed; optional `EVENTBRITE_ORGANIZATION_ID` pin): `functions/eventbrite_sync.py` (timer 05:50 UTC) resolves orgs via `/users/me/organizations/` then pulls **all** events per org (`status=all`, `expand=venue,ticket_availability,organizer,format,category`, continuation pagination) → `bronze.eventbrite_events` → `silver.eventbrite_events` (UTC+local schedule, status, capacity, flattened venue incl. lat/lng + `venue_json`, ticket price range/sold-out/waitlist + `ticket_availability_json`, organizer, logo) → embedded daily reconcile (floor `EVENTBRITE_RECONCILE_MIN_IDS=1`). Both new sources registered in `function_app.py` behind their flags (default off, like competence) and added to `sync_health_report._expected_daily()` **only when enabled**. HubSpot/Eventbrite schemas **applied to prod 2026-06-10** (tables exist, empty until tokens are set). New helper `scripts/python_scripts/apply_schema_script.py` (runs GO-batched .sql against the warehouse). Tests: `tests/test_nexudus_event_transformers.py` (+11), `tests/test_hubspot_transformer.py` (+9), `tests/test_eventbrite_transformer.py` (+8) — 28 new tests pass, full suite 91 pass (4 pre-existing local-venv import errors in location-scraper tests: `pytest`/`apify_client` not installed locally). MERGE placeholder parity machine-checked for all 5 new silver writers. No new pip deps. **To activate**: deploy = push to `main` (GitHub Actions) — Nexudus events then flow nightly with zero config; for HubSpot/Eventbrite set the token + `ENABLE_*_FUNCTIONS=1` app settings on `func-infinitspace-etl`.)
+Previous: 2026-06-08 (Competence competitor **country enrichment** — `silver.competence_competitors` competitors carried no usable country (`last_seen_country_code` is mostly empty in Firestore), so a **cleanup step between bronze and silver** now fills both `country` (NAME, new column) and `country_code` from each competitor's **per-country parent list** (`NL_AUTO` → Netherlands / NL). New pure resolver `resolve_competitor_country()` in [shared/firebase/transformers/competence.py](shared/firebase/transformers/competence.py). **Real-data shape (confirmed against prod):** all 30 `competence_new` parent lists carry a free-text country NAME and **no** `country_code`, and their ids are random Firestore doc ids (not `NL_AUTO`) — so the country NAME is what fills the code. Code precedence = competitor's own `last_seen_country_code` → parent list `country_code` → **list country name mapped to ISO2** (name→ISO2 alias map, the path that actually fires) → ISO2 from a `XX_AUTO` list-id prefix. Name precedence = parent list `country` name (authoritative) → canonical ISO name; `UK`→`GB`, and names are canonicalised ("USA" + "United States" → "United States" / `US`). `transform_competitor` gained optional `list_country_name`/`list_country_code` params; [shared/azure_clients/silver_writer_competence.py](shared/azure_clients/silver_writer_competence.py) `_sync_competitors` builds a `{list_source_id → (country, country_code)}` map from `silver.competence_lists` (synced first in the same run, so complete) and passes each parent's country in, and the competitor MERGE/`_competitor_params` now write `country` (44 placeholders, parity-checked). **Schema**: new `country NVARCHAR(200) NULL` column + index on `silver.competence_competitors` — source-of-truth `scripts/sql_scripts/competence_schema.sql` updated + idempotent migration `scripts/sql_scripts/competence_competitor_country_migration.sql` for existing DBs. **One-off backfill**: `scripts/python_scripts/backfill_competence_competitor_country.py` (`--dry-run`/`--all`/`--limit`) reuses the same resolver so backfilled rows match the sync exactly; uses the existing silver `country_code` as the competitor's "own" code, skips already-correct rows (idempotent). Only watermark-changed rows are re-enriched by the nightly sync, hence the backfill for history. Tests: `tests/test_competence_transformer.py` +8 (18 pass) covering inherit-from-list, own-code-wins, list-name-when-codes-agree, prefix fallback, name→ISO2, USA canonicalisation, UK→GB, unresolvable→NULL; modules import clean. **Applied to prod 2026-06-08:** migration run (added `country` column + index) and backfill executed — all 15,319 active competitor rows now carry `country` + `country_code`, 0 unresolved (NL 3689, US 3354, GB 2592, DE 1999, FR 1829, CA 549, ES 534, PL 350, PT 220, FI 203). Still TODO: deploy code = push to `main` (GitHub Actions) so the nightly sync keeps new/changed rows enriched. No Firestore/index change; competence stays gated behind `ENABLE_COMPETENCE_FUNCTIONS`.)
 Previous: 2026-06-08 (Firebase `competence_new` sync — **new daily Firestore → bronze → silver pipeline for TeamAndy competitor data, gated behind `ENABLE_COMPETENCE_FUNCTIONS` (default off) + `FIREBASE_CREDENTIALS`**. New `functions/competence_sync.py` (two timers: **incremental** Mon-Sat 04:30 UTC + **weekly full reconcile** Sun 04:00 UTC) mirrors the self-contained `bamboohr_sync` pattern: reads Firestore collection `competence_new` (per-country parent lists + their `competitors` subcollection, with a legacy in-doc `competitors` array fallback) via new `shared/firebase/client.py` (firebase-admin; credentials from the `FIREBASE_CREDENTIALS` env var parsed as service-account JSON, or `FIREBASE_SERVICE_ACCOUNT_KEY_FILE` (a local path or a Google Drive download URL, fetched in-memory) — the same connection logic the AI-teamandy services use) and `shared/firebase/competence.py` (reader; the competitor bronze key is the composite `{list_id}::{competitor_doc_id}` so the same placeId appearing under multiple lists stays distinct). Writes `bronze.competence_lists` + `bronze.competence_competitors` (string `source_id`, latest-payload MERGE with SHA-256 hash-dedup — `shared/azure_clients/competence_bronze_writer.py`), then `silver.competence_lists` + `silver.competence_competitors` (pure transformers in `shared/firebase/transformers/competence.py`; writer `shared/azure_clients/silver_writer_competence.py` reuses `load_latest_bronze_rows`), then (weekly only, in `competence_full_reconcile`) a full-read soft-delete reconcile (`is_deleted`/`deleted_at`, `COMPETENCE_RECONCILE_MIN_IDS` safety floor). The daily `competence_sync` is **incremental** — it reads only competitors whose `updated_at` advanced since the last run via a Firestore collection-group watermark (needs a one-time COLLECTION_GROUP index on `competitors.updated_at`; falls back to a full read while the index builds), so it never re-imports all 15k; bronze SHA-256 hash-dedup + the silver watermark mean only new/changed rows are written either way. Each step tracked in `meta.sync_runs` under source_name `competence`. SQL DDL: `scripts/sql_scripts/competence_schema.sql` (run once; NVARCHAR(450) string keys). New dep `firebase-admin>=6.5.0,<7` (resolved to 6.9.0). Validation: `scripts/python_scripts/test_competence_sync.py` (`--dry-run`/`--write`) + `tests/test_competence_transformer.py` (10 tests pass; module imports + blueprint registration verified). Gated separately (not in the default ETL deployment) so the daily timer only runs once creds exist. `sync_health_report` now includes competence in its expected-daily check (`("competence","competence","silver")`) **only when `ENABLE_COMPETENCE_FUNCTIONS=1`**, so a disabled feature is never flagged "never started"; the weekly `competence_reconcile` is deliberately excluded from the daily check. NB deploy = push to `main` (GitHub Actions), then set `FIREBASE_CREDENTIALS` + `ENABLE_COMPETENCE_FUNCTIONS=1` on `func-infinitspace-etl`.)
 Previous: 2026-06-03 (Location Scraper — **`host.json` activity concurrency lowered 10 → 2 to stop worker OOM (`python exited with code 137`)**. Even with sequential waves of 3, `maxConcurrentActivityFunctions=10` let up to ~6 memory-heavy activities (`ls_fetch_dataset`/`ls_persist_raw` load the full Apify payload set) run at once → the Python worker was SIGKILL'd for OOM (German IS24 cities + austin failed with a *NULL* `error_message`: a hard OOM kill dies before it can log). `maxConcurrentActivityFunctions` is now **2**, so at most 2 big datasets are in memory at any time, regardless of wave composition. `maxConcurrentOrchestratorFunctions` stays 5 (orchestrators are lightweight; memory lives in activities). Trade-off: the monthly batch runs more serially (fine — it is a once-a-month job). If a *single* huge city still OOMs alone, the next lever is capping its items (`LOCATION_SCRAPER_MAX_ITEMS`) or bumping the plan instance size. NB deploy = push to `main` (GitHub Actions).)
 Previous: 2026-06-03 (Location Scraper — **monthly run now batched into sequential waves of 3 cities (fixes worker OOM / exit 137) + SQL-based retry of only failed cities** [+ follow-up fix: a re-trigger now terminates a hung parent instead of skipping it]. Problem: the monthly timer fanned out all 18 cities at once; with `host.json` `maxConcurrentActivityFunctions=10`, several memory-heavy Apify datasets (`ls_fetch_dataset`/`ls_persist_raw` load the full payload set — e.g. madrid 633 buildings) loaded simultaneously and the Python worker was SIGKILL'd for OOM (`python exited with code 137`). Solution in [functions/location_scraper.py](functions/location_scraper.py): the timer no longer starts 18 orchestrations directly — it starts **one parent orchestrator** `location_scraper_monthly_orch` (instance_id `location-scraper-monthly-{YYYY-MM}`, one per month). The parent processes cities in **sequential waves** of `_wave_size()` (default 3, env `LOCATION_SCRAPER_WAVE_SIZE`): each wave fans out its cities as **sub-orchestrations** (`call_sub_orchestrator("location_scraper_orch", …)`, no explicit child instance_id → Durable auto-assigns; the month-scoped `run_id` drives SQL/gold de-dup) and `task_all` waits before the next wave — so at most `wave_size` datasets are in memory at once. A wave failure is caught (try/except around `task_all`) and logged (`is_replaying`-guarded), so one failed city doesn't block later waves. **Retry semantics**: new activity `ls_cities_needing_run` queries `bronze.n8n_location_scraper_logs` (new helper `log_run.completed_run_ids`) and the parent **skips cities already `completed` this month**, so a re-trigger only retries failed/missing cities (no wasted Apify credits). New activity `ls_init_run_log` writes the per-city RUNNING row from inside the parent (orchestrators can't do I/O directly). **Parent-level lock** (replaces the per-city lock from the previous entry): a (re-)trigger always supersedes the current parent — a `running`/`pending`/`suspended` parent is **terminated** (`client.terminate`) then purged, a `completed`/`failed` parent is purged, and a fresh parent is started; SQL idempotency handles the rest, so a manual portal **Test/Run** always re-runs (retrying only failed cities). NB: the earlier "skip if running" variant deadlocked — a hung parent silently blocked every Test/Run (`Monthly location scraper parent already in progress; skipping`); terminating fixes that. Also: `log_run._UPDATE_LOG` and `_UPSERT_RUNNING_LOG` now clear `error_message` on success/re-run, so `completed` rows no longer carry a stale error (previously a city that failed then succeeded on retry showed `completed` with the old error text). No schema change (uses existing `error_message` column). Tests: 40 pass (resolve/loopnet/IS24/run_quality); module imports clean. NB still needs `func azure functionapp publish func-infinitspace-etl --python` — i.e. merge to `main` (GitHub Actions `main_func-infinitspace-etl.yml` deploys on push to `main`). Per-city `POST /api/scrape` path unchanged.)
