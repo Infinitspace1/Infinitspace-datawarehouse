@@ -106,9 +106,17 @@ def _num(val: Any) -> Optional[float]:
 class LoopnetAdapter:
     actor_id: str = LOOPNET_ACTOR_ID
 
-    def build_input(self, start_url: str, max_items: int | None | str = "default") -> dict:
+    def build_input(
+        self,
+        start_url: str | list[str],
+        max_items: int | None | str = "default",
+    ) -> dict:
+        # A list means individual listing-detail URLs (enumerated from the
+        # filtered search pages) — the actor scrapes exactly those listings.
+        # A single URL is the legacy broad search (geocoded, capped at 500).
+        urls = start_url if isinstance(start_url, list) else [start_url]
         payload = {
-            "startUrls": [{"url": start_url}],
+            "startUrls": [{"url": u} for u in urls],
             "includeListingDetails": True,
             "maxConcurrency": 20,
             "minConcurrency": 1,

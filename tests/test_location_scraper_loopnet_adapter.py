@@ -51,6 +51,17 @@ def test_build_input_unlimited_omits_max_items():
     assert "maxItems" not in LoopnetAdapter().build_input("https://x", max_items=None)
 
 
+def test_build_input_listing_url_list():
+    """Enumerated listing-detail URLs are passed through one-to-one."""
+    urls = [
+        "https://www.loopnet.co.uk/listing/10-queen-street-pl-london/34548634/",
+        "https://www.loopnet.co.uk/listing/21-southampton-row-london/34501482/",
+    ]
+    payload = LoopnetAdapter().build_input(urls, max_items=None)
+    assert payload["startUrls"] == [{"url": u} for u in urls]
+    assert "maxItems" not in payload
+
+
 def test_sf_to_m2_conversion():
     # 29,270 SF -> ~2719 m²
     assert round(available_surface_m2_from_payload({"header": {"subtext": "29,270 SF of Office Space Available"}})) == 2719

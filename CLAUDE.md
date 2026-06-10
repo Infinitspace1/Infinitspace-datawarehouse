@@ -1,4 +1,4 @@
-# CLAUDE.md -- InfinitSpace Data Warehouse
+﻿# CLAUDE.md -- InfinitSpace Data Warehouse
 
 > Self-updating protocol: any agent that changes this project must update this file before finishing.
 
@@ -431,7 +431,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `refresh_invoice_worklist` | `functions/finance_invoice_worklist_refresh.py` | HTTP POST | `finance/refresh-invoice-worklist` | on-demand from finance dashboard; silver refresh (coworker_invoices → coworker_invoice_lines → coworkers) then `gold.sp_refresh_invoice_worklist`; skips user_access; auth_level=FUNCTION |
 | `location_scraper_http` | `functions/location_scraper.py` | HTTP POST | `/api/scrape` | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — Durable Functions starter; returns 202 |
 | `location_scraper_orch` | `functions/location_scraper.py` | orchestration | — | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — Durable orchestrator |
-| `ls_*` (12 activities) | `functions/location_scraper.py` | activity | — | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — resolve / scrape / enrich / persist / log; raw dataset is streamed Apify→SQL via `ls_fetch_and_persist_raw` and read back by `ls_normalize` (full payload never transits the orchestrator) |
+| `ls_*` (13 activities) | `functions/location_scraper.py` | activity | — | only when `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1` — resolve / enumerate (LoopNet) / scrape / enrich / persist / log; raw dataset is streamed Apify→SQL via `ls_fetch_and_persist_raw` and read back by `ls_normalize` (full payload never transits the orchestrator); `ls_enumerate_loopnet_urls` walks the space-available-filtered LoopNet search pages (abotapi/loopnet-scraper in URL mode, `?page=N` pagination) and the memo23 actor then scrapes those listing URLs directly |
 | `competence_sync` | `functions/competence_sync.py` | timer | `0 30 4 * * 1-6` | only when `ENABLE_COMPETENCE_FUNCTIONS=1` — **incremental** Firebase `competence_new` -> bronze + silver (`updated_at` watermark); needs a Firebase credential + a Firestore index on `competitors.updated_at` |
 | `competence_full_reconcile` | `functions/competence_sync.py` | timer | `0 0 4 * * 0` | only when `ENABLE_COMPETENCE_FUNCTIONS=1` — weekly full read of `competence_new` + soft-delete reconcile |
 | `hubspot_sync` | `functions/hubspot_sync.py` | timer | `0 45 5 * * *` | only when `ENABLE_HUBSPOT_FUNCTIONS=1` — marketing emails (content + KPI stats) -> bronze + silver + embedded daily soft-delete reconcile; needs `HUBSPOT_ACCESS_TOKEN` |
@@ -896,6 +896,7 @@ APIFY_TOKEN=...
 LUSHA_API_KEY=...
 ENABLE_LOCATION_SCRAPER_FUNCTIONS=0
 LOCATION_SCRAPER_WAVE_SIZE=3  # monthly cities scraped per sequential wave (OOM guard)
+LOOPNET_ENUM_MAX_PAGES=25     # safety ceiling on filtered LoopNet search pages fetched per city
 
 # Function registration
 ENABLE_ETL_FUNCTIONS=1
@@ -1192,7 +1193,7 @@ az functionapp config appsettings set `
 | Landlord dashboard gold views | done | 3 views in `scripts/sql_scripts/landlord_dashboard_schema.sql`: `gold.vw_landlord_current_contracts`, `gold.vw_landlord_contract_book_monthly` (±12 months), `gold.vw_landlord_pricing_summary`; cancellation_date-only semantics for forecasting; list price from product join |
 | Soft-delete / source reconciliation | done | `is_deleted`/`deleted_at` on all Nexudus + BambooHR silver tables; daily `nexudus_invoice_reconcile` (invoices + cascaded lines), daily roster reconcile inside `bamboohr_sync`, weekly `nexudus_silver_reconcile` for other entities |
 | Sync health report email | done | daily 06:00 UTC via Microsoft Graph; subject `[OK]`/`[FAIL]`; green/red table per entity + record-level error summary; sends to `SYNC_REPORT_RECIPIENTS` from `GRAPH_SENDER_UPN` |
-| Location Scraper (Idealista + Otodom + IS24 + LoopNet) | done | HTTP-triggered Durable Functions pipeline; `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1`; Idealista (ES/IT) + Otodom (PL) + Immobilienscout24 (DE) + LoopNet (UK/London + US: New York, San Francisco, Palo Alto, Los Angeles, Austin, Seattle); Lusha enrichment via fan-out; free Nominatim geocode fallback when no `GOOGLE_MAPS_API_KEY`; bronze schema; see `docs/location_scraper.md` |
+| Location Scraper (Idealista + Otodom + IS24 + LoopNet) | done | HTTP-triggered Durable Functions pipeline; `ENABLE_LOCATION_SCRAPER_FUNCTIONS=1`; Idealista (ES/IT) + Otodom (PL) + Immobilienscout24 (DE) + LoopNet (UK/London + US: New York, San Francisco, Palo Alto, Los Angeles, Austin, Seattle); LoopNet uses a 2-step full-coverage flow (enumerate filtered search via abotapi → memo23 per listing URL, ~383 London buildings vs 42 with the old capped broad search); Lusha enrichment via fan-out; free Nominatim geocode fallback when no `GOOGLE_MAPS_API_KEY`; bronze schema; see `docs/location_scraper.md` |
 | Nexudus events (calendar events + attendees + ticket products) | done | bronze + silver via the standard fanout (3 new entities in `nexudus_to_bronze` / queue worker); linking: event → location (BusinessId), attendee → event/coworker/ticket/invoice, product → event (+ location inherited from parent event); weekly soft-delete via `nexudus_silver_reconcile`; schema applied to prod + backfilled 2026-06-10 (729 events / 1,553 attendees / 205 products) |
 | HubSpot marketing emails sync | done (code) | Optional (`ENABLE_HUBSPOT_FUNCTIONS=1` + `HUBSPOT_ACCESS_TOKEN`); daily 05:45 UTC full fetch with `includeStats=true`; silver carries subject/body/content + KPI counters & ratios + raw `stats_json`; schema applied to prod 2026-06-10; waiting on a private-app token to enable |
 | Eventbrite events sync | done (code) | Optional (`ENABLE_EVENTBRITE_FUNCTIONS=1` + `EVENTBRITE_PRIVATE_TOKEN`); daily 05:50 UTC, all orgs + all statuses with venue/ticket/organizer expansions; schema applied to prod 2026-06-10; waiting on a private token to enable |
