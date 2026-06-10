@@ -51,10 +51,15 @@ def start_apify_run(config: dict) -> dict:
     """
     src = SourceConfig.from_dict(config)
     adapter = ADAPTER_REGISTRY[src.actor]
-    actor_input = adapter.build_input(
-        src.start_url,
-        max_items=None if src.unlimited_items else "default",
-    )
+    if src.listing_urls:
+        # Enumerated listing-detail URLs (LoopNet): scrape exactly these —
+        # the enumeration already bounded the volume, so never cap items.
+        actor_input = adapter.build_input(src.listing_urls, max_items=None)
+    else:
+        actor_input = adapter.build_input(
+            src.start_url,
+            max_items=None if src.unlimited_items else "default",
+        )
     result = apify_client.start_run(src.actor_id, actor_input)
     result["actor"] = src.actor
     return result

@@ -217,6 +217,10 @@ class SourceConfig:
     actor_id: str
     run_id: str
     unlimited_items: bool = False
+    # LoopNet only: individual listing-detail URLs enumerated from the
+    # filtered search pages. When set, the actor scrapes exactly these
+    # listings instead of running its own (capped) broad search.
+    listing_urls: list[str] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -228,6 +232,7 @@ class SourceConfig:
             "actor_id": self.actor_id,
             "run_id": self.run_id,
             "unlimited_items": self.unlimited_items,
+            "listing_urls": self.listing_urls,
         }
 
     @staticmethod

@@ -78,9 +78,13 @@ class TestResolveSource:
         assert cfg.country_code == "gb"
         assert cfg.actor == "loopnet"
         assert cfg.actor_id == LOOPNET_ACTOR_ID
+        # UK lives on loopnet.co.uk; min-space-size filters on AVAILABLE space
+        # so the search only contains qualifying buildings (~383 for London
+        # instead of a 500-capped window with 42).
         assert cfg.start_url == (
-            "https://www.loopnet.com/search/office-properties/"
+            "https://www.loopnet.co.uk/search/office-space/"
             "london-england--united-kingdom/for-rent/"
+            "?min-space-size=16146"
         )
 
     def test_london_ignores_shape(self):
@@ -98,6 +102,7 @@ class TestResolveSource:
         assert cfg.actor_id == LOOPNET_ACTOR_ID
         assert cfg.start_url == (
             "https://www.loopnet.com/search/office-space/new-york-ny/for-lease/"
+            "?min-space-size=16146"
         )
 
     def test_san_francisco_loopnet_us(self):
@@ -105,6 +110,7 @@ class TestResolveSource:
         assert cfg.country == "us"
         assert cfg.start_url == (
             "https://www.loopnet.com/search/office-space/san-francisco-ca/for-lease/"
+            "?min-space-size=16146"
         )
 
     def test_us_cities_all_resolve(self):
@@ -122,6 +128,7 @@ class TestResolveSource:
             assert cfg.country == "us"
             assert cfg.start_url == (
                 f"https://www.loopnet.com/search/office-space/{slug}/for-lease/"
+                "?min-space-size=16146"
             )
 
     def test_us_loopnet_ignores_shape(self):
@@ -152,3 +159,19 @@ class TestResolveSource:
         assert restored.actor_id == cfg.actor_id
         assert restored.start_url == cfg.start_url
         assert restored.unlimited_items is True
+        assert restored.listing_urls is None
+
+    def test_listing_urls_roundtrip(self):
+        from shared.location_scraper.models import SourceConfig
+        cfg = resolve_source("london", None, "run-uk-2")
+        cfg.listing_urls = ["https://www.loopnet.co.uk/listing/x-london/123/"]
+        restored = SourceConfig.from_dict(cfg.to_dict())
+        assert restored.listing_urls == cfg.listing_urls
+
+    def test_legacy_config_dict_without_listing_urls(self):
+        """Queue messages serialized before the listing_urls field must load."""
+        from shared.location_scraper.models import SourceConfig
+        d = resolve_source("london", None, "x").to_dict()
+        d.pop("listing_urls")
+        restored = SourceConfig.from_dict(d)
+        assert restored.listing_urls is None

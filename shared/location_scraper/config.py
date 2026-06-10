@@ -16,7 +16,17 @@ IMMOBILIENSCOUT_ACTOR_ID = "ciTdHfgOkkwfEzTE9"
 # memo23 pay-per-event LoopNet actor (US + UK). The $31/mo flat-rate twin
 # (RuOxoBM1bnc5pQ3TJ) is deliberately NOT used.
 LOOPNET_ACTOR_ID = "0ZCQONxB3BdyOzrbD"
+# Enumeration actor for the filtered LoopNet search pages. memo23 ignores URL
+# filters entirely, plain HTTP and Apify's generic browser scrapers are
+# Akamai-challenge-blocked; abotapi passes Akamai and preserves URL query
+# params (pagination is driven via `?page=N` — its page-PATH handling is
+# broken). Used in URL mode, fetchDetails off — memo23 does the detail work.
+LOOPNET_ENUM_ACTOR_ID = "abotapi/loopnet-scraper"
 GOOGLE_SEARCH_ACTOR_ID = "nFJndFXA5zjCTuudP"
+
+# LoopNet available-space URL filter, in square feet (= the 1500 m² floor the
+# adapter enforces; 1500 / 0.092903 ≈ 16146).
+MIN_SPACE_SIZE_SQFT = 16146
 
 COUNTRY_CONFIG: dict[str, dict] = {
     "spain": {
@@ -79,18 +89,22 @@ COUNTRY_CONFIG: dict[str, dict] = {
         },
     },
     "uk": {
-        "domain": "https://www.loopnet.com",
+        # LoopNet UK moved to its own domain — the old
+        # `www.loopnet.com/search/office-properties/...` UK route now 404s.
+        "domain": "https://www.loopnet.co.uk",
         "language": "en",
-        "property_path": "office-properties",
+        "property_path": "office-space",
         "filter_suffix": "for-rent",
         "actor": "loopnet",
         "actor_id": LOOPNET_ACTOR_ID,
         "country_code": "gb",
-        # LoopNet UK office listings. City slug MUST include the region +
-        # `--united-kingdom`, e.g. `london-england--united-kingdom`, otherwise
-        # the actor's geocoder cannot resolve the search area.
-        # The >=1500 m² floor is enforced in the adapter (LoopNet's URL size
-        # filter is unreliable: it filters total building size, not available area).
+        # `min-space-size` (sq ft) filters on AVAILABLE space server-side.
+        # Without it the SRP is capped at ~500 results dominated by small
+        # spaces, and most >=1500 m² buildings are invisible (London: 42 of
+        # 383). 16146 sq ft = the 1500 m² floor enforced in the adapter.
+        "min_space_size_sqft": MIN_SPACE_SIZE_SQFT,
+        # City slug MUST include the region + `--united-kingdom`, e.g.
+        # `london-england--united-kingdom`.
         "cities": {
             "london": "london-england--united-kingdom",
         },
@@ -98,18 +112,17 @@ COUNTRY_CONFIG: dict[str, dict] = {
     "us": {
         "domain": "https://www.loopnet.com",
         "language": "en",
-        # US LoopNet uses a different property path + listing-type than UK:
-        # `/search/office-space/{city}-{state}/for-lease/` (UK is
-        # `office-properties/.../for-rent`). Same actor, same domain.
+        # US LoopNet uses `for-lease` where UK uses `for-rent`. Same actor.
         "property_path": "office-space",
         "filter_suffix": "for-lease",
         "actor": "loopnet",
         "actor_id": LOOPNET_ACTOR_ID,
         "country_code": "us",
+        # Same available-space URL filter as UK (verified on loopnet.com:
+        # New York unfiltered is capped while ?min-space-size=16146 -> 455).
+        "min_space_size_sqft": MIN_SPACE_SIZE_SQFT,
         # LoopNet US office listings. City slug is `{city}-{state-abbrev}`,
-        # e.g. `new-york-ny` — the actor geocodes the search area from the URL.
-        # The >=1500 m² floor is enforced in the adapter (LoopNet's URL size
-        # filter is unreliable: it filters total building size, not available area).
+        # e.g. `new-york-ny`.
         "cities": {
             "new york": "new-york-ny",
             "san francisco": "san-francisco-ca",

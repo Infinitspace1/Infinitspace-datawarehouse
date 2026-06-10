@@ -42,6 +42,7 @@ import azure.durable_functions as df
 import azure.functions as func
 
 from shared.location_scraper.activities import enrich as enrich_act
+from shared.location_scraper.activities import enumerate_loopnet as enumerate_loopnet_act
 from shared.location_scraper.activities import log_run as log_act
 from shared.location_scraper.activities import materialize_globe as materialize_act
 from shared.location_scraper.activities import persist as persist_act
@@ -372,6 +373,26 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             },
         )
 
+        # 1b. LoopNet only: enumerate the listing URLs from the space-
+        # available-filtered search pages. The memo23 actor's own broad search
+        # is hard-capped at 500 items/bounding-box and ignores every filter,
+        # which hid ~90% of qualifying buildings in dense markets (London:
+        # 42 of 383). Scraping the enumerated listing URLs instead gives full
+        # coverage while keeping the same payload format (incl. brokerEmail).
+        if source_config.get("actor") == "loopnet":
+            enum_result: dict = yield context.call_activity(
+                "ls_enumerate_loopnet_urls", source_config
+            )
+            listing_urls = (enum_result or {}).get("listing_urls") or []
+            if listing_urls:
+                source_config["listing_urls"] = listing_urls
+            elif not context.is_replaying:
+                logger.warning(
+                    "LoopNet enumeration returned no URLs for city=%s — "
+                    "falling back to the capped broad search",
+                    city,
+                )
+
         # 2. Start Apify actor (async — do NOT block on completion)
         run_info: dict = yield context.call_activity("ls_start_apify_run", source_config)
 
@@ -520,6 +541,12 @@ def ls_resolve_source(payload: dict) -> dict:
         unlimited_items=bool(payload.get("unlimited_items")),
     )
     return cfg.to_dict()
+
+
+@bp.activity_trigger(input_name="config")
+def ls_enumerate_loopnet_urls(config: dict) -> dict:
+    urls = enumerate_loopnet_act.enumerate_listing_urls(config["start_url"])
+    return {"listing_urls": urls, "count": len(urls)}
 
 
 @bp.activity_trigger(input_name="config")

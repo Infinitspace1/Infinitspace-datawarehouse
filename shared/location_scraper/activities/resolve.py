@@ -34,8 +34,14 @@ def resolve_source(
         filter_suffix = cfg["filter_suffix"]
 
         if actor == "loopnet":
-            # LoopNet UK: /search/office-properties/{city}-england--united-kingdom/for-rent/
+            # LoopNet: /search/office-space/{city_slug}/{for-rent|for-lease}/
+            # `min-space-size` (sq ft) filters on AVAILABLE space server-side —
+            # without it the search is capped at ~500 results dominated by
+            # small spaces and most qualifying buildings are invisible.
             start_url = f"{domain}/search/{property_path}/{city_slug}/{filter_suffix}/"
+            min_space = cfg.get("min_space_size_sqft")
+            if min_space:
+                start_url += f"?min-space-size={min_space}"
         elif actor == "otodom":
             # Otodom does not support polygon search via URL.
             start_url = f"{domain}/{language}/{property_path}/{city_slug}?{filter_suffix}"
