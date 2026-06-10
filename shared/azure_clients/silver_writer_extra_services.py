@@ -10,6 +10,7 @@ import uuid
 
 from shared.azure_clients.sql_client import get_sql_client
 from shared.azure_clients.silver_sync import load_latest_bronze_rows
+from shared.nexudus.exclusions import is_excluded_location_source_id
 from shared.nexudus.transformers.extra_services import transform_extra_service
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,8 @@ class SilverExtraServicesWriter:
             raw = json.loads(row["raw_json"])
             try:
                 es = transform_extra_service(raw, row["id"], self.sync_run_id)
+                if is_excluded_location_source_id(es["location_source_id"]):
+                    continue
                 params_list.append(self._make_params(es))
             except Exception as e:
                 logger.warning(f"Failed source_id={raw.get('Id')}: {e}")

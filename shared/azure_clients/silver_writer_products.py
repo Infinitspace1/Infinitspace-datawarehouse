@@ -10,6 +10,7 @@ import uuid
 
 from shared.azure_clients.sql_client import get_sql_client
 from shared.azure_clients.silver_sync import load_latest_bronze_rows
+from shared.nexudus.exclusions import is_excluded_location_source_id
 from shared.nexudus.transformers.products import transform_product
 
 logger = logging.getLogger(__name__)
@@ -99,8 +100,8 @@ class SilverProductsWriter:
             raw = json.loads(row["raw_json"])
             try:
                 p = transform_product(raw, row["id"], self.sync_run_id)
-                if p["location_source_id"] in {1376491116, 1376491117}:
-                    continue    # skip beyond Global products
+                if is_excluded_location_source_id(p["location_source_id"]):
+                    continue
                 params_list.append(self._make_params(p))
             except Exception as e:
                 logger.warning(f"Failed source_id={raw.get('Id')}: {e}")

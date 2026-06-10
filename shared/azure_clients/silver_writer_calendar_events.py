@@ -10,6 +10,7 @@ import uuid
 
 from shared.azure_clients.sql_client import get_sql_client
 from shared.azure_clients.silver_sync import load_latest_bronze_rows
+from shared.nexudus.exclusions import is_excluded_location_source_id
 from shared.nexudus.transformers.calendar_events import transform_calendar_event
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,8 @@ class SilverCalendarEventsWriter:
             raw = json.loads(row["raw_json"])
             try:
                 ev = transform_calendar_event(raw, row["id"], self.sync_run_id)
+                if is_excluded_location_source_id(ev["location_source_id"]):
+                    continue
                 params_list.append(self._make_params(ev))
             except Exception as e:
                 logger.warning(f"Failed source_id={raw.get('Id')}: {e}")

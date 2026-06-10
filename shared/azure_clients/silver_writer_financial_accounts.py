@@ -13,6 +13,7 @@ import uuid
 
 from shared.azure_clients.sql_client import get_sql_client
 from shared.azure_clients.silver_sync import load_latest_bronze_rows
+from shared.nexudus.exclusions import is_excluded_location_source_id
 from shared.nexudus.transformers.financial_accounts import transform_financial_account
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,8 @@ class SilverFinancialAccountsWriter:
             raw = json.loads(row["raw_json"])
             try:
                 fa = transform_financial_account(raw, row["id"], self.sync_run_id)
+                if is_excluded_location_source_id(fa["location_source_id"]):
+                    continue
                 params_list.append(self._make_params(fa))
             except Exception as e:
                 logger.warning(f"Failed source_id={raw.get('Id')}: {e}")

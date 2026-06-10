@@ -10,6 +10,7 @@ import uuid
 
 from shared.azure_clients.sql_client import get_sql_client
 from shared.azure_clients.silver_sync import load_latest_bronze_rows
+from shared.nexudus.exclusions import is_excluded_location_source_id
 from shared.nexudus.transformers.resources import transform_resource
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ class SilverResourcesWriter:
             try:
                 r = transform_resource(raw, row["id"], self.sync_run_id)
                 if r is None:
+                    continue
+                if is_excluded_location_source_id(r["location_source_id"]):
                     continue
                 params_list.append(self._make_params(r))
             except Exception as e:

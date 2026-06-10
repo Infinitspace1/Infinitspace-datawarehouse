@@ -599,6 +599,16 @@ Downstream consumers (gold tables, views, reports) MUST filter
 `WHERE is_deleted = 0` on any silver read. `gold.sp_refresh_finance_dashboard`
 already enforces this on every silver join.
 
+Manual business exclusions:
+
+- `shared/nexudus/exclusions.py` lists Nexudus locations intentionally hidden
+  from silver even when Nexudus still returns them. Current excluded real
+  location: Kingsbourne House / London - Holborn - 229-231 High Holborn
+  (`location_source_id=1414964752`).
+- Use `scripts/python_scripts/deactivate_nexudus_location.py` for an
+  idempotent dry-run/apply soft-delete and immediate AVA/finance refresh for a
+  location exclusion.
+
 ---
 
 ## Logging and Operational Expectations

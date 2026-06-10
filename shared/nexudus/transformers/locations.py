@@ -12,11 +12,13 @@ import re
 from datetime import datetime, timezone
 from typing import Optional
 
+from shared.nexudus.exclusions import is_excluded_location_source_id
+
 
 # ── Locations to exclude from silver ─────────────────────────
 # Root business account and demo locations that exist in Nexudus
 # but are not real physical locations.
-# Add source_id (Nexudus Id) here to exclude from silver.
+# Add new source IDs in shared/nexudus/exclusions.py.
 EXCLUDED_SOURCE_IDS: set[int] = {
     1376491116,   # (beyond Global) — root business account
     1376491117,   # beyond Demo     — demo/test location
@@ -78,7 +80,7 @@ def transform_location(
     Keys match silver.nexudus_locations columns exactly.
     """
     source_id = raw.get("Id")
-    if source_id in EXCLUDED_SOURCE_IDS:
+    if is_excluded_location_source_id(source_id):
         return None
     return {
         "source_id":    raw["Id"],
@@ -123,7 +125,7 @@ def transform_location_hours(raw: dict) -> Optional[list[dict]]:
     Transform one raw location record into 7 opening-hours rows.
     Returns None if the location is excluded.
     """
-    if raw.get("Id") in EXCLUDED_SOURCE_IDS:
+    if is_excluded_location_source_id(raw.get("Id")):
         return None
 
     location_source_id = raw["Id"]

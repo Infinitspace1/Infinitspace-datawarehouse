@@ -38,6 +38,7 @@ from shared.azure_clients.run_tracker import RunTracker
 from shared.azure_clients.sql_client import get_sql_client
 from shared.nexudus.auth import get_bearer_token
 from shared.nexudus.client import NexudusClient
+from shared.nexudus.exclusions import EXCLUDED_LOCATION_SOURCE_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,11 @@ def _reconcile_invoices(active_ids: set[int], cutoff: datetime) -> tuple[int, in
             "INSERT INTO #active_ids (source_id) VALUES (?)",
             [(i,) for i in active_ids],
         )
+        cursor.execute("CREATE TABLE #excluded_location_ids (source_id BIGINT PRIMARY KEY)")
+        cursor.executemany(
+            "INSERT INTO #excluded_location_ids (source_id) VALUES (?)",
+            [(i,) for i in EXCLUDED_LOCATION_SOURCE_IDS],
+        )
 
         cursor.execute(
             """
@@ -142,7 +148,10 @@ def _reconcile_invoices(active_ids: set[int], cutoff: datetime) -> tuple[int, in
             SET is_deleted = 1, deleted_at = GETUTCDATE()
             WHERE is_deleted = 0
               AND due_date >= ?
-              AND source_id NOT IN (SELECT source_id FROM #active_ids)
+              AND (
+                    source_id NOT IN (SELECT source_id FROM #active_ids)
+                 OR location_source_id IN (SELECT source_id FROM #excluded_location_ids)
+              )
             """,
             (cutoff,),
         )
@@ -154,10 +163,15 @@ def _reconcile_invoices(active_ids: set[int], cutoff: datetime) -> tuple[int, in
             SET is_deleted = 0, deleted_at = NULL
             WHERE is_deleted = 1
               AND source_id IN (SELECT source_id FROM #active_ids)
+              AND (
+                    location_source_id IS NULL
+                 OR location_source_id NOT IN (SELECT source_id FROM #excluded_location_ids)
+              )
             """
         )
         restored = cursor.rowcount if cursor.rowcount is not None else 0
 
+        cursor.execute("DROP TABLE #excluded_location_ids")
         cursor.execute("DROP TABLE #active_ids")
 
         logger.info("Invoices: %s soft-deleted, %s restored", deleted, restored)
@@ -173,6 +187,11 @@ def _reconcile_invoice_lines() -> tuple[int, int]:
     sql = get_sql_client()
     with sql.get_connection() as conn:
         cursor = conn.cursor()
+        cursor.execute("CREATE TABLE #excluded_location_ids (source_id BIGINT PRIMARY KEY)")
+        cursor.executemany(
+            "INSERT INTO #excluded_location_ids (source_id) VALUES (?)",
+            [(i,) for i in EXCLUDED_LOCATION_SOURCE_IDS],
+        )
 
         cursor.execute(
             """
@@ -182,7 +201,10 @@ def _reconcile_invoice_lines() -> tuple[int, int]:
             INNER JOIN silver.nexudus_coworker_invoices nci
                 ON nci.source_id = ncil.invoice_source_id
             WHERE ncil.is_deleted = 0
-              AND nci.is_deleted = 1
+              AND (
+                    nci.is_deleted = 1
+                 OR ncil.location_source_id IN (SELECT source_id FROM #excluded_location_ids)
+              )
             """
         )
         deleted = cursor.rowcount if cursor.rowcount is not None else 0
@@ -196,9 +218,14 @@ def _reconcile_invoice_lines() -> tuple[int, int]:
                 ON nci.source_id = ncil.invoice_source_id
             WHERE ncil.is_deleted = 1
               AND nci.is_deleted = 0
+              AND (
+                    ncil.location_source_id IS NULL
+                 OR ncil.location_source_id NOT IN (SELECT source_id FROM #excluded_location_ids)
+              )
             """
         )
         restored = cursor.rowcount if cursor.rowcount is not None else 0
 
+        cursor.execute("DROP TABLE #excluded_location_ids")
         logger.info("Invoice lines: %s soft-deleted, %s restored", deleted, restored)
         return deleted, restored

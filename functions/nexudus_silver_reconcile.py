@@ -44,6 +44,7 @@ from shared.azure_clients.run_tracker import RunTracker
 from shared.azure_clients.sql_client import get_sql_client
 from shared.nexudus.auth import get_bearer_token
 from shared.nexudus.client import NexudusClient
+from shared.nexudus.exclusions import EXCLUDED_LOCATION_SOURCE_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -167,13 +168,43 @@ def _soft_delete_missing(
             "INSERT INTO #active_ids (source_id) VALUES (?)",
             [(i,) for i in active_ids],
         )
+        cursor.execute("CREATE TABLE #excluded_location_ids (source_id BIGINT PRIMARY KEY)")
+        cursor.executemany(
+            "INSERT INTO #excluded_location_ids (source_id) VALUES (?)",
+            [(i,) for i in EXCLUDED_LOCATION_SOURCE_IDS],
+        )
+
+        has_location_column = bool(
+            cursor.execute(
+                "SELECT COL_LENGTH(?, 'location_source_id')",
+                (silver_table,),
+            ).fetchone()[0]
+        )
+        excluded_delete_condition = (
+            "location_source_id IN (SELECT source_id FROM #excluded_location_ids)"
+            if has_location_column
+            else "source_id IN (SELECT source_id FROM #excluded_location_ids)"
+        )
+        excluded_restore_condition = (
+            """
+              AND (
+                    location_source_id IS NULL
+                 OR location_source_id NOT IN (SELECT source_id FROM #excluded_location_ids)
+              )
+            """
+            if has_location_column
+            else "AND source_id NOT IN (SELECT source_id FROM #excluded_location_ids)"
+        )
 
         cursor.execute(
             f"""
             UPDATE {silver_table}
             SET is_deleted = 1, deleted_at = GETUTCDATE()
             WHERE is_deleted = 0
-              AND source_id NOT IN (SELECT source_id FROM #active_ids)
+              AND (
+                    source_id NOT IN (SELECT source_id FROM #active_ids)
+                 OR {excluded_delete_condition}
+              )
             """
         )
         deleted = cursor.rowcount if cursor.rowcount is not None else 0
@@ -184,9 +215,11 @@ def _soft_delete_missing(
             SET is_deleted = 0, deleted_at = NULL
             WHERE is_deleted = 1
               AND source_id IN (SELECT source_id FROM #active_ids)
+              {excluded_restore_condition}
             """
         )
         restored = cursor.rowcount if cursor.rowcount is not None else 0
 
+        cursor.execute("DROP TABLE #excluded_location_ids")
         cursor.execute("DROP TABLE #active_ids")
         return deleted, restored

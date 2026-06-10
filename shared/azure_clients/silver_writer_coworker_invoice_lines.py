@@ -10,6 +10,7 @@ import uuid
 
 from shared.azure_clients.sql_client import get_sql_client
 from shared.azure_clients.silver_sync import load_latest_bronze_rows
+from shared.nexudus.exclusions import is_excluded_location_source_id
 from shared.nexudus.transformers.coworker_invoice_lines import transform_coworker_invoice_line
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,8 @@ class SilverCoworkerInvoiceLinesWriter:
             raw = json.loads(row["raw_json"])
             try:
                 line = transform_coworker_invoice_line(raw, row["id"], self.sync_run_id)
+                if is_excluded_location_source_id(line["location_source_id"]):
+                    continue
                 params_list.append(self._make_params(line))
             except Exception as exc:
                 logger.warning("Failed source_id=%s: %s", raw.get("Id"), exc)
