@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from shared.azure_clients.sql_client import get_sql_client
@@ -102,6 +103,12 @@ SELECT
     b.latitude,
     b.longitude,
     b.floor,
+    (
+        SELECT TOP 1 l.id
+        FROM bronze.n8n_location_scraper_listings l
+        WHERE l.building_id = b.id
+        ORDER BY l.last_seen_date DESC
+    ) AS latest_listing_id,
     ISNULL((
         SELECT TOP 1 l.price_monthly
         FROM bronze.n8n_location_scraper_listings l
@@ -149,6 +156,21 @@ def _floor_int(floor: Optional[str]) -> Optional[int]:
     try:
         return int(floor)
     except (ValueError, TypeError):
+        return None
+
+
+def _dec2(value) -> Optional[Decimal]:
+    """Normalize a price to DECIMAL(…,2) semantics before comparing.
+
+    SQL DECIMAL columns come back from pyodbc as Decimal while scraped prices
+    are Python floats; comparing them with != flags unchanged prices as
+    changed for any value that is not exactly representable in binary.
+    """
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value)).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
         return None
 
 
@@ -261,28 +283,46 @@ def upsert_sql(payload: dict) -> dict:
 
             else:
                 # Existing building — check if price/status changed
-                price_changed = listing.price_monthly != existing.get("price_monthly")
-                price_m2_changed = listing.price_per_m2 != existing.get("price_per_m2")
+                price_changed = _dec2(listing.price_monthly) != _dec2(existing.get("price_monthly"))
+                price_m2_changed = _dec2(listing.price_per_m2) != _dec2(existing.get("price_per_m2"))
                 status_changed = listing.status != existing.get("status")
 
-                if not (price_changed or price_m2_changed or status_changed):
-                    continue
+                target_listing_id = existing.get("latest_listing_id")
 
-                buildings_updated += 1
+                if price_changed or price_m2_changed or status_changed:
+                    buildings_updated += 1
 
-                # INSERT listing snapshot (update path — no first_time_extract)
-                cursor.execute(
-                    _INSERT_LISTING,
-                    (
-                        str(existing["id"]), run_id, listing.status,
-                        listing.surface_m2, listing.surface_display, listing.surface_unit,
-                        listing.price_monthly,
-                        listing.price_per_m2, listing.currency,
-                        listing.energy_class, listing.days_on_market,
-                        listing.first_listed_date, listing.last_updated_date,
-                        None, today,
-                    ),
-                )
+                    # INSERT listing snapshot (update path — no first_time_extract)
+                    cursor.execute(
+                        _INSERT_LISTING,
+                        (
+                            str(existing["id"]), run_id, listing.status,
+                            listing.surface_m2, listing.surface_display, listing.surface_unit,
+                            listing.price_monthly,
+                            listing.price_per_m2, listing.currency,
+                            listing.energy_class, listing.days_on_market,
+                            listing.first_listed_date, listing.last_updated_date,
+                            None, today,
+                        ),
+                    )
+                    listing_row = cursor.fetchone()
+                    if listing_row and listing_row[0]:
+                        target_listing_id = listing_row[0]
+                    # Later same-run listings on this building compare against
+                    # (and link to) the snapshot just written.
+                    existing["price_monthly"] = listing.price_monthly
+                    existing["price_per_m2"] = listing.price_per_m2
+                    existing["status"] = listing.status
+                    existing["latest_listing_id"] = target_listing_id
+
+                # Contacts must be linked on this path too, otherwise a
+                # re-scrape can never attach a broker/Lusha email to a
+                # building that already exists in SQL.
+                if target_listing_id:
+                    _upsert_scraper_contact(cursor, listing, str(target_listing_id))
+                    matching = listing.matching_name()
+                    if matching and matching in bundles:
+                        _upsert_lusha_contacts(cursor, bundles[matching], str(target_listing_id))
 
         conn.commit()
 

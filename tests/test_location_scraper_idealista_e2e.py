@@ -96,7 +96,12 @@ def mock_sql_empty():
     mock_conn.commit = MagicMock()
     mock_client.get_connection.return_value = mock_conn
 
-    with patch("shared.azure_clients.sql_client.get_sql_client", return_value=mock_client):
+    with (
+        patch("shared.azure_clients.sql_client.get_sql_client", return_value=mock_client),
+        # persist.py binds get_sql_client at import time, so patching only the
+        # source module silently misses it once persist was imported elsewhere.
+        patch("shared.location_scraper.activities.persist.get_sql_client", return_value=mock_client),
+    ):
         yield mock_client, mock_cursor
 
 
