@@ -3,8 +3,8 @@ Location Scraper — Azure Durable Functions module.
 
 Functions registered here:
   - location_scraper_http   POST /api/scrape  (HTTP starter)
-  - location_scraper_monthly  (monthly timer starter — starts the parent)
-  - location_scraper_monthly_orch (parent orchestrator — sequential waves)
+  - location_scraper_weekly  (weekly timer starter, Monday — starts the parent)
+  - location_scraper_weekly_orch (parent orchestrator — sequential waves)
   - location_scraper_orch   (Durable orchestrator — one city)
   - ls_init_run_log         (activity — RUNNING log row per city)
   - ls_cities_needing_run   (activity — skip cities already completed this month)
@@ -55,8 +55,9 @@ logger = logging.getLogger(__name__)
 
 bp = df.Blueprint()
 
-MONTHLY_SCHEDULE = os.getenv("LOCATION_SCRAPER_MONTHLY_SCHEDULE", "0 0 1 1 * *")
-MONTHLY_CITIES = (
+# Mondays at 01:00 UTC (NCRONTAB: sec min hour day month day-of-week).
+WEEKLY_SCHEDULE = os.getenv("LOCATION_SCRAPER_WEEKLY_SCHEDULE", "0 0 1 * * 1")
+SCRAPE_CITIES = (
     "barcelona",
     "madrid",
     "milan",
@@ -83,7 +84,7 @@ MONTHLY_CITIES = (
 # on the globe directly). LoopNet returns broker contact on every listing.
 LUSHA_SKIP_SOURCES = {"loopnet"}
 
-# Monthly run processes cities in sequential waves of this size so that only a
+# Weekly run processes cities in sequential waves of this size so that only a
 # handful of (memory-heavy) Apify datasets are loaded at once — prevents the
 # worker OOM (exit code 137) seen when all cities fan out simultaneously.
 # Override via LOCATION_SCRAPER_WAVE_SIZE.
@@ -183,7 +184,7 @@ async def location_scraper_http(
         "city": city,
         "shape": shape,
         "run_id": run_id,
-        # On-demand sourcing has no item cap, same as the monthly job — we want
+        # On-demand sourcing has no item cap, same as the weekly job — we want
         # every available building, not just Apify's first 100. Pass
         # "unlimited_items": false in the request body to re-enable the cap.
         "unlimited_items": bool(body.get("unlimited_items", True)),
@@ -196,26 +197,26 @@ async def location_scraper_http(
 
 
 # ---------------------------------------------------------------------------
-# Timer Trigger — monthly scrape for all supported rollout cities
+# Timer Trigger — weekly scrape (Monday) for all supported rollout cities
 # ---------------------------------------------------------------------------
 
-@bp.timer_trigger(schedule=MONTHLY_SCHEDULE, arg_name="timer", run_on_startup=False)
+@bp.timer_trigger(schedule=WEEKLY_SCHEDULE, arg_name="timer", run_on_startup=False)
 @bp.durable_client_input(client_name="client")
-async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
-    """Start the monthly parent orchestrator (one instance per month).
+async def location_scraper_weekly(timer: func.TimerRequest, client) -> None:
+    """Start the weekly parent orchestrator (one instance per ISO week).
 
-    The parent (``location_scraper_monthly_orch``) processes cities in sequential
+    The parent (``location_scraper_weekly_orch``) processes cities in sequential
     waves so only a few memory-heavy Apify datasets load at once (avoids the
     worker OOM seen with a full fan-out), and skips cities already completed this
-    month so a re-trigger only retries failed/missing ones.
+    week so a re-trigger only retries failed/missing ones.
     """
     now = datetime.now(timezone.utc)
-    month_key = now.strftime("%Y-%m")
+    period_key = now.strftime("%G-W%V")  # ISO week, e.g. 2026-W25
 
     if timer.past_due:
-        logger.warning("Monthly location scraper timer is past due")
+        logger.warning("Weekly location scraper timer is past due")
 
-    instance_id = f"location-scraper-monthly-{month_key}"
+    instance_id = f"location-scraper-weekly-{period_key}"
     existing = await client.get_status(instance_id)
     if existing:
         existing_status = str(getattr(existing, "runtime_status", ""))
@@ -225,30 +226,30 @@ async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
         # silently block every Test/Run forever (the previous "skip if running"
         # behaviour). Then purge so start_new can reuse the same instance_id.
         # SQL idempotency (ls_cities_needing_run) means the fresh parent only
-        # re-runs cities not yet completed this month, so superseding is safe.
+        # re-runs cities not yet completed this week, so superseding is safe.
         if status_name in {"running", "pending", "suspended"}:
             logger.info(
-                "Terminating in-progress monthly parent before re-run. "
+                "Terminating in-progress weekly parent before re-run. "
                 "instance_id=%s status=%s",
                 instance_id,
                 existing_status,
             )
             try:
-                await client.terminate(instance_id, "Superseded by a new monthly trigger")
+                await client.terminate(instance_id, "Superseded by a new weekly trigger")
             except Exception:
-                logger.warning("Could not terminate monthly parent %s", instance_id)
+                logger.warning("Could not terminate weekly parent %s", instance_id)
         try:
             await client.purge_instance_history(instance_id)
         except Exception:
-            logger.warning("Could not purge prior monthly parent instance %s", instance_id)
+            logger.warning("Could not purge prior weekly parent instance %s", instance_id)
 
     try:
         await client.start_new(
-            "location_scraper_monthly_orch",
+            "location_scraper_weekly_orch",
             instance_id,
             {
-                "month_key": month_key,
-                "cities": list(MONTHLY_CITIES),
+                "period_key": period_key,
+                "cities": list(SCRAPE_CITIES),
                 "wave_size": _wave_size(),
             },
         )
@@ -256,14 +257,14 @@ async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
         # Rare terminate/purge race: the old instance was not fully cleared yet.
         # The next trigger will start cleanly (it is now terminated + purged).
         logger.exception(
-            "Could not start monthly parent %s (terminate/purge race?) — re-trigger once",
+            "Could not start weekly parent %s (terminate/purge race?) — re-trigger once",
             instance_id,
         )
         return
     logger.info(
-        "Monthly location scraper parent started instance_id=%s month=%s wave_size=%d",
+        "Weekly location scraper parent started instance_id=%s week=%s wave_size=%d",
         instance_id,
-        month_key,
+        period_key,
         _wave_size(),
     )
 
@@ -273,25 +274,25 @@ async def location_scraper_monthly(timer: func.TimerRequest, client) -> None:
 # ---------------------------------------------------------------------------
 
 @bp.orchestration_trigger(context_name="context")
-def location_scraper_monthly_orch(context: df.DurableOrchestrationContext):
-    """Run the monthly cities in sequential waves of ``wave_size``.
+def location_scraper_weekly_orch(context: df.DurableOrchestrationContext):
+    """Run the weekly cities in sequential waves of ``wave_size``.
 
     Each wave fans out its cities concurrently (via sub-orchestrations) and the
     next wave only starts once the current one finishes — so at most ``wave_size``
     Apify datasets are in memory at any time. A city failure is isolated to its
     wave (caught, logged) and does not block later waves; it stays non-completed
-    in SQL so the next monthly run retries it.
+    in SQL so the next weekly run retries it.
     """
     payload: dict = context.get_input() or {}
-    month_key: str = payload["month_key"]
-    cities: list = payload.get("cities") or list(MONTHLY_CITIES)
+    period_key: str = payload.get("period_key") or payload["month_key"]
+    cities: list = payload.get("cities") or list(SCRAPE_CITIES)
     wave_size: int = int(payload.get("wave_size") or 3)
     force_full: bool = bool(payload.get("force_full"))
 
     # Slugify here (orchestrator) so run_id/labels stay deterministic; cities
     # such as "new york" carry a space that is unsafe in run_id keys.
     candidates = [
-        {"city": c, "run_id": f"monthly-{c.replace(' ', '-')}-{month_key}"}
+        {"city": c, "run_id": f"weekly-{c.replace(' ', '-')}-{period_key}"}
         for c in cities
     ]
 
@@ -301,7 +302,7 @@ def location_scraper_monthly_orch(context: df.DurableOrchestrationContext):
     )
 
     summary = {
-        "month_key": month_key,
+        "period_key": period_key,
         "cities_total": len(cities),
         "cities_run": len(todo),
         "waves": 0,
@@ -341,13 +342,13 @@ def location_scraper_monthly_orch(context: df.DurableOrchestrationContext):
             summary["waves_with_failures"] += 1
             if not context.is_replaying:
                 logger.warning(
-                    "Monthly wave %d had failures (cities=%s); continuing",
+                    "Weekly wave %d had failures (cities=%s); continuing",
                     summary["waves"],
                     [e["city"] for e in wave],
                 )
 
     if not context.is_replaying:
-        logger.info("Monthly location scraper parent complete: %s", json.dumps(summary, sort_keys=True))
+        logger.info("Weekly location scraper parent complete: %s", json.dumps(summary, sort_keys=True))
     return summary
 
 
@@ -652,16 +653,16 @@ def ls_mark_run_failed(payload: dict) -> None:
 
 @bp.activity_trigger(input_name="payload")
 def ls_init_run_log(payload: dict) -> None:
-    """Upsert a RUNNING log row for a monthly city before its sub-orchestration."""
+    """Upsert a RUNNING log row for a weekly city before its sub-orchestration."""
     try:
         log_act.init_run_log(payload["run_id"], payload["city"])
     except Exception:
-        logger.exception("Could not init monthly log row for run_id=%s", payload.get("run_id"))
+        logger.exception("Could not init weekly log row for run_id=%s", payload.get("run_id"))
 
 
 @bp.activity_trigger(input_name="payload")
 def ls_cities_needing_run(payload: dict) -> list:
-    """Return the subset of candidate cities not yet completed this month.
+    """Return the subset of candidate cities not yet completed this week.
 
     payload = {"candidates": [{"city": str, "run_id": str}, ...], "force_full": bool}
     With force_full, returns all candidates (full re-scrape).
@@ -672,7 +673,7 @@ def ls_cities_needing_run(payload: dict) -> list:
     try:
         completed = log_act.completed_run_ids([c["run_id"] for c in candidates])
     except Exception:
-        logger.exception("Could not query completed monthly runs; running all candidates")
+        logger.exception("Could not query completed weekly runs; running all candidates")
         return candidates
     return [c for c in candidates if c["run_id"] not in completed]
 
