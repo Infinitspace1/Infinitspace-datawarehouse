@@ -190,7 +190,17 @@ BEGIN
         inv.source_id                                                      AS nexudus_invoice_source_id,
         inv.location_source_id,
         COALESCE(loc.name,       inv.location_name)                        AS location_name,
-        loc.city                                                           AS location_city,
+        COALESCE(
+            loc.city,
+            CASE
+                WHEN CHARINDEX(N' - ', COALESCE(loc.name, inv.location_name)) > 0
+                    THEN LEFT(
+                        COALESCE(loc.name, inv.location_name),
+                        CHARINDEX(N' - ', COALESCE(loc.name, inv.location_name)) - 1
+                    )
+                ELSE NULL
+            END
+        )                                                                 AS location_city,
         loc.country_name                                                   AS location_country_name,
         ls.finance_location_email                                          AS location_finance_email,
         inv.invoice_number,
@@ -205,7 +215,10 @@ BEGIN
         inv.invoice_status,
         inv.processing,
         inv.payment_failure_count,
-        CAST(inv.invoice_from_date AS DATE)                                AS invoice_date,
+        COALESCE(
+            CAST((inv.invoice_from_date AT TIME ZONE 'UTC' AT TIME ZONE 'Central European Standard Time') AS DATE),
+            inv.due_date_local
+        )                                                                 AS invoice_date,
         inv.due_date_local                                                 AS due_date,
         CAST(GETUTCDATE()          AS DATE)                                AS as_of_date_utc,
         DATEDIFF(DAY, CAST(GETUTCDATE() AS DATE), inv.due_date_local)      AS days_until_due,
