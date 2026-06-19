@@ -1,6 +1,9 @@
 import unittest
 
-from functions.ava_refresh import _assert_ava_objects_exist
+from functions.ava_refresh import (
+    _assert_ava_objects_exist,
+    _location_plans_objects_exist,
+)
 
 
 class _StubSQL:
@@ -35,6 +38,18 @@ class TestAvaRefreshPreflight(unittest.TestCase):
             _assert_ava_objects_exist(sql)
 
         self.assertIn("ava.sp_refresh_product_availability", str(ctx.exception))
+
+
+class TestLocationPlansObjectsExist(unittest.TestCase):
+
+    def test_true_when_both_objects_present(self):
+        sql = _StubSQL([1])
+        self.assertTrue(_location_plans_objects_exist(sql))
+        self.assertEqual(len(sql.queries), 1)
+
+    def test_false_when_objects_missing(self):
+        sql = _StubSQL([0])
+        self.assertFalse(_location_plans_objects_exist(sql))
 
 
 if __name__ == "__main__":
