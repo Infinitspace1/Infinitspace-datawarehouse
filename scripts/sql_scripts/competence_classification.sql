@@ -12,7 +12,7 @@
 -- (which would otherwise overwrite an AI verdict) and keeps classification incremental.
 --
 -- Filled by the two-tier classifier (free category rules + an LLM pass on the ambiguous
--- middle): functions/competence_classification.py for the nightly run, and
+-- middle), run as a step of the daily functions/competence_sync.py, and by
 -- scripts/python_scripts/backfill_competitor_classification.py for the one-off backfill.
 --
 -- Idempotent: safe to run more than once.

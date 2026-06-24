@@ -15,9 +15,9 @@ filter — the website is the real signal, over ~15k rows):
   - HARD CAPS: ``max_ai_units`` per run + a sliding-window rate limit, so a run can't run away.
 
 Verdicts are written per place_id into silver.competence_competitor_classification (see
-scripts/sql_scripts/competence_classification.sql). Drive it via the nightly function
-(functions/competence_classification.py) or the one-off backfill
-(scripts/python_scripts/backfill_competitor_classification.py).
+scripts/sql_scripts/competence_classification.sql). It runs as a step of the daily competence
+sync (functions/competence_sync.py) so silver stays clean for future competitors, and via the
+one-off backfill (scripts/python_scripts/backfill_competitor_classification.py).
 """
 from __future__ import annotations
 

@@ -65,6 +65,17 @@ INCREMENTAL_OVERLAP_MINUTES = int(os.getenv("COMPETENCE_INCREMENTAL_OVERLAP_MINU
 # (protects against a failed/empty full read soft-deleting the whole table).
 MIN_IDS = int(os.getenv("COMPETENCE_RECONCILE_MIN_IDS", "10"))
 
+# Classification step: clean the newly-synced competitors into real flex-workspace operators
+# (feeds silver.competence_flex_competitors). On by default; auto-skipped when ANTHROPIC_API_KEY
+# is unset. Incremental (only not-yet-classified competitors) + a per-run AI cap, so daily cost
+# is tiny. Set COMPETENCE_CLASSIFY=0 to run the sync without it.
+CLASSIFY_IN_SYNC = os.getenv("COMPETENCE_CLASSIFY", "true").strip().lower() in {"1", "true", "yes", "on"}
+CLASSIFY_MAX_AI_UNITS = int(os.getenv("COMPETENCE_CLASSIFY_MAX_AI_UNITS", "2000"))
+
+
+def _classify_enabled() -> bool:
+    return CLASSIFY_IN_SYNC and bool(os.getenv("ANTHROPIC_API_KEY"))
+
 
 @bp.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
 async def competence_sync(timer: func.TimerRequest) -> None:
@@ -182,6 +193,21 @@ async def run_competence_sync(mode: str = "incremental", run_id: uuid.UUID | Non
         run.rows_skipped = result["errors"]
         summary["silver"] = result
         logger.info("Competence silver complete: %s", result)
+
+    # ── Classification (clean competitors → flex view) ───────
+    # Classify the just-synced competitors so silver.competence_flex_competitors stays clean for
+    # future data too. Same run/RunTracker as the rest of the pipeline; incremental + AI-capped.
+    if _classify_enabled():
+        async with RunTracker("competence", "competence_classification", "silver", metadata=str(run_id)) as run:
+            from shared.competence.classifier_service import CompetitorClassifier
+            report = CompetitorClassifier(max_ai_units=CLASSIFY_MAX_AI_UNITS).classify()
+            run.rows_read = report.units
+            run.rows_written = report.rows_written
+            run.rows_skipped = report.ai_unsure + report.ai_skipped_cap
+            cls = report.as_dict()
+            cls.pop("samples", None)
+            summary["classification"] = cls
+            logger.info("Competence classification complete: %s", cls)
 
     # ── Reconcile (full mode only) ───────────────────────────
     if full:

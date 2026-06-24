@@ -14,8 +14,9 @@ App settings:
   - ENABLE_ADMIN_FUNCTIONS=0                default
   - ENABLE_REAL_ESTATE_FUNCTIONS=0          default
   - ENABLE_LOCATION_SCRAPER_FUNCTIONS=0     default
-  - ENABLE_COMPETENCE_FUNCTIONS=0           default (needs FIREBASE_CREDENTIALS)
-  - ENABLE_COMPETENCE_CLASSIFY=0            default (needs ANTHROPIC_API_KEY)
+  - ENABLE_COMPETENCE_FUNCTIONS=0           default (needs FIREBASE_CREDENTIALS; its sync also
+                                            classifies competitors when ANTHROPIC_API_KEY is set,
+                                            disable with COMPETENCE_CLASSIFY=0)
   - ENABLE_HUBSPOT_FUNCTIONS=0              default (needs HUBSPOT_ACCESS_TOKEN)
   - ENABLE_EVENTBRITE_FUNCTIONS=0           default (needs EVENTBRITE_PRIVATE_TOKEN)
 """
@@ -108,15 +109,6 @@ if _env_flag("ENABLE_COMPETENCE_FUNCTIONS", False):
     from functions.competence_sync import bp as competence_bp
 
     app.register_functions(competence_bp)
-
-
-# Nightly flexible-workspace classification of the synced competitors (LLM, deduped by domain).
-# Separate flag (default off): it spends on the Anthropic API, so it stays off until the one-off
-# backfill is done and ANTHROPIC_API_KEY is configured.
-if _env_flag("ENABLE_COMPETENCE_CLASSIFY", False):
-    from functions.competence_classification import bp as competence_classify_bp
-
-    app.register_functions(competence_classify_bp)
 
 
 # Daily HubSpot marketing emails -> bronze -> silver sync (content + KPI stats).
