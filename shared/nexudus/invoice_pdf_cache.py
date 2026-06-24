@@ -28,9 +28,10 @@ async def cache_missing_nexudus_pdfs(
     Fetch and cache PDFs for recent Nexudus invoices missing a pdf_blob_path.
 
     Only processes invoices from the last ``lookback_days`` days to avoid
-    hitting the entire backlog every run.  Invoices that return a server
-    error from Nexudus are marked with a sentinel path so they are not
-    retried on the next run.
+    hitting the entire backlog every run.  A failed fetch leaves
+    ``pdf_blob_path`` NULL so it is retried on the next run (the lookback
+    window naturally bounds how long a permanently-unprintable invoice keeps
+    being retried).
 
     Returns stats dict: {pdfs_cached, pdfs_failed, pdfs_skipped, pdfs_total}.
     """
@@ -38,6 +39,10 @@ async def cache_missing_nexudus_pdfs(
     blob_writer = BlobWriter()
 
     top = f"TOP {limit}" if limit else ""
+    # Candidates = recently-updated invoices OR any open finance-worklist
+    # invoice still missing a PDF. The worklist branch (bounded to the last
+    # 365 days of due_date) guarantees the finance dashboard's invoices get a
+    # PDF nightly even when they haven't been updated within the lookback.
     rows = sql.execute_query(
         f"""
         SELECT {top}
@@ -46,7 +51,17 @@ async def cache_missing_nexudus_pdfs(
             invoice_number
         FROM silver.nexudus_coworker_invoices
         WHERE pdf_blob_path IS NULL
-          AND updated_on >= DATEADD(DAY, -{lookback_days}, GETUTCDATE())
+          AND is_deleted = 0
+          AND (
+                updated_on >= DATEADD(DAY, -{lookback_days}, GETUTCDATE())
+                OR (
+                    due_amount > 0
+                    AND void  = 0
+                    AND draft = 0
+                    AND paid  = 0
+                    AND due_date >= DATEADD(DAY, -365, GETUTCDATE())
+                )
+          )
         ORDER BY updated_on DESC
         """
     )
@@ -101,29 +116,11 @@ async def cache_missing_nexudus_pdfs(
             logger.info(
                 "PDF cached for invoice %s [blob=%s]", invoice_number, blob_path
             )
-        except Exception as exc:
+        except Exception:
+            # Leave pdf_blob_path NULL so the invoice is retried next run.
+            # The lookback window bounds how long a failing invoice is retried.
             failed += 1
             logger.exception("Failed to cache PDF for invoice %s", invoice_number)
-
-            # Mark server-side errors with a sentinel so we don't retry forever
-            is_server_error = (
-                hasattr(exc, "status") and exc.status in (500, 502, 503)
-            )
-            if is_server_error:
-                sql.execute_non_query(
-                    """
-                    UPDATE silver.nexudus_coworker_invoices
-                    SET pdf_blob_path = '__unavailable__',
-                        pdf_cached_at = GETUTCDATE()
-                    WHERE source_id = ?
-                    """,
-                    (invoice_id,),
-                )
-                logger.info(
-                    "Marked invoice %s as PDF unavailable (server error %s)",
-                    invoice_number,
-                    getattr(exc, "status", "unknown"),
-                )
 
         await asyncio.sleep(PDF_FETCH_THROTTLE_SECONDS)
 

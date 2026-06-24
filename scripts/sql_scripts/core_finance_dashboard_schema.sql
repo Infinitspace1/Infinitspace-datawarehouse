@@ -356,7 +356,10 @@ BEGIN
             nci.total_amount,
             nci.due_amount,
             nci.paid_amount,
-            nci.pdf_blob_path,
+            -- Guard against the legacy '__unavailable__' sentinel (written by
+            -- the old, broken PDF endpoint) leaking into the worklist as a
+            -- bogus blob path; treat it as "no PDF yet".
+            NULLIF(nci.pdf_blob_path, '__unavailable__') AS pdf_blob_path,
             nci.last_synced_at
         FROM silver.nexudus_coworker_invoices nci
         WHERE nci.due_amount > 0

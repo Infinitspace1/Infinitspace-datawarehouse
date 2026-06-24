@@ -44,12 +44,22 @@ async def nexudus_invoice_pdf_cache(timer: func.TimerRequest) -> None:
 
             run.rows_read = stats["pdfs_total"]
             run.rows_written = stats["pdfs_cached"]
-            run.rows_skipped = stats["pdfs_skipped"] + stats["pdfs_failed"]
+            run.rows_skipped = stats["pdfs_skipped"]
 
             logger.info(
                 "Nexudus invoice PDF cache complete: %s",
                 stats,
             )
+
+            # Fail the run if we had candidates and every fetch errored — this
+            # is the regression signal (e.g. the run-command contract changed or
+            # temp URLs consistently expire). Partial failures self-heal next
+            # run, so only an all-failed run trips the health report.
+            if stats["pdfs_total"] > 0 and stats["pdfs_cached"] == 0 and stats["pdfs_failed"] > 0:
+                raise RuntimeError(
+                    f"Nexudus PDF cache: all {stats['pdfs_failed']} fetch(es) failed, "
+                    f"0 cached (of {stats['pdfs_total']} candidates)"
+                )
 
     except Exception as exc:
         logger.error("Nexudus invoice PDF cache failed: %s", exc, exc_info=True)
