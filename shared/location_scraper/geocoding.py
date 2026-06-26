@@ -41,6 +41,12 @@ COUNTRY_NAME_BY_SOURCE = {
         "los angeles": "United States",
         "austin": "United States",
         "seattle": "United States",
+        "redwood city": "United States",
+        "san mateo": "United States",
+        "san bruno": "United States",
+        "cupertino": "United States",
+        "phoenix": "United States",
+        "atlanta": "United States",
     },
     "immobilienscout": {
         "berlin": "Germany",

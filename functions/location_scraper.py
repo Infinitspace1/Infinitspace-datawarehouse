@@ -77,6 +77,12 @@ SCRAPE_CITIES = (
     "los angeles",
     "austin",
     "seattle",
+    "redwood city",
+    "san mateo",
+    "san bruno",
+    "cupertino",
+    "phoenix",
+    "atlanta",
 )
 
 # Sources whose listing payload already carries broker name/company/phone/email,
