@@ -544,6 +544,14 @@ def _map_row(
         surface_display = surface_m2
         surface_unit = "m2"
 
+    if source == "loopnet":
+        # The broad-search LoopNet payload carries no `country` field, so derive
+        # the currency from the already-resolved country_code (which falls back
+        # to the run city) — otherwise UK listings would default to USD.
+        currency = currency_for_country(country_code)
+    else:
+        currency = _pick_currency(payload, source)
+
     return (
         row["run_id"],
         item_index,
@@ -564,7 +572,7 @@ def _map_row(
         surface_m2,
         surface_display,
         surface_unit,
-        _pick_currency(payload, source),
+        currency,
         additional_costs_per_m2,
         total_price_per_m2,
         divisible_from_m2,

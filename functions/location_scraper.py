@@ -380,25 +380,14 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             },
         )
 
-        # 1b. LoopNet only: enumerate the listing URLs from the space-
-        # available-filtered search pages. The memo23 actor's own broad search
-        # is hard-capped at 500 items/bounding-box and ignores every filter,
-        # which hid ~90% of qualifying buildings in dense markets (London:
-        # 42 of 383). Scraping the enumerated listing URLs instead gives full
-        # coverage while keeping the same payload format (incl. brokerEmail).
-        if source_config.get("actor") == "loopnet":
-            enum_result: dict = yield context.call_activity(
-                "ls_enumerate_loopnet_urls", source_config
-            )
-            listing_urls = (enum_result or {}).get("listing_urls") or []
-            if listing_urls:
-                source_config["listing_urls"] = listing_urls
-            elif not context.is_replaying:
-                logger.warning(
-                    "LoopNet enumeration returned no URLs for city=%s — "
-                    "falling back to the capped broad search",
-                    city,
-                )
+        # 1b. LoopNet coverage note: we run the memo23 broad search directly on
+        # the space-available-filtered URL with `moreResults` (see
+        # LoopnetAdapter.build_input), which bypasses the old 500-item cap. The
+        # previous enumeration 2-step (ls_enumerate_loopnet_urls -> feed listing
+        # URLs to memo23) was retired on 2026-06-29: the actor's 2026-06-27
+        # rebuild made the listing-URL payload drop broker contact + the
+        # header/spaces surface fields, so the enumerated path produced 0
+        # buildings. The broad-search payload keeps brokerEmail and sizeSf.
 
         # 2. Start Apify actor (async — do NOT block on completion)
         run_info: dict = yield context.call_activity("ls_start_apify_run", source_config)

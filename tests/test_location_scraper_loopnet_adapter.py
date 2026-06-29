@@ -10,6 +10,8 @@ if str(ROOT) not in sys.path:
 
 from shared.location_scraper.adapters.loopnet import (
     LoopnetAdapter,
+    _available_sf_from_name,
+    _parse_abbrev_sf,
     available_surface_m2_from_payload,
     available_surface_sqft_from_payload,
     currency_for_country,
@@ -43,6 +45,9 @@ def test_build_input_shape_and_cap():
         {"url": "https://www.loopnet.com/search/office-properties/london-england--united-kingdom/for-rent/"}
     ]
     assert payload["includeListingDetails"] is True
+    # moreResults bypasses memo23's 500-item cap so the filtered search returns
+    # the full qualifying set (replaces the retired enumeration 2-step).
+    assert payload["moreResults"] is True
     assert payload["maxItems"] == 100
     assert adapter.actor_id == LOOPNET_ACTOR_ID
 
@@ -152,3 +157,83 @@ def test_globe_surfaces_broker_email_for_loopnet():
 def test_globe_broker_contacts_empty_when_no_email():
     from shared.location_scraper.activities.materialize_globe import _loopnet_broker_contacts
     assert _loopnet_broker_contacts({"brokerName": "X"}) == []
+
+
+# --- memo23 schema variants after the 2026-06-27 actor rebuild ---
+
+
+def test_parse_abbrev_sf_handles_k_and_m():
+    # The broad-search `sizeSf` field is abbreviated.
+    assert _parse_abbrev_sf("36.8K") == 36800
+    assert _parse_abbrev_sf("624K") == 624000
+    assert _parse_abbrev_sf("1.2M") == 1200000
+    assert _parse_abbrev_sf("29,186") == 29186
+    assert _parse_abbrev_sf(None) is None
+    assert _parse_abbrev_sf("Upon Request") is None
+
+
+def test_available_sf_from_name_range_and_single():
+    # "X - Y SF ... Available" -> upper bound; single "Y SF ... Available" -> Y.
+    assert _available_sf_from_name(
+        "The Concorde | 2222 W Dunlap Ave - 1,605 - 103,916 SF of 4-Star Space Available in Phoenix, AZ"
+    ) == 103916
+    assert _available_sf_from_name(
+        "345 Convention Way - 7,334 SF of Office  Space Available in Redwood City, CA"
+    ) == 7334
+    # UK listings quote "sq ft", not "SF".
+    assert _available_sf_from_name(
+        "1 Edcity - 10,173 - 41,511 sq ft of 4-Star Office  Space Available in London"
+    ) == 41511
+    # Coworking listings have no "... SF ... Available" clause.
+    assert _available_sf_from_name("88 Kingsway - Coworking Space Available in London WC2B 6AA") is None
+
+
+def test_surface_from_listing_web_name_payload():
+    """memo23 'listingWeb' detail payload — surface lives only in `name`."""
+    payload = {
+        "sourceType": "listingWeb",
+        "name": "2222 W Dunlap Ave - 1,605 - 103,916 SF of 4-Star Space Available in Phoenix, AZ",
+        "buildingSize": "140,161 SF",  # total building size — must NOT be used as available
+    }
+    assert available_surface_sqft_from_payload(payload) == 103916.0
+    assert round(available_surface_m2_from_payload(payload)) == 9654
+
+
+def test_normalize_broad_search_sizesf_payload_with_broker():
+    """The broad-search payload uses `sizeSf` + carries broker contact."""
+    payload = {
+        "propertyId": "40870460",
+        "listingUrl": "https://www.loopnet.com/Listing/2222-W-Dunlap-Ave-Phoenix-AZ/40870460/",
+        "address": "2222 W Dunlap Ave",
+        "city": "Phoenix",
+        "state": "AZ",
+        "zip": "85021",
+        "sizeSf": "36.8K",
+        "brokerName": "Charles Strouss",
+        "brokerCompany": "CBRE",
+        "brokerPhone": "602-000-0000",
+        "brokerEmail": "Charles.Strouss@cbre.com",
+    }
+    listing = LoopnetAdapter().normalize(payload, "phoenix")
+    assert listing is not None
+    assert round(listing.surface_m2) == 3419  # 36,800 SF
+    assert listing.surface_display == 36800.0
+    assert listing.email == "Charles.Strouss@cbre.com"
+    assert listing.company_name == "CBRE"
+    assert listing.external_id == "40870460"
+
+
+def test_normalize_listing_web_name_payload_no_broker():
+    """The listingWeb payload yields a building from `name` even without broker."""
+    payload = {
+        "sourceType": "listingWeb",
+        "propertyId": "37654403",
+        "listingUrl": "https://www.loopnet.com/Listing/2727-W-Glendale-Ave-Phoenix-AZ/37654403/",
+        "name": "2727 W Glendale Ave - 8,299 - 20,255 SF of Office  Space Available in Phoenix, AZ 85051",
+        "city": "Phoenix",
+        "zip": "85051",
+    }
+    listing = LoopnetAdapter().normalize(payload, "phoenix")
+    assert listing is not None
+    assert round(listing.surface_m2) == 1882  # 20,255 SF
+    assert listing.email == ""  # no broker in this schema

@@ -29,12 +29,16 @@ SF_TO_M2 = 0.092903
 MIN_SURFACE_M2 = 1500.0
 
 
+# LoopNet quotes square footage as either "SF" (US) or "sq ft" (UK / Realla).
+_SF_UNIT = r"(?:SF|sq\s*ft)"
+
+
 def _first_sf(text: Any) -> Optional[float]:
     """Extract the first square-footage number from a string like
-    '33,889 SF of Office Space Available' or '1,292 - 1,333 SF' -> 33889.0 / 1292.0."""
+    '33,889 SF of Office Space Available' or '41,511 sq ft' -> 33889.0 / 41511.0."""
     if text is None:
         return None
-    match = re.search(r"(\d[\d,]*)\s*SF", str(text), flags=re.IGNORECASE)
+    match = re.search(rf"(\d[\d,]*)\s*{_SF_UNIT}", str(text), flags=re.IGNORECASE)
     if not match:
         return None
     try:
@@ -43,16 +47,66 @@ def _first_sf(text: Any) -> Optional[float]:
         return None
 
 
+def _available_sf_from_name(name: Any) -> Optional[float]:
+    """Available square footage parsed from a LoopNet listing name/title.
+
+    The memo23 actor's listing-detail payload (``sourceType="listingWeb"``, since
+    its 2026-06-27 rebuild) no longer carries ``header``/``spaces`` — the only
+    available-area signal is the name, e.g.
+    ``"The Concorde | 2222 W Dunlap Ave - 1,605 - 103,916 SF of 4-Star Space Available in Phoenix, AZ"``.
+    The figure is a range (smallest unit - largest available); we take the upper
+    bound, which mirrors the old ``header.subtext`` total-available semantic. A
+    name with no "... SF ... Available" clause (e.g. coworking listings) -> None.
+    """
+    if name is None:
+        return None
+    match = re.search(
+        rf"([\d,]+)(?:\s*-\s*([\d,]+))?\s*{_SF_UNIT}\b.{{0,60}}?Available",
+        str(name),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        values = [float(g.replace(",", "")) for g in match.groups() if g]
+    except ValueError:
+        return None
+    return max(values) if values else None
+
+
+def _parse_abbrev_sf(value: Any) -> Optional[float]:
+    """Parse the broad-search ``sizeSf`` field, which uses K/M abbreviations:
+    '36.8K' -> 36800, '624K' -> 624000, '1.2M' -> 1200000, '29,186' -> 29186."""
+    if value is None:
+        return None
+    match = re.search(r"([\d,]+(?:\.\d+)?)\s*([KkMm]?)", str(value).strip())
+    if not match:
+        return None
+    try:
+        number = float(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    suffix = (match.group(2) or "").upper()
+    if suffix == "K":
+        number *= 1_000
+    elif suffix == "M":
+        number *= 1_000_000
+    return number
+
+
 def available_surface_sqft_from_payload(payload: dict[str, Any]) -> Optional[float]:
     """Best available-surface estimate in **square feet** for one LoopNet building.
 
     This is LoopNet's native unit — the exact figure a UK/US broker recognises,
     so we keep it verbatim for `surface_display`.
 
-    Preference order:
-      1. header.subtext ("33,889 SF of Office Space Available") — the headline
-         total available area on the placard.
-      2. sum of spaces[].size when the subtext is missing.
+    memo23 returns three different payload shapes depending on the actor version
+    and the input mode, so we try each available-area signal in turn:
+      1. header.subtext ("33,889 SF of Office Space Available") — old detail page.
+      2. sum of spaces[].size — old detail page fallback.
+      3. name / listingName ("... - 103,916 SF of ... Available") — the
+         post-2026-06-27 listing-detail ("listingWeb") payload.
+      4. sizeSf ("36.8K") — the broad-search / search-results payload.
     """
     header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
     sf = _first_sf(header.get("subtext"))
@@ -68,6 +122,12 @@ def available_surface_sqft_from_payload(payload: dict[str, Any]) -> Optional[flo
                 total += size
                 found = True
         sf = total if found else None
+
+    if sf is None:
+        sf = _available_sf_from_name(payload.get("name") or payload.get("listingName"))
+
+    if sf is None:
+        sf = _parse_abbrev_sf(payload.get("sizeSf"))
 
     return sf
 
@@ -118,6 +178,12 @@ class LoopnetAdapter:
         payload = {
             "startUrls": [{"url": u} for u in urls],
             "includeListingDetails": True,
+            # Bypass memo23's default 500-item-per-bounding-box cap so the
+            # space-available-filtered search returns the FULL qualifying set
+            # (the reason the old enumeration 2-step existed). The broad-search
+            # payload carries broker contact + sizeSf, which the enumerated
+            # listing-URL payload lost in the actor's 2026-06-27 rebuild.
+            "moreResults": True,
             "maxConcurrency": 20,
             "minConcurrency": 1,
             "proxy": {"useApifyProxy": True},
