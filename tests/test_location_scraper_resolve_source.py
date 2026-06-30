@@ -125,8 +125,6 @@ class TestResolveSource:
             "san mateo": "san-mateo-ca",
             "san bruno": "san-bruno-ca",
             "cupertino": "cupertino-ca",
-            "phoenix": "phoenix-az",
-            "atlanta": "atlanta-ga",
         }
         for city, slug in expected.items():
             cfg = resolve_source(city, None, "x")

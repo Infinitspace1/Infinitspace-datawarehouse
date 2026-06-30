@@ -45,8 +45,6 @@ COUNTRY_NAME_BY_SOURCE = {
         "san mateo": "United States",
         "san bruno": "United States",
         "cupertino": "United States",
-        "phoenix": "United States",
-        "atlanta": "United States",
     },
     "immobilienscout": {
         "berlin": "Germany",

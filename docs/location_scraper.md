@@ -65,7 +65,7 @@ sequenceDiagram
 
 `location_scraper_monthly` runs on `LOCATION_SCRAPER_MONTHLY_SCHEDULE`, default `0 0 1 1 * *` (01:00 UTC on the first day of each month). It starts one Durable orchestration per city with `unlimited_items=true`, so the Apify actor input omits `maxItems` and the dataset fetch reads all returned items.
 
-Scheduled cities: `barcelona`, `madrid`, `milan`, `berlin`, `munich`, `hamburg`, `cologne`, `frankfurt`, `dusseldorf`, `stuttgart`, `warsaw`, `london`, `new york`, `san francisco`, `palo alto`, `los angeles`, `austin`, `seattle`, `redwood city`, `san mateo`, `san bruno`, `cupertino`, `phoenix`, `atlanta`.
+Scheduled cities: `barcelona`, `madrid`, `milan`, `berlin`, `munich`, `hamburg`, `cologne`, `frankfurt`, `dusseldorf`, `stuttgart`, `warsaw`, `london`, `new york`, `san francisco`, `palo alto`, `los angeles`, `austin`, `seattle`, `redwood city`, `san mateo`, `san bruno`, `cupertino`.
 
 ---
 
@@ -139,8 +139,6 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
 | `san mateo` | US | LoopNet |
 | `san bruno` | US | LoopNet |
 | `cupertino` | US | LoopNet |
-| `phoenix` | US | LoopNet |
-| `atlanta` | US | LoopNet |
 
 #### LoopNet (UK + US) notes
 
@@ -155,7 +153,7 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
     `office-space` + `for-lease`, not `office-properties` + `for-rent`). City slug is
     `{city}-{state-abbrev}`, e.g. `new-york-ny`, `san-francisco-ca`, `palo-alto-ca`,
     `los-angeles-ca`, `austin-tx`, `seattle-wa`, `redwood-city-ca`, `san-mateo-ca`,
-    `san-bruno-ca`, `cupertino-ca`, `phoenix-az`, `atlanta-ga`. Multi-word city names
+    `san-bruno-ca`, `cupertino-ca`. Multi-word city names
     contain a space (`new york`, `redwood city`) — the weekly timer slugifies them
     (`new-york`, `redwood-city`) for `run_id`/instance ids.
   - Currency is derived from the country (GB → GBP, otherwise USD) since LoopNet has no

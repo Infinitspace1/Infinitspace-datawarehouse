@@ -134,8 +134,6 @@ COUNTRY_CONFIG: dict[str, dict] = {
             "san mateo": "san-mateo-ca",
             "san bruno": "san-bruno-ca",
             "cupertino": "cupertino-ca",
-            "phoenix": "phoenix-az",
-            "atlanta": "atlanta-ga",
         },
     },
 }
