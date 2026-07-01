@@ -160,11 +160,36 @@ class SQLClient:
                 cursor.execute(query)
             return cursor.rowcount
 
-    def execute_many(self, query: str, params_list: List[tuple]) -> int:
+    def execute_many(
+        self,
+        query: str,
+        params_list: List[tuple],
+        fast: bool = False,
+        input_sizes: Optional[list] = None,
+    ) -> int:
         """Execute the same parameterised query for multiple row tuples in a
         single connection.  Much more efficient than calling execute_non_query
         once per row when writing large batches (avoids a new TCP connection +
         auth round-trip per row).
+
+        ``fast=True`` additionally sets pyodbc's ``fast_executemany``, which
+        batches the parameter arrays instead of doing one network round-trip
+        per row — the difference between minutes and hours on large batches.
+        Defaults to False: pyodbc's fast path infers each string column's
+        buffer size from a sample of the batch, and CAN RAISE "String data,
+        right truncation" on an ordinary bounded NVARCHAR(n) column if a later
+        row's value is longer than the rows pyodbc happened to size from —
+        this is not limited to NVARCHAR(MAX) columns (verified empirically).
+        Only opt in where either the data is narrow/uniform enough that this
+        can't bite, or ``input_sizes`` (below) pins the real column widths.
+
+        ``input_sizes``, when given, is passed to ``cursor.setinputsizes()``
+        before executemany — one entry per ``?`` placeholder, each either
+        ``None`` (let the driver infer) or a ``(sql_type, column_size,
+        decimal_digits)`` tuple. This is the documented fix for the
+        truncation issue above: it pins each string parameter to its actual
+        column width instead of letting pyodbc guess from sampled data, so
+        ``fast=True`` is safe regardless of row order/content.
 
         Returns the total number of rows affected (cursor.rowcount after the
         final executemany call — -1 if the driver does not report row counts).
@@ -173,6 +198,13 @@ class SQLClient:
             return 0
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            if fast:
+                try:
+                    cursor.fast_executemany = True
+                except AttributeError:
+                    pass
+            if input_sizes is not None:
+                cursor.setinputsizes(input_sizes)
             cursor.executemany(query, params_list)
             return cursor.rowcount
 

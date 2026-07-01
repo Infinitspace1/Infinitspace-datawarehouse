@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 # Shared silver entity/watermark name for both competence tables.
 SILVER_ENTITY = "competence"
 
+# Batch size for the competitors MERGE. Chunked (rather than one giant
+# executemany) so a single slow/oversized batch can't blow the whole write,
+# and so progress is visible in logs on a full reprocess (e.g. the very
+# first run, before any watermark exists — see load_latest_bronze_rows).
+_COMPETITOR_BATCH_SIZE = 1000
+
+
+def _chunks(seq: list, n: int):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
 _LISTS_MERGE_SQL = """
     MERGE silver.competence_lists AS target
     USING (SELECT ? AS source_id) AS source
@@ -173,8 +184,8 @@ class SilverCompetenceWriter:
                     row.get("source_id"), exc,
                 )
                 errors += 1
-        if params_list:
-            self.sql.execute_many(_COMPETITORS_MERGE_SQL, params_list)
+        for batch in _chunks(params_list, _COMPETITOR_BATCH_SIZE):
+            self.sql.execute_many(_COMPETITORS_MERGE_SQL, batch, fast=True)
         logger.info(
             "Silver competence_competitors: %s upserted, %s errors", len(params_list), errors
         )
