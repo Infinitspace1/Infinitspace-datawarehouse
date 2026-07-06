@@ -102,14 +102,13 @@ if _env_flag("ENABLE_LOCATION_SCRAPER_FUNCTIONS", False):
     app.register_functions(location_scraper_bp)
 
 
-# Daily Firebase competence_new -> bronze -> silver sync (TeamAndy competitors).
-# Gated separately (default off) so the daily timer only runs once
-# FIREBASE_CREDENTIALS is configured — otherwise it would fail every day.
-if _env_flag("ENABLE_COMPETENCE_FUNCTIONS", False):
-    from functions.competence_sync import bp as competence_bp
-
-    app.register_functions(competence_bp)
-
+# RETIRED 2026-07-06: the Firebase competence_new -> bronze -> silver sync. TeamAndy now
+# lives on Azure SQL in this same database (teamandy schema) and classifies competitors at
+# sourcing time, so the ETL had nothing live left to read (Firestore is frozen post-cutover;
+# ENABLE_COMPETENCE_FUNCTIONS was never enabled in prod). silver.competence_competitor_
+# classification STAYS — TeamAndy's sourcing filter reads/writes it — and
+# silver.competence_flex_competitors is re-pointed at teamandy.competence_new_competitors
+# (see scripts/sql_scripts/competence_classification.sql).
 
 # Daily HubSpot marketing emails -> bronze -> silver sync (content + KPI stats).
 # Gated separately (default off) so the daily timer only runs once

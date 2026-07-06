@@ -12,8 +12,11 @@
 -- (which would otherwise overwrite an AI verdict) and keeps classification incremental.
 --
 -- Filled by the two-tier classifier (free category rules + an LLM pass on the ambiguous
--- middle), run as a step of the daily functions/competence_sync.py, and by
--- scripts/python_scripts/backfill_competitor_classification.py for the one-off backfill.
+-- middle). Originally run by the daily functions/competence_sync.py (RETIRED 2026-07-06 —
+-- TeamAndy moved to Azure SQL in this same DB and now classifies AT SOURCING TIME via
+-- TeamAndy-individual-scraping-services/scraping_service/services/competitor_ai_filter.py,
+-- which reads/writes THIS classification table with byte-identical input hashes).
+-- scripts/python_scripts/backfill_competitor_classification.py remains for one-off use.
 --
 -- Idempotent: safe to run more than once.
 -- =============================================================================
@@ -48,22 +51,28 @@ END
 GO
 
 -- Clean serving view: real flexible-workspace operators only, one row per physical site.
--- Dedupes the competitor table on place_id (a place can appear under several country
--- lists), honours the soft-delete contract, and exposes lat/lng (the reliable location
--- signal — `city` from the scrape is unreliable, so it is intentionally NOT surfaced here).
+--
+-- RE-POINTED 2026-07-06: reads LIVE TeamAndy data (teamandy.competence_new_competitors,
+-- same database) instead of the retired-and-frozen silver.competence_competitors sync.
+-- The TeamAndy table is already noise-filtered at sourcing time (kept = flex + unsure),
+-- so the classification LEFT JOIN only excludes any known-not-flex straggler and carries
+-- the verdict metadata for consumers (e.g. the AI pricing/negotiator import).
+-- Same view name + column list as before, so consumers keep working unchanged.
+-- (`city` from the scrape is unreliable, so it is intentionally NOT surfaced here.)
 CREATE OR ALTER VIEW silver.competence_flex_competitors AS
 WITH ranked AS (
     SELECT
-        c.place_id, c.source_id, c.list_source_id, c.title, c.category_name,
-        c.address, c.street, c.postal_code, c.country, c.country_code,
+        c.place_id, c.title, c.category_name,
+        c.address, c.street, c.postal_code, l.country, l.country_code,
         c.phone, c.website, c.google_maps_url, c.latitude, c.longitude,
-        c.last_seen_at, c.last_synced_at,
+        c.updated_at AS last_seen_at,
         ROW_NUMBER() OVER (
             PARTITION BY c.place_id
-            ORDER BY c.last_synced_at DESC, c.source_id
+            ORDER BY c.updated_at DESC, c.competitor_id
         ) AS rn
-    FROM silver.competence_competitors c
-    WHERE c.is_deleted = 0 AND c.place_id IS NOT NULL
+    FROM teamandy.competence_new_competitors c
+    JOIN teamandy.competence_new l ON l.uid = c.list_uid
+    WHERE c.place_id IS NOT NULL AND c.place_id <> ''
 )
 SELECT
     r.place_id, r.title, r.category_name, r.address, r.street, r.postal_code,
@@ -71,8 +80,8 @@ SELECT
     r.latitude, r.longitude, r.last_seen_at,
     k.confidence AS flex_confidence, k.method AS flex_method, k.classified_at AS flex_classified_at
 FROM ranked r
-JOIN silver.competence_competitor_classification k ON k.place_id = r.place_id
-WHERE r.rn = 1 AND k.is_flex = 1;
+LEFT JOIN silver.competence_competitor_classification k ON k.place_id = r.place_id
+WHERE r.rn = 1 AND (k.is_flex IS NULL OR k.is_flex = 1);
 GO
 
 -- Verify
