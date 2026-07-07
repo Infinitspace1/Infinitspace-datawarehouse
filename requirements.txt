@@ -19,6 +19,12 @@ apify-client==2.5.0
 # Firebase / Firestore (competence_new competitor sync — same SDK as AI-teamandy)
 firebase-admin>=6.5.0,<7
 
+# TeamAndy Firestore -> Azure migration (scripts/python_scripts/teamandy_migration)
+#   azure-data-tables : cache collections -> Azure Table Storage (load_tables.py)
+#   google-cloud-storage : location images GCS -> Azure Blob (one-shot image copy)
+azure-data-tables>=12.7.0
+google-cloud-storage>=2.14.0
+
 # Real Estate — CoStar PDF extractor
 anthropic>=0.40.0
 pandas>=2.2.0

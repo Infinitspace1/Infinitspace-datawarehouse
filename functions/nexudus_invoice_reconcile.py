@@ -50,6 +50,14 @@ RECONCILE_LOOKBACK_DAYS = int(
 )
 # Safety floor — if Nexudus returns fewer than this many invoices, abort
 MIN_ACTIVE_IDS = int(os.getenv("NEXUDUS_INVOICE_RECONCILE_MIN_IDS", "100"))
+# DueDate sub-window size (days) for fetching active invoice ids. The Nexudus
+# billing/coworkerinvoices endpoint returns 403 Forbidden on deep pagination
+# (an unbounded 365-day fetch reached ~58 pages), and the client does not retry
+# 403 — so one deep query aborts the whole reconcile. Fetching in narrower
+# DueDate windows keeps every request shallow.
+RECONCILE_WINDOW_DAYS = int(
+    os.getenv("NEXUDUS_INVOICE_RECONCILE_WINDOW_DAYS", "30")
+)
 
 
 @bp.timer_trigger(schedule=SCHEDULE, arg_name="timer", run_on_startup=False)
@@ -105,10 +113,62 @@ async def _fetch_active_invoice_ids(
     client: NexudusClient,
     cutoff: datetime,
 ) -> set[int]:
-    """Fetch all currently-active invoice IDs within the reconcile window."""
-    since = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
-    extra_params = {"from_CoworkerInvoice_DueDate": since}
-    logger.info("Fetching active invoice ids (due_date >= %s)", since)
+    """Fetch all currently-active invoice IDs the reconcile cares about.
+
+    The reconcile soft-deletes any silver invoice with ``due_date >= cutoff``
+    that is missing from this set, so the set MUST cover the same range
+    (``due_date >= cutoff``, unbounded above — future-dated invoices included),
+    or genuinely-active invoices would be wrongly soft-deleted.
+
+    The fetch is split into contiguous ``DueDate`` sub-windows because the
+    Nexudus billing/coworkerinvoices endpoint returns 403 Forbidden on deep
+    pagination (an unbounded 365-day fetch reached ~58 pages) and the client
+    does not retry 403. A window that errors is allowed to propagate and fail
+    the run (fail-safe): silently dropping a window's ids would under-count
+    active invoices and cause wrong soft-deletes.
+    """
+    now = datetime.now(timezone.utc)
+    active_ids: set[int] = set()
+    windows = 0
+
+    # Past + present: cutoff .. now, in RECONCILE_WINDOW_DAYS chunks.
+    window_start = cutoff
+    while window_start < now:
+        window_end = min(window_start + timedelta(days=RECONCILE_WINDOW_DAYS), now)
+        active_ids |= await _fetch_invoice_ids_in_window(
+            client, window_start, window_end
+        )
+        windows += 1
+        window_start = window_end
+
+    # Future-dated invoices (due_date >= now): one unbounded window with a small
+    # backward overlap so a due date on the cutover second is not missed (the
+    # set dedups the overlap). Future due dates are few, so this stays shallow.
+    active_ids |= await _fetch_invoice_ids_in_window(
+        client, now - timedelta(days=1), None
+    )
+    windows += 1
+
+    logger.info(
+        "Fetched %s active invoice ids across %s DueDate window(s) (due_date >= %s)",
+        len(active_ids),
+        windows,
+        cutoff.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+    return active_ids
+
+
+async def _fetch_invoice_ids_in_window(
+    client: NexudusClient,
+    start: datetime,
+    end: datetime | None,
+) -> set[int]:
+    """Fetch active invoice ids with ``DueDate >= start`` (and ``< end`` if given)."""
+    extra_params = {
+        "from_CoworkerInvoice_DueDate": start.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if end is not None:
+        extra_params["to_CoworkerInvoice_DueDate"] = end.strftime("%Y-%m-%dT%H:%M:%S")
 
     records = await client.get_all(
         "billing/coworkerinvoices", extra_params=extra_params

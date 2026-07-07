@@ -254,9 +254,13 @@ BEGIN
         tax_id_number                           NVARCHAR(128)       NULL,
         billing_day                             INT                 NULL,
         tariff_id                               BIGINT              NULL,
-        tariff_name                             NVARCHAR(512)       NULL,
+        -- NVARCHAR(MAX): the GET /spaces/coworkers list endpoint returns an
+        -- aggregated (comma-joined) TariffName/NextTariffName across all of a
+        -- member's tariffs, which can exceed a bounded width (see
+        -- nexudus_coworkers_tariff_name_widen_migration.sql).
+        tariff_name                             NVARCHAR(MAX)       NULL,
         next_tariff_id                          BIGINT              NULL,
-        next_tariff_name                        NVARCHAR(512)       NULL,
+        next_tariff_name                        NVARCHAR(MAX)       NULL,
         coworker_contract_ids                   NVARCHAR(MAX)       NULL,
         coworker_contract_tariff_names          NVARCHAR(MAX)       NULL,
         active                                  BIT                 NULL,
