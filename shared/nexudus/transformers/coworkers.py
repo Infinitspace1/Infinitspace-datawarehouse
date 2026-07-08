@@ -4,6 +4,7 @@ for silver.nexudus_coworkers.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Optional
 
@@ -13,6 +14,33 @@ def _str(value: Any) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+# The internal "HubSpot Deal URL" custom field lives in the coworker payload's
+# CustomFields.Data array as a {Name, Value} entry keyed by the field's Nexudus
+# id (see the field's API panel: record.CustomFields.Data[f.Name=='1414370977'].
+# Value). We match that id primarily, and fall back to any entry whose value
+# looks like a HubSpot deal URL (so a recreated field with a new id still works).
+_HUBSPOT_DEAL_FIELD_ID = "1414370977"
+_HUBSPOT_DEAL_URL_RE = re.compile(r"(?:record/0-3/|/deals?/)(\d{4,})")
+
+
+def _extract_hubspot_deal_url(raw: dict) -> Optional[str]:
+    data = (raw.get("CustomFields") or {}).get("Data")
+    if not isinstance(data, list):
+        return None
+    by_id = fallback = None
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        value = _str(item.get("Value"))
+        if not value:
+            continue
+        if _HUBSPOT_DEAL_FIELD_ID in str(item.get("Name") or ""):
+            by_id = value
+        elif "hubspot" in value.lower() and _HUBSPOT_DEAL_URL_RE.search(value):
+            fallback = value
+    return by_id or fallback
 
 
 def _int(value: Any) -> Optional[int]:
@@ -110,4 +138,5 @@ def transform_coworker(raw: dict, bronze_id: int, sync_run_id: str) -> dict:
         "cancellation_date": _parse_dt(raw.get("CancellationDate")),
         "created_on": _parse_dt(raw.get("CreatedOn")),
         "updated_on": _parse_dt(raw.get("UpdatedOn")),
+        "hubspot_deal_url": _extract_hubspot_deal_url(raw),
     }

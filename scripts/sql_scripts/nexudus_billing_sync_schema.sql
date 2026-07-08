@@ -277,6 +277,12 @@ BEGIN
         cancellation_date                       DATETIME2           NULL,
         created_on                              DATETIME2           NULL,
         updated_on                              DATETIME2           NULL,
+        -- HubSpot deal URL from the internal Nexudus custom field (one of the
+        -- Custom1..30 slots), extracted in transformers/coworkers.py. Lets the
+        -- sales dashboard link a contract's company 1-to-1 to its HubSpot deal
+        -- without scanning bronze raw_json. Added by
+        -- nexudus_coworkers_hubspot_deal_url_migration.sql for existing DBs.
+        hubspot_deal_url                        NVARCHAR(512)       NULL,
         first_seen_at                           DATETIME2           NOT NULL DEFAULT GETUTCDATE(),
         last_synced_at                          DATETIME2           NOT NULL DEFAULT GETUTCDATE()
     );
