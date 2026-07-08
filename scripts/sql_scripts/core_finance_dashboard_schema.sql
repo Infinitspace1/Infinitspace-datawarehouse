@@ -529,7 +529,7 @@ BEGIN
             c.coworker_id,
             c.location_source_id,
             c.currency_code,
-            COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS monthly_fee
+            COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS monthly_fee
         FROM silver.nexudus_contracts c
         WHERE c.active = 1
           AND c.in_paused_period = 0
@@ -703,9 +703,9 @@ membership AS (
         c.floor_plan_desk_names,
         ISNULL(cpc.workstation_capacity, 0) AS capacity,
         c.currency_code,
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS latest_monthly_fee,
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS latest_monthly_fee,
         CAST(
-            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
             / NULLIF(ISNULL(cpc.workstation_capacity, 0), 0)
             AS DECIMAL(18,2)
         ) AS latest_monthly_fee_per_workstation,
@@ -719,7 +719,7 @@ membership AS (
         END AS term_months,
         CAST(CEILING(ISNULL(c.cancellation_limit_days, 0) / 30.0) AS INT) AS notice_period_months,
         CAST(
-            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
             * CASE
                 WHEN c.start_date IS NULL THEN 0
                 WHEN cee.eff_end_date IS NULL
@@ -729,7 +729,7 @@ membership AS (
             AS DECIMAL(18,2)
         ) AS contract_value,
         CAST(
-            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
             * CASE
                 WHEN cee.eff_end_date IS NULL
                     THEN CAST(CEILING(ISNULL(c.cancellation_limit_days, 0) / 30.0) AS INT)

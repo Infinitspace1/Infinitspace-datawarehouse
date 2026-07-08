@@ -72,8 +72,14 @@
 --   - List price  = SUM(silver.nexudus_products.price) for products linked via
 --                   silver.nexudus_contracts.floor_plan_desk_ids (comma-separated
 --                   product source_ids).
---   - Sold price  = COALESCE(price_with_products, price, tariff_price, 0) from the
---                   contract — always populated regardless of product link.
+--   - Sold price  = COALESCE(NULLIF(price_with_products, 0), price, tariff_price, 0)
+--                   from the contract — always populated regardless of product link.
+--                   The NULLIF guards a spurious price_with_products = 0: Nexudus
+--                   sometimes emits 0 for a genuinely priced contract (e.g. Weave
+--                   Security desk 3012 at QH — price_with_products=0, price=6000),
+--                   which a plain COALESCE would treat as valid and zero out the
+--                   line. Skipping the 0 falls through to `price`. A truly comped
+--                   contract has price=0 too, so it still resolves to 0.
 --   - list_price_missing = 1 only for root cause E: physical product found (capacity > 0)
 --     but price = NULL or 0 in Nexudus. Fix: update the product price in Nexudus and re-sync.
 --
@@ -210,17 +216,19 @@ SELECT
     -- `price` instead. Adjustments have no linked products, so the two
     -- fields SHOULD be equal — but 4 contracts in Nexudus have a phantom
     -- delta of €20–180 (e.g. EBCONT 1417662289 at QH). Using `price`
-    -- matches what Nexudus's own UI shows for those.
+    -- matches what Nexudus's own UI shows for those. The NULLIF(...,0) also
+    -- skips a spurious price_with_products = 0 on positive contracts so the
+    -- real `price` is used instead of zeroing the line.
     CASE
-        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
-            THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
-        ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
+            THEN COALESCE(c.price, NULLIF(c.price_with_products, 0), c.tariff_price, 0)
+        ELSE COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
     END                                 AS sold_monthly_fee,
     CAST(
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
-                THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
-            ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
+                THEN COALESCE(c.price, NULLIF(c.price_with_products, 0), c.tariff_price, 0)
+            ELSE COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
         END
         / NULLIF(pl.capacity, 0)
         AS DECIMAL(18,2)
@@ -239,7 +247,7 @@ SELECT
         WHEN pl.list_monthly_fee IS NOT NULL
             THEN CAST(
                 pl.list_monthly_fee
-                - COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+                - COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
                 AS DECIMAL(18,2)
             )
         ELSE NULL
@@ -247,7 +255,7 @@ SELECT
     CASE
         WHEN pl.list_monthly_fee IS NOT NULL AND pl.list_monthly_fee <> 0
             THEN CAST(
-                (pl.list_monthly_fee - COALESCE(c.price_with_products, c.price, c.tariff_price, 0))
+                (pl.list_monthly_fee - COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0))
                 / pl.list_monthly_fee
                 AS DECIMAL(9,4)
             )
@@ -276,7 +284,7 @@ SELECT
     -- contract_term is only used HERE for valuation; the forecast chart still
     -- ignores it (rolls past it as ongoing) per the file header convention.
     CAST(
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
         * CASE
             WHEN c.start_date IS NULL    THEN 0
             WHEN c.cancellation_date IS NOT NULL
@@ -296,7 +304,7 @@ SELECT
     --   2. contract_term in future → months(today → contract_term)
     --   3. Otherwise (rolling)     → 12 (12-month forward assumption)
     CAST(
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
         * CASE
             WHEN c.cancellation_date IS NOT NULL
                 THEN CASE
@@ -333,7 +341,7 @@ SELECT
     -- price = NULL or 0 in Nexudus (root cause E). Fix: set product price in Nexudus.
     -- Suppressed for negative-fee adjustment contracts (no list price expected).
     CASE
-        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 0
+        WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 0
         WHEN ISNULL(pl.list_monthly_fee, 0) = 0 THEN 1
         ELSE 0
     END                                 AS list_price_missing,
@@ -341,7 +349,7 @@ SELECT
     -- 1 when sold_monthly_fee is negative — discount / credit / refund contract.
     -- These contribute zero capacity and negative revenue to aggregates.
     CASE
-        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+        WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 1
         ELSE 0
     END                                 AS is_negative_adjustment,
 
@@ -417,7 +425,7 @@ WHERE c.is_deleted = 0
   -- is also zero or positive.
   AND (
       pl.contract_source_id IS NOT NULL
-      OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+      OR COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
   );
 GO
 
@@ -577,11 +585,13 @@ contract_facts AS (
         -- delta of €20–180 (e.g. EBCONT 1417662289: price=-1149,
         -- price_with_products=-1224). Using `price` matches what Nexudus's
         -- own UI shows. Positive contracts keep using price_with_products
-        -- so add-on fees still count.
+        -- so add-on fees still count — but via NULLIF(...,0) so a spurious
+        -- price_with_products = 0 (Nexudus glitch) falls through to `price`
+        -- instead of zeroing the line.
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
-                THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
-            ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
+                THEN COALESCE(c.price, NULLIF(c.price_with_products, 0), c.tariff_price, 0)
+            ELSE COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
         END                          AS sold_monthly_fee,
         -- Whether this contract's tariff is a "Membership Fee" financial
         -- account. Used downstream to make sure parking/ancillary discounts
@@ -607,7 +617,7 @@ contract_facts AS (
         ISNULL(pl.private_office_list_fee, 0) AS private_office_list_fee,
         ISNULL(pl.is_pure_private_office, 0)  AS is_pure_private_office,
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 1
             ELSE 0
         END                          AS is_negative_adjustment
     FROM silver.nexudus_contracts c
@@ -646,12 +656,12 @@ contract_facts AS (
       --      They contribute fee to revenue, 0 to capacity.
       AND (
           pl.contract_source_id IS NOT NULL
-          OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+          OR COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0
               AND c.cancelled = 0
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
-              AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+              AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
           )
       )
 ),
@@ -962,7 +972,7 @@ contract_facts AS (
         )                                 AS member_company_name,
         c.coworker_name,
         c.tariff_name,
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS sold_monthly_fee,
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS sold_monthly_fee,
         ISNULL(pl.list_monthly_fee, 0)    AS list_monthly_fee,
         pl.capacity,
         ISNULL(pl.private_office_capacity, 0) AS private_office_capacity,
@@ -971,7 +981,7 @@ contract_facts AS (
         CAST(c.cancellation_date AS DATE) AS cancellation_date,
         CAST(DATEADD(HOUR, 4, c.start_date) AS DATE) AS effective_start_date,
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 1
             ELSE 0
         END                               AS is_negative_adjustment
     FROM silver.nexudus_contracts c
@@ -992,12 +1002,12 @@ contract_facts AS (
       -- See that view for the rationale on each branch.
       AND (
           pl.contract_source_id IS NOT NULL
-          OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+          OR COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0
               AND c.cancelled = 0
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
-              AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+              AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
           )
       )
 )
@@ -1328,7 +1338,7 @@ followup_candidates AS (
         c.source_id                                                AS followup_contract_id,
         CAST(c.start_date AS DATE)                                 AS followup_start,
         DATEDIFF(DAY, b.cancellation_date, CAST(c.start_date AS DATE)) AS gap_days,
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS followup_fee,
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS followup_fee,
         CAST(
             CASE
                 WHEN c.cancellation_date IS NOT NULL THEN c.cancellation_date
@@ -1359,7 +1369,7 @@ followup_candidates AS (
         -- contract's value is still tracked in `base.contract_value` — adding
         -- the two at the SELECT below gives the company's committed total.
         CAST(
-            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
             * CASE
                 WHEN c.start_date IS NULL    THEN 0
                 WHEN c.cancellation_date IS NOT NULL
@@ -1379,7 +1389,7 @@ followup_candidates AS (
         --   - contract_term in future → months(today_or_start → contract_term)
         --   - else (rolling)          → 12 (12-month forward horizon)
         CAST(
-            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
             * CASE
                 WHEN c.cancellation_date IS NOT NULL
                     THEN CASE
@@ -1415,7 +1425,7 @@ followup_candidates AS (
         AND COALESCE(NULLIF(c.coworker_company, N''), c.coworker_billing_name, c.coworker_name)
             = b.member_company_name
         AND c.is_deleted = 0
-        AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+        AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
         AND CAST(c.start_date AS DATE) >= b.cancellation_date
         AND (
             c.active = 1
