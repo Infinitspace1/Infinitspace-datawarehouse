@@ -49,6 +49,9 @@ This project runs scheduled Azure Functions that ingest operational data into Az
   - Writes typed accounts to `silver.xero_accounts`
   - Writes typed invoices to `silver.xero_invoices`
   - Writes line items to `silver.xero_invoice_line_items`
+  - Writes monthly Xero-computed Profit & Loss reports to `bronze.xero_profit_loss_reports`
+  - Writes flattened P&L account and summary rows to `silver.xero_profit_loss_accounts`
+  - Exposes the budget-tool shape through `silver.vw_xero_profit_loss_monthly_accounts`
   - Refreshes the Xero tenant directory in `silver.xero_tenants`
   - Exposes the same directory through `xero.silver_tenants`
   - Nightly caches PDFs for invoices still missing `pdf_blob_path` into `bronze.xero_invoice_pdfs`
@@ -255,6 +258,7 @@ For local queue-trigger testing, also set `AzureWebJobsStorage` in `local.settin
 .\venv\Scripts\python.exe scripts\python_scripts\xero_list_tenants.py --owner-type workspace --owner-id default
 .\venv\Scripts\python.exe scripts\python_scripts\xero_get_connections.py --owner-type workspace --owner-id default
 .\venv\Scripts\python.exe scripts\python_scripts\xero_sync_invoices.py --owner-type workspace --owner-id default
+.\venv\Scripts\python.exe scripts\python_scripts\xero_sync_profit_loss.py --from-month 2024-01 --force-full
 .\venv\Scripts\python.exe scripts\python_scripts\xero_list_invoices.py --owner-type workspace --owner-id default --top 20
 ```
 
@@ -274,10 +278,12 @@ The supported production path is DB-backed, not `.env` refresh-token rotation:
 - Account metadata is stored in `silver.xero_accounts`
 - Tenant-to-location directory rows are stored in `silver.xero_tenants`
 - `xero.silver_tenants` is a view alias for the same directory
+- Monthly Xero-computed P&L rows are stored in `silver.xero_profit_loss_accounts`
+- Budget-tool reads can use `silver.vw_xero_profit_loss_monthly_accounts`, which aliases `currency_code` to `currency`
 - Automatic refresh happens in `shared/xero/client.py`
 - If Xero returns `invalid_grant`, the connection is marked disconnected
 
-Recommended Xero scopes now include `accounting.settings.read` so the sync can read account names for finance-dashboard classification. Existing connections without that scope will continue syncing invoices, but account sync will be skipped until the app is re-authorized.
+Recommended Xero scopes now include `accounting.settings.read` so the sync can read account names/base currency and `accounting.reports.read` so it can read monthly Profit & Loss reports. Existing connections without those scopes will continue syncing invoices, but account/report syncs will be skipped until the app is re-authorized.
 
 Recommended verification:
 
@@ -431,6 +437,7 @@ ORDER BY tenant_name;
 - `Writing Xero invoices page`
 - `Xero invoice sync complete`
 - `Xero PDF cache complete: {pdfs_cached: N, pdfs_failed: N, pdfs_total: N}`
+- `Xero Profit & Loss sync complete`
 - tenant directory refresh stats inside the final Xero sync payload
 
 ### Expected CoStar Logs
@@ -448,6 +455,7 @@ ORDER BY tenant_name;
 - Xero OAuth, token refresh, tenant storage, and invoice sync: done
 - Xero accounts sync: done
 - Xero invoice PDF caching: done
+- Xero Profit & Loss monthly report sync: done
 - Xero tenant-to-location directory: done
 - BambooHR employee sync: done
 - Reply.io stats sync: done

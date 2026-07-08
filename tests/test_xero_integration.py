@@ -311,6 +311,68 @@ class TestXeroIntegration(unittest.TestCase):
         self.assertIn("/api.xro/2.0/Accounts", mock_request.call_args.kwargs["url"])
         self.assertEqual(mock_request.call_args.kwargs["headers"]["xero-tenant-id"], "tenant-alt")
 
+    def test_get_organisation_uses_organisation_endpoint(self):
+        oauth = FakeOAuth()
+        store = FakeStore()
+        store._connection = StoredXeroConnection(
+            id=1,
+            owner_type="workspace",
+            owner_id="default",
+            xero_user_id="xero-user-1",
+            access_token="access-ok",
+            refresh_token="refresh-ok",
+            id_token=None,
+            scope="offline_access accounting.settings.read",
+            token_type="Bearer",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=60),
+            selected_xero_tenant_id="tenant-xyz",
+            is_connected=True,
+            last_error=None,
+        )
+        client = XeroApiClient(store=store, oauth_service=oauth)
+
+        with patch("shared.xero.client.requests.request") as mock_request:
+            mock_request.return_value = FakeResponse(payload={"Organisations": []})
+            client.get_organisation(tenant_id="tenant-alt")
+
+        self.assertIn("/api.xro/2.0/Organisation", mock_request.call_args.kwargs["url"])
+        self.assertEqual(mock_request.call_args.kwargs["headers"]["xero-tenant-id"], "tenant-alt")
+
+    def test_get_profit_and_loss_uses_report_endpoint_and_standard_layout(self):
+        oauth = FakeOAuth()
+        store = FakeStore()
+        store._connection = StoredXeroConnection(
+            id=1,
+            owner_type="workspace",
+            owner_id="default",
+            xero_user_id="xero-user-1",
+            access_token="access-ok",
+            refresh_token="refresh-ok",
+            id_token=None,
+            scope="offline_access accounting.reports.read",
+            token_type="Bearer",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=60),
+            selected_xero_tenant_id="tenant-xyz",
+            is_connected=True,
+            last_error=None,
+        )
+        client = XeroApiClient(store=store, oauth_service=oauth)
+
+        with patch("shared.xero.client.requests.request") as mock_request:
+            mock_request.return_value = FakeResponse(payload={"Reports": []})
+            client.get_profit_and_loss(
+                from_date="2026-06-01",
+                to_date="2026-06-30",
+                tenant_id="tenant-alt",
+            )
+
+        kwargs = mock_request.call_args.kwargs
+        self.assertIn("/api.xro/2.0/Reports/ProfitAndLoss", kwargs["url"])
+        self.assertEqual(kwargs["headers"]["xero-tenant-id"], "tenant-alt")
+        self.assertEqual(kwargs["params"]["fromDate"], "2026-06-01")
+        self.assertEqual(kwargs["params"]["toDate"], "2026-06-30")
+        self.assertEqual(kwargs["params"]["standardLayout"], "true")
+
     def test_get_invoice_pdf_requests_pdf_accept_header(self):
         oauth = FakeOAuth()
         store = FakeStore()

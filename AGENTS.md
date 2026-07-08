@@ -107,6 +107,9 @@ Xero API
   -> bronze.xero_invoices
   -> silver.xero_invoices (pdf_blob_path populated when PDF is cached)
   -> silver.xero_invoice_line_items
+  -> bronze.xero_profit_loss_reports
+  -> silver.xero_profit_loss_accounts
+  -> silver.vw_xero_profit_loss_monthly_accounts
   -> silver.xero_tenants
   -> xero.silver_tenants (view alias)
   -> optional bronze.xero_invoice_pdfs
@@ -240,6 +243,7 @@ Infinitspace-datawarehouse/
       store.py
       client.py
       invoice_sync.py
+      profit_loss_sync.py
       tenant_directory.py
     integrations/
       xero_nexudus_overdue.py
@@ -272,6 +276,7 @@ Infinitspace-datawarehouse/
       xero_list_tenants.py
       xero_sync_invoices.py
       xero_list_invoices.py
+      xero_sync_profit_loss.py
       xero_download_invoice_pdf.py
       xero_test_contacts.py
       xero_test_invoices.py
@@ -301,6 +306,7 @@ Infinitspace-datawarehouse/
       nexudus_billing_sync_schema.sql
       nexudus_coworker_invoice_lines_schema.sql
       xero_invoices_schema.sql
+      xero_profit_loss_schema.sql
       xero_pdf_blob_migration.sql
       test.sql
   tests/
@@ -334,7 +340,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 | `bronze_to_silver` | `functions/silver_nexudus.py` | timer | `0 30 2 * * *` | enqueues 8 queue messages (includes coworker_invoice_lines) |
 | `silver_entity_worker` | `functions/silver_worker.py` | queue | `silver-sync-tasks` | one entity per invocation |
 | `refresh_ava_availability` | `functions/ava_refresh.py` | timer | `0 0 3 * * *` | executes AVA stored procedure |
-| `xero_invoice_sync` | `functions/xero_sync.py` | timer | `0 0 4 * * *` | syncs all linked Xero tenants + caches PDFs for invoices missing `pdf_blob_path`; reuses the backfill retry/throttle flow |
+| `xero_invoice_sync` | `functions/xero_sync.py` | timer | `0 0 4 * * *` | syncs all linked Xero tenants + caches PDFs for invoices missing `pdf_blob_path`; also ingests monthly Xero Profit & Loss reports |
 | admin HTTP routes | `functions/integrations_admin.py` | HTTP | on-demand | only when `ENABLE_ADMIN_FUNCTIONS=1` |
 | `test_connections` | `functions/admin_health.py` | HTTP | on-demand | only when `ENABLE_ADMIN_FUNCTIONS=1` |
 | `run_costar_extractor` | `functions/real_estate_costar.py` | HTTP POST | `real-estate/costar/run` | only when `ENABLE_REAL_ESTATE_FUNCTIONS=1` — enqueues only, returns 202 |
@@ -371,6 +377,7 @@ Legacy Xero helper scripts still exist, but the supported path is now:
 - `bronze.nexudus_coworker_invoices`
 - `bronze.nexudus_coworkers`
 - `bronze.xero_invoices`
+- `bronze.xero_profit_loss_reports` — one raw Xero P&L report payload per tenant/month
 - `bronze.xero_invoice_pdfs` — stores `blob_path` reference, not raw bytes
 - `bronze.bamboohr_employees`
 - `bronze.nexudus_coworker_invoice_lines`
@@ -397,6 +404,8 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
 - `silver.nexudus_coworkers`
 - `silver.xero_invoices` — includes `pdf_blob_path`, `pdf_cached_at`
 - `silver.xero_invoice_line_items`
+- `silver.xero_profit_loss_accounts` — monthly Xero-computed P&L account and summary rows; includes `section`, `amount`, `currency_code`, and `is_summary`
+- `silver.vw_xero_profit_loss_monthly_accounts` — budget-tool shape with `currency_code AS currency`
 - `silver.xero_tenants`
 - `silver.location_nearby_pois`
 - `silver.location_transit_stations`
@@ -500,6 +509,15 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
   - `cache_missing_pdfs()` runs after sync — fetches PDFs for any invoice with no `pdf_blob_path`
   - reuses the same retry/throttle flow as `scripts/python_scripts/backfill_xero_pdfs.py`
   - does not use `RunTracker`
+- `shared/xero/profit_loss_sync.py`
+  - calls `GET /api.xro/2.0/Reports/ProfitAndLoss` once per tenant/month with `standardLayout=true`
+  - stores raw report payloads in `bronze.xero_profit_loss_reports`
+  - flattens account rows and `SummaryRow` totals into `silver.xero_profit_loss_accounts`
+  - exposes `silver.vw_xero_profit_loss_monthly_accounts` with `currency` alias for budget-tool reads
+  - gets report currency from `GET /api.xro/2.0/Organisation` base currency
+  - defaults to historical coverage from `2024-01` through the latest complete month
+  - on each regular run, fills missing months and re-pulls the last 3 complete months for late accounting entries
+  - requires `accounting.reports.read`; missing report/settings scope skips that tenant without failing the whole Xero timer
 - `shared/xero/tenant_directory.py`
   - matches legal Xero tenant names to Nexudus locations
   - preserves any manually maintained `community_manager_name`
@@ -666,6 +684,7 @@ Operational note:
 - `Writing Xero invoices page`
 - `Xero invoice sync complete`
 - `Xero PDF cache complete: {pdfs_cached: N, pdfs_failed: N, pdfs_total: N}`
+- `Xero Profit & Loss sync complete`
 - possible warning: `Some tenants failed during Xero sync`
 - final Xero sync stats include nested `tenant_directory` refresh results
 
@@ -711,8 +730,12 @@ XERO_CLIENT_ID=...
 XERO_CLIENT_SECRET=...
 XERO_REDIRECT_URI=https://...
 XERO_POST_AUTH_REDIRECT_URI=...
-XERO_SCOPES="offline_access accounting.invoices accounting.payments ..."
+XERO_SCOPES="offline_access accounting.invoices accounting.payments accounting.settings.read accounting.reports.read ..."
 INTEGRATIONS_ENCRYPTION_KEY=...
+XERO_PROFIT_LOSS_BACKFILL_START=2024-01
+XERO_PROFIT_LOSS_REFRESH_MONTHS=3
+XERO_PROFIT_LOSS_SYNC_FORCE_FULL=0
+XERO_PROFIT_LOSS_INCLUDE_CURRENT_MONTH=0
 
 # Reply.io
 REPLY_IO_API_KEY=...
@@ -803,6 +826,7 @@ Xero validation:
 .\venv\Scripts\python.exe scripts\python_scripts\xero_complete_oauth.py --redirect-url "<full redirect url>"
 .\venv\Scripts\python.exe scripts\python_scripts\xero_get_connections.py --owner-type workspace --owner-id default
 .\venv\Scripts\python.exe scripts\python_scripts\xero_sync_invoices.py --owner-type workspace --owner-id default
+.\venv\Scripts\python.exe scripts\python_scripts\xero_sync_profit_loss.py --owner-type workspace --owner-id default --from-month 2024-01 --force-full
 .\venv\Scripts\python.exe scripts\python_scripts\xero_list_invoices.py --owner-type workspace --owner-id default --top 20
 .\venv\Scripts\python.exe -m unittest tests.test_xero_integration tests.test_xero_tenant_directory tests.test_xero_nexudus_invoice_linking
 ```
@@ -927,6 +951,7 @@ az functionapp config appsettings set `
 | Xero invoice sync | done | incremental by tenant |
 | Xero tenant directory | done | refreshed after Xero sync and exposed as `xero.silver_tenants` |
 | Xero invoice PDF caching | done | blob storage (`xero-invoice-pdfs`); path in `silver.xero_invoices.pdf_blob_path`; auto-cached nightly for invoices missing `pdf_blob_path` |
+| Xero Profit & Loss sync | done | monthly Xero-computed P&L account + summary rows in `silver.xero_profit_loss_accounts`; backfills from 2024-01 and refreshes recent months |
 | Nexudus coworker invoices + coworkers | done | incremental via UpdatedSince watermark |
 | Xero ↔ Nexudus invoice linking | done | `silver.xero_overdue_invoice_contacts` view; 5/12 tenants connected |
 | Optional admin HTTP routes | done | separate deployment mode |

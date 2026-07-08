@@ -58,6 +58,34 @@ class XeroApiClient:
             tenant_id=tenant_id,
         )
 
+    def get_organisation(
+        self,
+        tenant_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return self.request(
+            method="GET",
+            path="/api.xro/2.0/Organisation",
+            tenant_id=tenant_id,
+        )
+
+    def get_profit_and_loss(
+        self,
+        from_date: Any,
+        to_date: Any,
+        tenant_id: Optional[str] = None,
+        standard_layout: bool = True,
+    ) -> dict[str, Any]:
+        return self.request(
+            method="GET",
+            path="/api.xro/2.0/Reports/ProfitAndLoss",
+            params={
+                "fromDate": from_date.isoformat() if hasattr(from_date, "isoformat") else str(from_date),
+                "toDate": to_date.isoformat() if hasattr(to_date, "isoformat") else str(to_date),
+                "standardLayout": "true" if standard_layout else "false",
+            },
+            tenant_id=tenant_id,
+        )
+
     def get_invoice(
         self,
         invoice_id: str,

@@ -17,6 +17,7 @@ import azure.functions as func
 
 from shared.xero.bank_transaction_sync import XeroBankTransactionSyncService
 from shared.xero.invoice_sync import XeroInvoiceSyncService
+from shared.xero.profit_loss_sync import XeroProfitLossSyncService
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,25 @@ async def xero_invoice_sync(timer: func.TimerRequest) -> None:
             logger.warning(
                 "Bank transactions skipped for tenants missing the accounting.banktransactions scope",
                 extra={"skipped": bank_stats["scope_skipped_tenant_ids"]},
+            )
+
+        # Monthly Xero-computed Profit & Loss. This is the canonical budget-tool
+        # actuals feed because it includes invoices, credit notes, payroll
+        # journals, deferred income, and other Xero-native postings by design.
+        profit_loss_force_full = os.getenv("XERO_PROFIT_LOSS_SYNC_FORCE_FULL", "0") == "1"
+        profit_loss_stats = XeroProfitLossSyncService().sync_profit_loss(
+            owner_type="workspace",
+            owner_id="default",
+            force_full=profit_loss_force_full,
+        )
+        logger.info(
+            "Xero Profit & Loss sync complete",
+            extra={"profit_loss_stats": json.dumps(profit_loss_stats, default=str)},
+        )
+        if profit_loss_stats.get("scope_skipped_tenant_ids"):
+            logger.warning(
+                "Profit & Loss skipped for tenants missing accounting.reports.read/settings scope",
+                extra={"skipped": profit_loss_stats["scope_skipped_tenant_ids"]},
             )
 
     except Exception:
