@@ -15,6 +15,7 @@ import os
 
 import azure.functions as func
 
+from shared.xero.bank_transaction_sync import XeroBankTransactionSyncService
 from shared.xero.invoice_sync import XeroInvoiceSyncService
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,26 @@ async def xero_invoice_sync(timer: func.TimerRequest) -> None:
         # This reuses the shared backfill logic so the ETL timer gets retry/pacing safeguards too.
         pdf_stats = service.cache_missing_pdfs()
         logger.info("Xero PDF cache complete", extra={"pdf_stats": json.dumps(pdf_stats, default=str)})
+
+        # Bank transactions (spend/receive money) — bank fees never appear on
+        # ACCPAY invoices, so these feed the P&L actuals gap. Requires the
+        # accounting.banktransactions[.read] scope; tenants on a token missing
+        # it are skipped with a warning until the OAuth re-consent lands.
+        bank_force_full = os.getenv("XERO_BANK_TX_SYNC_FORCE_FULL", "0") == "1"
+        bank_stats = XeroBankTransactionSyncService().sync_bank_transactions(
+            owner_type="workspace",
+            owner_id="default",
+            force_full=bank_force_full,
+        )
+        logger.info(
+            "Xero bank transaction sync complete",
+            extra={"bank_stats": json.dumps(bank_stats, default=str)},
+        )
+        if bank_stats.get("scope_skipped_tenant_ids"):
+            logger.warning(
+                "Bank transactions skipped for tenants missing the accounting.banktransactions scope",
+                extra={"skipped": bank_stats["scope_skipped_tenant_ids"]},
+            )
 
     except Exception:
         logger.exception("Xero invoice sync failed")

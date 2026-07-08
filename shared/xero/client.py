@@ -92,6 +92,27 @@ class XeroApiClient:
             extra_headers=extra_headers or None,
         )
 
+    def get_bank_transactions(
+        self,
+        page: int = 1,
+        tenant_id: Optional[str] = None,
+        if_modified_since: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Paginated bank transactions (spend/receive money). Line items are
+        included when the page parameter is used. Requires the
+        accounting.banktransactions[.read] scope."""
+        extra_headers: dict[str, str] = {}
+        if if_modified_since is not None:
+            extra_headers["If-Modified-Since"] = if_modified_since.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+        return self.request(
+            method="GET",
+            path="/api.xro/2.0/BankTransactions",
+            params={"page": page},
+            tenant_id=tenant_id,
+            extra_headers=extra_headers or None,
+        )
+
     def get_invoice_pdf(
         self,
         invoice_id: str,
