@@ -128,7 +128,7 @@ class XeroApiClient:
     ) -> dict[str, Any]:
         """Paginated bank transactions (spend/receive money). Line items are
         included when the page parameter is used. Requires the
-        accounting.banktransactions[.read] scope."""
+        accounting.transactions.read scope."""
         extra_headers: dict[str, str] = {}
         if if_modified_since is not None:
             extra_headers["If-Modified-Since"] = if_modified_since.strftime("%a, %d %b %Y %H:%M:%S GMT")

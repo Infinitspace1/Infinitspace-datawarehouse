@@ -57,7 +57,7 @@ async def xero_invoice_sync(timer: func.TimerRequest) -> None:
 
         # Bank transactions (spend/receive money) — bank fees never appear on
         # ACCPAY invoices, so these feed the P&L actuals gap. Requires the
-        # accounting.banktransactions[.read] scope; tenants on a token missing
+        # accounting.transactions.read scope; tenants on a token missing
         # it are skipped with a warning until the OAuth re-consent lands.
         bank_force_full = os.getenv("XERO_BANK_TX_SYNC_FORCE_FULL", "0") == "1"
         bank_stats = XeroBankTransactionSyncService().sync_bank_transactions(
@@ -71,7 +71,7 @@ async def xero_invoice_sync(timer: func.TimerRequest) -> None:
         )
         if bank_stats.get("scope_skipped_tenant_ids"):
             logger.warning(
-                "Bank transactions skipped for tenants missing the accounting.banktransactions scope",
+                "Bank transactions skipped for tenants missing the accounting.transactions.read scope",
                 extra={"skipped": bank_stats["scope_skipped_tenant_ids"]},
             )
 

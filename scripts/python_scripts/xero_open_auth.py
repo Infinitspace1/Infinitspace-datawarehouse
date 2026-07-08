@@ -36,8 +36,8 @@ scopes = os.getenv(
         "accounting.contacts accounting.contacts.read "
         "accounting.invoices accounting.invoices.read "
         "accounting.payments accounting.payments.read "
-        "accounting.banktransactions accounting.banktransactions.read "
-        "accounting.manualjournals accounting.manualjournals.read"
+        "accounting.transactions accounting.transactions.read "
+        "accounting.settings.read accounting.reports.read"
     ),
 )
 
