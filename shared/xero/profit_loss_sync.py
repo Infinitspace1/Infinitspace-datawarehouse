@@ -361,7 +361,7 @@ class XeroProfitLossSyncService:
                         self._mark_failed(
                             connection.id,
                             current_tenant_id,
-                            f"HTTP {status}; token likely missing accounting.reports.read or accounting.settings.read",
+                            f"HTTP {status}; token likely missing accounting.reports.profitandloss.read or accounting.settings.read",
                         )
                     logger.warning(
                         "Skipping Xero Profit & Loss sync (missing scope or access)",

@@ -283,7 +283,7 @@ The supported production path is DB-backed, not `.env` refresh-token rotation:
 - Automatic refresh happens in `shared/xero/client.py`
 - If Xero returns `invalid_grant`, the connection is marked disconnected
 
-Recommended Xero scopes now include `accounting.settings.read` so the sync can read account names/base currency and `accounting.reports.read` so it can read monthly Profit & Loss reports. Existing connections without those scopes will continue syncing invoices, but account/report syncs will be skipped until the app is re-authorized.
+Recommended Xero scopes now include `accounting.settings.read` so the sync can read account names/base currency and `accounting.reports.profitandloss.read` so it can read monthly Profit & Loss reports. Existing connections without those scopes will continue syncing invoices, but account/report syncs will be skipped until the app is re-authorized.
 
 Recommended verification:
 

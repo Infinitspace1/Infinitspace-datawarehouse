@@ -517,7 +517,7 @@ tables and downstream reads must filter `WHERE is_deleted = 0`.
   - gets report currency from `GET /api.xro/2.0/Organisation` base currency
   - defaults to historical coverage from `2024-01` through the latest complete month
   - on each regular run, fills missing months and re-pulls the last 3 complete months for late accounting entries
-  - requires `accounting.reports.read`; missing report/settings scope skips that tenant without failing the whole Xero timer
+  - requires `accounting.reports.profitandloss.read`; missing report/settings scope skips that tenant without failing the whole Xero timer
 - `shared/xero/tenant_directory.py`
   - matches legal Xero tenant names to Nexudus locations
   - preserves any manually maintained `community_manager_name`
@@ -730,7 +730,7 @@ XERO_CLIENT_ID=...
 XERO_CLIENT_SECRET=...
 XERO_REDIRECT_URI=https://...
 XERO_POST_AUTH_REDIRECT_URI=...
-XERO_SCOPES="offline_access accounting.contacts.read accounting.transactions.read accounting.settings.read accounting.reports.read"
+XERO_SCOPES="offline_access accounting.settings accounting.settings.read accounting.invoices accounting.invoices.read accounting.payments accounting.payments.read accounting.banktransactions accounting.banktransactions.read accounting.manualjournals accounting.manualjournals.read accounting.reports.profitandloss.read"
 INTEGRATIONS_ENCRYPTION_KEY=...
 XERO_PROFIT_LOSS_BACKFILL_START=2024-01
 XERO_PROFIT_LOSS_REFRESH_MONTHS=3

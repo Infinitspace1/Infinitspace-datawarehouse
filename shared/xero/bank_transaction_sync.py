@@ -15,7 +15,7 @@ Data model:
   - silver.xero_bank_transaction_line_items   typed line items
   - silver.vw_xero_bank_transaction_pnl_lines P&L serving view (net of tax)
 
-Scope: requires accounting.transactions.read on the stored token. A
+Scope: requires accounting.banktransactions[.read] on the stored token. A
 tenant hitting 401/403 is skipped with a warning (same pattern as the accounts
 sync in invoice_sync), so this can be deployed BEFORE the OAuth re-consent —
 data starts flowing the night after the consent lands, without a redeploy.
@@ -228,7 +228,7 @@ class XeroBankTransactionSyncService:
                         self._mark_failed(
                             connection.id,
                             current_tenant_id,
-                            f"HTTP {status} — token likely missing accounting.transactions.read scope",
+                            f"HTTP {status} — token likely missing accounting.banktransactions scope",
                         )
                     logger.warning(
                         "Skipping Xero bank transactions sync (missing scope or access)",

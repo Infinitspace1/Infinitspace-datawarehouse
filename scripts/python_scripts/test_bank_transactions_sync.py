@@ -6,7 +6,7 @@ Local harness for the Xero bank transactions sync.
 Default (dry run, read-only against the API):
   - lists tenants on the stored connection
   - probes GET /BankTransactions page 1 per tenant — a 403 means the token
-    is still missing the accounting.transactions.read scope
+    is still missing the accounting.banktransactions[.read] scope
   - prints a sample payload + its transformed silver header/lines
 
 Options:
@@ -53,8 +53,8 @@ def dry_run(args) -> None:
         return
     print(f"connection_id={connection.id} is_connected={connection.is_connected}")
     print(f"granted scope: {connection.scope}")
-    if connection.scope and "accounting.transactions.read" not in connection.scope:
-        print(">>> The stored token does NOT include accounting.transactions.read — expect 403s below.")
+    if connection.scope and "accounting.banktransactions" not in connection.scope:
+        print(">>> The stored token does NOT include accounting.banktransactions — expect 403s below.")
 
     tenants = store.list_tenants(connection_id=connection.id)
     if args.tenant:

@@ -82,7 +82,7 @@ class FakeStore:
             access_token="access-ok",
             refresh_token="refresh-ok",
             id_token=None,
-            scope="offline_access accounting.reports.read accounting.settings.read",
+            scope="offline_access accounting.reports.profitandloss.read accounting.settings.read",
             token_type="Bearer",
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=60),
             selected_xero_tenant_id="tenant-1",

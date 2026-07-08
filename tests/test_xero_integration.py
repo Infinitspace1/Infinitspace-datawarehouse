@@ -349,7 +349,7 @@ class TestXeroIntegration(unittest.TestCase):
             access_token="access-ok",
             refresh_token="refresh-ok",
             id_token=None,
-            scope="offline_access accounting.reports.read",
+            scope="offline_access accounting.reports.profitandloss.read",
             token_type="Bearer",
             expires_at=datetime.now(timezone.utc) + timedelta(minutes=60),
             selected_xero_tenant_id="tenant-xyz",

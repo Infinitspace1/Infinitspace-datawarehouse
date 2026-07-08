@@ -28,14 +28,18 @@ XERO_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize"
 client_id = os.getenv("XERO_CLIENT_ID")
 redirect_uri = os.getenv("XERO_REDIRECT_URI", "https://xero.com")
 
-# New granular scopes required for apps created after 2 March 2026
+# The app runs in GRANULAR permissions mode: broad accounting.transactions[.read]
+# scopes are rejected with invalid_scope. Use the granular family.
 scopes = os.getenv(
     "XERO_SCOPES",
     (
         "offline_access "
-        "accounting.contacts.read "
-        "accounting.transactions.read "
-        "accounting.settings.read accounting.reports.read"
+        "accounting.settings accounting.settings.read "
+        "accounting.invoices accounting.invoices.read "
+        "accounting.payments accounting.payments.read "
+        "accounting.banktransactions accounting.banktransactions.read "
+        "accounting.manualjournals accounting.manualjournals.read "
+        "accounting.reports.profitandloss.read"
     ),
 )
 
