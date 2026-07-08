@@ -34,7 +34,6 @@ scopes = os.getenv(
     (
         "openid offline_access "
         "accounting.contacts accounting.contacts.read "
-        "accounting.invoices accounting.invoices.read "
         "accounting.payments accounting.payments.read "
         "accounting.transactions accounting.transactions.read "
         "accounting.settings.read accounting.reports.read"
