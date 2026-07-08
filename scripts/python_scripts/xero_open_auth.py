@@ -32,10 +32,9 @@ redirect_uri = os.getenv("XERO_REDIRECT_URI", "https://xero.com")
 scopes = os.getenv(
     "XERO_SCOPES",
     (
-        "openid offline_access "
-        "accounting.contacts accounting.contacts.read "
-        "accounting.payments accounting.payments.read "
-        "accounting.transactions accounting.transactions.read "
+        "offline_access "
+        "accounting.contacts.read "
+        "accounting.transactions.read "
         "accounting.settings.read accounting.reports.read"
     ),
 )

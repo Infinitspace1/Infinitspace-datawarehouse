@@ -50,7 +50,7 @@ class XeroOAuthService:
         self.redirect_uri = redirect_uri or os.getenv("XERO_REDIRECT_URI")
         self.scopes = scopes or os.getenv(
             "XERO_SCOPES",
-            "offline_access accounting.transactions accounting.contacts accounting.settings.read",
+            "offline_access accounting.contacts.read accounting.transactions.read accounting.settings.read accounting.reports.read",
         )
         self.timeout_seconds = timeout_seconds
         self.leeway_seconds = leeway_seconds
