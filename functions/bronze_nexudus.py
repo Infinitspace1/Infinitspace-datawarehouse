@@ -29,6 +29,15 @@ Incremental sync:
   coworker_invoices uses from_CoworkerInvoice_UpdatedOn with a 3-day
   lookback window — no watermark dependency.
 
+  open-invoice resync (2026-07-16): Nexudus does NOT bump an invoice's
+  UpdatedOn when a payment/credit is applied, so the UpdatedOn window above
+  silently freezes a settled invoice's DueAmount/PaidAmount at its last
+  in-window value — the finance dashboard then shows the full gross amount
+  for an invoice that is really almost paid. _resync_open_invoices re-fetches
+  every currently-open unpaid invoice OBJECT by ID (independent of UpdatedOn)
+  so its balance stays fresh. Small set (~tens of rows); the SHA-256 hash
+  check only writes genuinely-changed payloads downstream.
+
   coworker_invoice_lines fetches lines only for invoices returned by
   the coworker_invoices step (using CoworkerInvoiceLine_CoworkerInvoice
   filter per invoice).
@@ -129,6 +138,10 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
             products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
             await _sync_contracts(client, blob_writer, writer, run_id, products)
             changed_invoices = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
+            # Re-fetch every open invoice by ID so a payment/credit that Nexudus
+            # applied WITHOUT bumping UpdatedOn (invisible to the incremental
+            # window above) still refreshes its DueAmount downstream.
+            await _resync_open_invoices(client, blob_writer, writer, run_id)
             await _sync_coworkers(client, blob_writer, writer, run_id)
             await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
             await _sync_extra_services(client, blob_writer, writer, run_id)
@@ -521,6 +534,104 @@ async def _sync_coworker_invoice_lines(
             "%s written to bronze, %s errors [blob=%s]",
             len(invoice_ids),
             len(all_lines),
+            run.rows_written,
+            errors,
+            blob_path,
+        )
+
+
+def _load_open_invoice_ids(lookback_months: int) -> list[int]:
+    """Return open, unpaid invoices due from the recent window onward.
+
+    Drives the by-ID re-fetch in _resync_open_invoices. Sourced from SILVER
+    (not the raw bronze payload) so it inherits `is_deleted` — invoices removed
+    in Nexudus are soft-deleted by nexudus_invoice_reconcile, so filtering them
+    out here avoids a nightly flood of 404s re-fetching invoices that no longer
+    exist. Unlike _load_invoice_history_candidate_ids there is NO
+    direct-debit-only filter: a credit/payment on ANY invoice can be applied by
+    Nexudus without bumping its UpdatedOn, so every open invoice needs
+    refreshing. The lookback bounds the set so we never re-fetch ancient
+    invoices; comfortably covers the finance worklist's 2026-03-01 floor.
+    """
+    sql = get_sql_client()
+    rows = sql.execute_query(
+        """
+        SELECT source_id
+        FROM silver.nexudus_coworker_invoices
+        WHERE due_amount > 0
+          AND ISNULL(paid, 0) = 0
+          AND ISNULL(void, 0) = 0
+          AND ISNULL(draft, 0) = 0
+          AND ISNULL(is_deleted, 0) = 0
+          AND due_date >= DATEADD(MONTH, -?, GETUTCDATE())
+        ORDER BY source_id
+        """,
+        (lookback_months,),
+    )
+    return [int(row["source_id"]) for row in rows if row.get("source_id")]
+
+
+async def _resync_open_invoices(
+    client: NexudusClient,
+    blob_writer: BlobWriter,
+    writer: BronzeWriter,
+    run_id: uuid.UUID,
+) -> None:
+    """Re-fetch every open unpaid invoice OBJECT by ID, independent of the 2-day
+    UpdatedOn incremental window used by _sync_coworker_invoices.
+
+    Why this exists: Nexudus applies a payment/credit to an invoice WITHOUT
+    bumping its UpdatedOn (observed 2026-07-16 with UpdatedBy='[System]'). The
+    incremental fetch is keyed on from_CoworkerInvoice_UpdatedOn, so once an
+    invoice ages out of that window its DueAmount/PaidAmount freeze at the last
+    in-window value and the finance dashboard keeps showing the full gross
+    amount for an invoice that is really almost settled. Re-fetching the small
+    set of open invoices by ID keeps their balances honest. The SHA-256 hash
+    check in BronzeWriter.write_coworker_invoices means unchanged invoices cost
+    one GET and no write.
+    """
+    lookback_months = int(os.getenv("NEXUDUS_INVOICE_RESYNC_LOOKBACK_MONTHS", "12"))
+    invoice_ids = _load_open_invoice_ids(lookback_months)
+    if not invoice_ids:
+        logger.info("Open-invoice resync: no open invoices to refresh, skipping")
+        return
+
+    logger.info(
+        "Open-invoice resync: re-fetching %s open invoices by ID (due within last %s months)",
+        len(invoice_ids),
+        lookback_months,
+    )
+
+    async with RunTracker("nexudus", "coworker_invoices_resync", "bronze", metadata=str(run_id)) as run:
+        tasks = [
+            client.get_one(f"billing/coworkerinvoices/{invoice_id}")
+            for invoice_id in invoice_ids
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        records: list[dict] = []
+        errors = 0
+        for invoice_id, result in zip(invoice_ids, results):
+            if isinstance(result, Exception):
+                logger.warning("Open-invoice resync for %s failed: %s", invoice_id, result)
+                errors += 1
+                continue
+            if result:
+                records.append(result)
+
+        run.rows_read = len(invoice_ids)
+        run.rows_skipped = errors
+        if records:
+            blob_path = blob_writer.write_snapshot("coworker_invoices_resync", records, run_id)
+            _changed, run.rows_written = writer.write_coworker_invoices(records)
+        else:
+            blob_path = "none"
+            run.rows_written = 0
+
+        logger.info(
+            "Open-invoice resync: %s queried, %s fetched, %s written to bronze, %s errors [blob=%s]",
+            len(invoice_ids),
+            len(records),
             run.rows_written,
             errors,
             blob_path,
