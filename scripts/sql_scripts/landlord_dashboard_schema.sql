@@ -158,6 +158,23 @@ WITH product_link AS (
         SUM(
             CASE WHEN p.item_type = 1 THEN ISNULL(p.price, 0) ELSE 0 END
         ) AS private_office_list_fee,
+        -- ── Per-type breakdown (MMRF / MARV, added 2026-07-16) ───────────────
+        -- Workstation counts and list-price subtotals per Nexudus item_type,
+        -- used downstream to ALLOCATE the single contract-level sold fee across
+        -- types (Nexudus stores one price per contract — see header note). The
+        -- weights below are list-price shares. private_office_* (item_type 1)
+        -- already exist above and serve as the type-1 slice.
+        --   MMRF = type 1 (Private Office) + 2 (Dedicated Desk) + 3 (Hot Desk)
+        --   MARV = type 4 (Other: parking/storeroom) here; type 5 (Meeting Room)
+        --          recurring is a data-quality exclusion (kept out of the join at
+        --          item_type IN (1,2,3,4) below), so ad-hoc meeting-room revenue
+        --          is sourced separately from invoice lines, not from contracts.
+        SUM(CASE WHEN p.item_type = 2 THEN 1 ELSE 0 END)             AS dedicated_desk_capacity,
+        SUM(CASE WHEN p.item_type = 3 THEN 1 ELSE 0 END)             AS hot_desk_capacity,
+        SUM(CASE WHEN p.item_type = 4 THEN 1 ELSE 0 END)             AS additional_unit_count,
+        SUM(CASE WHEN p.item_type = 2 THEN ISNULL(p.price, 0) ELSE 0 END) AS dedicated_desk_list_fee,
+        SUM(CASE WHEN p.item_type = 3 THEN ISNULL(p.price, 0) ELSE 0 END) AS hot_desk_list_fee,
+        SUM(CASE WHEN p.item_type = 4 THEN ISNULL(p.price, 0) ELSE 0 END) AS additional_list_fee,
         CASE
             WHEN SUM(CASE WHEN p.item_type IN (2, 3) THEN 1 ELSE 0 END) = 0
              AND SUM(CASE WHEN p.item_type = 1 THEN 1 ELSE 0 END) > 0
@@ -210,6 +227,24 @@ SELECT
     ISNULL(pl.private_office_capacity, 0)    AS private_office_capacity,
     pl.private_office_list_fee,
     ISNULL(pl.is_pure_private_office, 0)     AS is_pure_private_office,
+
+    -- ── Per-type breakdown (MMRF / MARV, added 2026-07-16) ───────────────────
+    -- Per-type workstation counts (type-1 = private_office_capacity above).
+    ISNULL(pl.dedicated_desk_capacity, 0)    AS dedicated_desk_capacity,
+    ISNULL(pl.hot_desk_capacity, 0)          AS hot_desk_capacity,
+    ISNULL(pl.additional_unit_count, 0)      AS additional_unit_count,
+    -- Per-type ALLOCATED sold revenue. The single contract fee is split by each
+    -- type's list-price share (alloc.w_*), so
+    --   rev_private_office + rev_dedicated_desk + rev_hot_desk + rev_additional
+    --   = sold_monthly_fee   (reconciles exactly).
+    -- MMRF = rev_private_office + rev_dedicated_desk + rev_hot_desk (types 1/2/3)
+    -- MARV = rev_additional (type 4). See the alloc CROSS APPLY for the fallback
+    -- when list price is missing (capacity share) or absent (residual → MMRF).
+    CAST(alloc.sold_fee * alloc.w_po  AS DECIMAL(18,2)) AS rev_private_office,
+    CAST(alloc.sold_fee * alloc.w_dd  AS DECIMAL(18,2)) AS rev_dedicated_desk,
+    CAST(alloc.sold_fee * alloc.w_hd  AS DECIMAL(18,2)) AS rev_hot_desk,
+    CAST(alloc.sold_fee * alloc.w_add AS DECIMAL(18,2)) AS rev_additional,
+
     c.currency_code,
 
     -- Sold price — for adjustment contracts (price_with_products < 0), use
@@ -379,6 +414,40 @@ LEFT JOIN silver.nexudus_tariffs t
 LEFT JOIN silver.nexudus_financial_accounts fa
     ON  fa.source_id = t.financial_account_id
     AND fa.is_deleted = 0
+-- Per-type revenue allocation (added 2026-07-16). Computes the resolved sold fee
+-- once, plus the four type weights. Weight basis, in priority order:
+--   1. list_monthly_fee > 0 → each type's list-price share (sums to 1)
+--   2. else capacity > 0    → each type's workstation share (type-4 = 0 desks)
+--   3. else                 → whole fee to the private-office (MMRF) bucket,
+--                             so negative-fee adjustments / unlinked contracts
+--                             are never dropped from the per-type totals.
+CROSS APPLY (
+    SELECT
+        CASE
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
+                THEN COALESCE(c.price, NULLIF(c.price_with_products, 0), c.tariff_price, 0)
+            ELSE COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
+        END AS sold_fee,
+        CASE
+            WHEN ISNULL(pl.list_monthly_fee, 0) > 0 THEN ISNULL(pl.private_office_list_fee, 0) / pl.list_monthly_fee
+            WHEN ISNULL(pl.capacity, 0) > 0 THEN CAST(ISNULL(pl.private_office_capacity, 0) AS FLOAT) / pl.capacity
+            ELSE 1.0
+        END AS w_po,
+        CASE
+            WHEN ISNULL(pl.list_monthly_fee, 0) > 0 THEN ISNULL(pl.dedicated_desk_list_fee, 0) / pl.list_monthly_fee
+            WHEN ISNULL(pl.capacity, 0) > 0 THEN CAST(ISNULL(pl.dedicated_desk_capacity, 0) AS FLOAT) / pl.capacity
+            ELSE 0.0
+        END AS w_dd,
+        CASE
+            WHEN ISNULL(pl.list_monthly_fee, 0) > 0 THEN ISNULL(pl.hot_desk_list_fee, 0) / pl.list_monthly_fee
+            WHEN ISNULL(pl.capacity, 0) > 0 THEN CAST(ISNULL(pl.hot_desk_capacity, 0) AS FLOAT) / pl.capacity
+            ELSE 0.0
+        END AS w_hd,
+        CASE
+            WHEN ISNULL(pl.list_monthly_fee, 0) > 0 THEN ISNULL(pl.additional_list_fee, 0) / pl.list_monthly_fee
+            ELSE 0.0
+        END AS w_add
+) alloc
 WHERE c.is_deleted = 0
 
   -- Status pre-filter: active contracts and notice-period (cancelled but still in
@@ -1280,6 +1349,20 @@ WITH base AS (
         SUM(contract_value)                                     AS contract_value,
         SUM(remaining_contract_value)                           AS remaining_contract_value,
 
+        -- ── Per-type revenue split (MMRF / MARV, added 2026-07-16) ───────────
+        -- Allocated by product list-price share upstream in
+        -- vw_landlord_current_contracts, so these are NOT financial-account
+        -- filtered — they reconcile as mmrf + marv = SUM(sold_monthly_fee over
+        -- ALL the company's current contracts, all types).
+        --   MMRF (Monthly Membership Revenues Fee) = types 1+2+3
+        --   MARV (Monthly Additional Revenues Fee) = type 4 (recurring; ad-hoc
+        --         meeting-room/day-pass MARV is invoice-sourced elsewhere)
+        SUM(ISNULL(rev_private_office, 0) + ISNULL(rev_dedicated_desk, 0) + ISNULL(rev_hot_desk, 0)) AS mmrf,
+        SUM(ISNULL(rev_additional, 0))                          AS marv,
+        SUM(ISNULL(dedicated_desk_capacity, 0))                 AS dedicated_desk_capacity,
+        SUM(ISNULL(hot_desk_capacity, 0))                       AS hot_desk_capacity,
+        SUM(ISNULL(additional_unit_count, 0))                   AS additional_unit_count,
+
         -- Notice / term info: take the most conservative (longest) values
         MAX(notice_period_months)                               AS notice_period_months,
         MAX(term_months)                                        AS term_months,
@@ -1489,6 +1572,18 @@ SELECT
     b.sold_monthly_fee,
     b.list_monthly_fee,
     b.discount_value,
+
+    -- ── Per-type revenue split (MMRF / MARV, added 2026-07-16) ───────────────
+    -- MMRF (Monthly Membership Revenues Fee) = types 1+2+3 (office/dedicated/hot)
+    -- MARV (Monthly Additional Revenues Fee) = type 4 (parking/storeroom, recurring)
+    -- mmrf_per_ws = MMRF ÷ workstations (b.capacity = types 1+2+3 desks).
+    -- Contract Value / Remaining above stay TOTAL across all types (unchanged).
+    ISNULL(b.mmrf, 0)                                          AS mmrf,
+    ISNULL(b.marv, 0)                                          AS marv,
+    CAST(ISNULL(b.mmrf, 0) / NULLIF(b.capacity, 0) AS DECIMAL(18,2)) AS mmrf_per_ws,
+    ISNULL(b.dedicated_desk_capacity, 0)                      AS dedicated_desk_capacity,
+    ISNULL(b.hot_desk_capacity, 0)                            AS hot_desk_capacity,
+    ISNULL(b.additional_unit_count, 0)                        AS additional_unit_count,
 
     -- ── Contract value (FIXED 2026-05-27 to include follow-ups + re-engagements) ──
     -- Historically `contract_value` and `remaining_contract_value` exposed only
