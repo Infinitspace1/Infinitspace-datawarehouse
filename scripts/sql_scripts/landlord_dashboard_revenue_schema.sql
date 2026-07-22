@@ -311,14 +311,14 @@ contract_facts AS (
     SELECT
         c.source_id                 AS contract_source_id,
         c.location_source_id,
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS sold_monthly_fee,
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS sold_monthly_fee,
         CAST(c.start_date        AS DATE) AS start_date,
         CAST(c.cancellation_date AS DATE) AS cancellation_date,
         CAST(DATEADD(HOUR, 4, c.start_date) AS DATE) AS effective_start_date,
         pl.capacity,
         pl.list_monthly_fee,
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 1
             ELSE 0
         END                          AS is_negative_adjustment
     FROM silver.nexudus_contracts c
@@ -350,12 +350,12 @@ contract_facts AS (
       -- adjustments, and unlinked-future renewal handovers.
       AND (
           pl.contract_source_id IS NOT NULL
-          OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+          OR COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0
               AND c.cancelled = 0
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
-              AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+              AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
           )
       )
 ),
@@ -525,7 +525,7 @@ SELECT
     fa.name                                      AS financial_account_name,
     CAST(c.start_date AS DATE)                   AS start_date,
     CAST(c.cancellation_date AS DATE)            AS cancellation_date,
-    COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS monthly_fee,
+    COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS monthly_fee,
     c.floor_plan_desk_ids                        AS desk_ids_raw,
     N'unlinked_membership_contract'              AS issue_type,
     CASE
@@ -547,7 +547,7 @@ LEFT JOIN product_link pl
     ON pl.contract_source_id = c.source_id
 WHERE c.is_deleted = 0
   AND LOWER(fa.name) LIKE N'%membership fee%'
-  AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+  AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
   AND (
       c.active = 1
       OR (c.cancelled = 1 AND c.cancellation_date IS NOT NULL)
@@ -573,7 +573,7 @@ SELECT
     NULL                                         AS financial_account_name,
     CAST(c.start_date AS DATE)                   AS start_date,
     CAST(c.cancellation_date AS DATE)            AS cancellation_date,
-    COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS monthly_fee,
+    COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS monthly_fee,
     c.floor_plan_desk_ids                        AS desk_ids_raw,
     N'tariff_without_financial_account'          AS issue_type,
     N'Tariff exists but has no financial_account_id — Nexudus admin needs to set one' AS issue_detail,
@@ -586,7 +586,7 @@ INNER JOIN silver.nexudus_tariffs t
     AND t.is_deleted = 0
     AND t.financial_account_id IS NULL
 WHERE c.is_deleted = 0
-  AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+  AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
   AND (
       c.active = 1
       OR (c.cancelled = 1 AND c.cancellation_date IS NOT NULL)
@@ -686,7 +686,7 @@ SELECT
     c.active, c.cancelled, c.floor_plan_desk_ids,
     CAST(c.start_date AS DATE) AS start_date,
     CAST(c.cancellation_date AS DATE) AS cancellation_date,
-    COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS fee
+    COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS fee
 FROM silver.nexudus_contracts c
 LEFT JOIN silver.nexudus_tariffs t ON t.source_id = c.tariff_id
 LEFT JOIN silver.nexudus_locations loc ON loc.source_id = c.location_source_id

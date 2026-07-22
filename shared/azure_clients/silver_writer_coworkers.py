@@ -35,6 +35,7 @@ _MERGE_SQL = """
         do_not_process_invoices_automatically = ?,
         user_last_access = ?, registration_date = ?, renewal_date = ?, start_date = ?, cancellation_date = ?,
         created_on = ?, updated_on = ?,
+        hubspot_deal_url = ?,
         last_synced_at = GETUTCDATE()
     WHEN NOT MATCHED THEN INSERT (
         source_id, unique_id, bronze_id, sync_run_id,
@@ -51,7 +52,8 @@ _MERGE_SQL = """
         notify_on_new_invoice, notify_on_new_payment, notify_on_failed_payment,
         do_not_process_invoices_automatically,
         user_last_access, registration_date, renewal_date, start_date, cancellation_date,
-        created_on, updated_on
+        created_on, updated_on,
+        hubspot_deal_url
     ) VALUES (
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
@@ -67,7 +69,8 @@ _MERGE_SQL = """
         ?, ?, ?,
         ?,
         ?, ?, ?, ?, ?,
-        ?, ?
+        ?, ?,
+        ?
     );
 """
 
@@ -125,5 +128,6 @@ class SilverCoworkersWriter:
             coworker["do_not_process_invoices_automatically"],
             coworker["user_last_access"], coworker["registration_date"], coworker["renewal_date"], coworker["start_date"], coworker["cancellation_date"],
             coworker["created_on"], coworker["updated_on"],
+            coworker["hubspot_deal_url"],
         )
         return (coworker["source_id"], *vals, coworker["source_id"], *vals)

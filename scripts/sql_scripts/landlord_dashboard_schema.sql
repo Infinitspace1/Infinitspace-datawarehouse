@@ -72,8 +72,14 @@
 --   - List price  = SUM(silver.nexudus_products.price) for products linked via
 --                   silver.nexudus_contracts.floor_plan_desk_ids (comma-separated
 --                   product source_ids).
---   - Sold price  = COALESCE(price_with_products, price, tariff_price, 0) from the
---                   contract — always populated regardless of product link.
+--   - Sold price  = COALESCE(NULLIF(price_with_products, 0), price, tariff_price, 0)
+--                   from the contract — always populated regardless of product link.
+--                   The NULLIF guards a spurious price_with_products = 0: Nexudus
+--                   sometimes emits 0 for a genuinely priced contract (e.g. Weave
+--                   Security desk 3012 at QH — price_with_products=0, price=6000),
+--                   which a plain COALESCE would treat as valid and zero out the
+--                   line. Skipping the 0 falls through to `price`. A truly comped
+--                   contract has price=0 too, so it still resolves to 0.
 --   - list_price_missing = 1 only for root cause E: physical product found (capacity > 0)
 --     but price = NULL or 0 in Nexudus. Fix: update the product price in Nexudus and re-sync.
 --
@@ -152,6 +158,23 @@ WITH product_link AS (
         SUM(
             CASE WHEN p.item_type = 1 THEN ISNULL(p.price, 0) ELSE 0 END
         ) AS private_office_list_fee,
+        -- ── Per-type breakdown (MMRF / MARV, added 2026-07-16) ───────────────
+        -- Workstation counts and list-price subtotals per Nexudus item_type,
+        -- used downstream to ALLOCATE the single contract-level sold fee across
+        -- types (Nexudus stores one price per contract — see header note). The
+        -- weights below are list-price shares. private_office_* (item_type 1)
+        -- already exist above and serve as the type-1 slice.
+        --   MMRF = type 1 (Private Office) + 2 (Dedicated Desk) + 3 (Hot Desk)
+        --   MARV = type 4 (Other: parking/storeroom) here; type 5 (Meeting Room)
+        --          recurring is a data-quality exclusion (kept out of the join at
+        --          item_type IN (1,2,3,4) below), so ad-hoc meeting-room revenue
+        --          is sourced separately from invoice lines, not from contracts.
+        SUM(CASE WHEN p.item_type = 2 THEN 1 ELSE 0 END)             AS dedicated_desk_capacity,
+        SUM(CASE WHEN p.item_type = 3 THEN 1 ELSE 0 END)             AS hot_desk_capacity,
+        SUM(CASE WHEN p.item_type = 4 THEN 1 ELSE 0 END)             AS additional_unit_count,
+        SUM(CASE WHEN p.item_type = 2 THEN ISNULL(p.price, 0) ELSE 0 END) AS dedicated_desk_list_fee,
+        SUM(CASE WHEN p.item_type = 3 THEN ISNULL(p.price, 0) ELSE 0 END) AS hot_desk_list_fee,
+        SUM(CASE WHEN p.item_type = 4 THEN ISNULL(p.price, 0) ELSE 0 END) AS additional_list_fee,
         CASE
             WHEN SUM(CASE WHEN p.item_type IN (2, 3) THEN 1 ELSE 0 END) = 0
              AND SUM(CASE WHEN p.item_type = 1 THEN 1 ELSE 0 END) > 0
@@ -204,23 +227,43 @@ SELECT
     ISNULL(pl.private_office_capacity, 0)    AS private_office_capacity,
     pl.private_office_list_fee,
     ISNULL(pl.is_pure_private_office, 0)     AS is_pure_private_office,
+
+    -- ── Per-type breakdown (MMRF / MARV, added 2026-07-16) ───────────────────
+    -- Per-type workstation counts (type-1 = private_office_capacity above).
+    ISNULL(pl.dedicated_desk_capacity, 0)    AS dedicated_desk_capacity,
+    ISNULL(pl.hot_desk_capacity, 0)          AS hot_desk_capacity,
+    ISNULL(pl.additional_unit_count, 0)      AS additional_unit_count,
+    -- Per-type ALLOCATED sold revenue. The single contract fee is split by each
+    -- type's list-price share (alloc.w_*), so
+    --   rev_private_office + rev_dedicated_desk + rev_hot_desk + rev_additional
+    --   = sold_monthly_fee   (reconciles exactly).
+    -- MMRF = rev_private_office + rev_dedicated_desk + rev_hot_desk (types 1/2/3)
+    -- MARV = rev_additional (type 4). See the alloc CROSS APPLY for the fallback
+    -- when list price is missing (capacity share) or absent (residual → MMRF).
+    CAST(alloc.sold_fee * alloc.w_po  AS DECIMAL(18,2)) AS rev_private_office,
+    CAST(alloc.sold_fee * alloc.w_dd  AS DECIMAL(18,2)) AS rev_dedicated_desk,
+    CAST(alloc.sold_fee * alloc.w_hd  AS DECIMAL(18,2)) AS rev_hot_desk,
+    CAST(alloc.sold_fee * alloc.w_add AS DECIMAL(18,2)) AS rev_additional,
+
     c.currency_code,
 
     -- Sold price — for adjustment contracts (price_with_products < 0), use
     -- `price` instead. Adjustments have no linked products, so the two
     -- fields SHOULD be equal — but 4 contracts in Nexudus have a phantom
     -- delta of €20–180 (e.g. EBCONT 1417662289 at QH). Using `price`
-    -- matches what Nexudus's own UI shows for those.
+    -- matches what Nexudus's own UI shows for those. The NULLIF(...,0) also
+    -- skips a spurious price_with_products = 0 on positive contracts so the
+    -- real `price` is used instead of zeroing the line.
     CASE
-        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
-            THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
-        ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
+            THEN COALESCE(c.price, NULLIF(c.price_with_products, 0), c.tariff_price, 0)
+        ELSE COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
     END                                 AS sold_monthly_fee,
     CAST(
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
-                THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
-            ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
+                THEN COALESCE(c.price, NULLIF(c.price_with_products, 0), c.tariff_price, 0)
+            ELSE COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
         END
         / NULLIF(pl.capacity, 0)
         AS DECIMAL(18,2)
@@ -239,7 +282,7 @@ SELECT
         WHEN pl.list_monthly_fee IS NOT NULL
             THEN CAST(
                 pl.list_monthly_fee
-                - COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+                - COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
                 AS DECIMAL(18,2)
             )
         ELSE NULL
@@ -247,7 +290,7 @@ SELECT
     CASE
         WHEN pl.list_monthly_fee IS NOT NULL AND pl.list_monthly_fee <> 0
             THEN CAST(
-                (pl.list_monthly_fee - COALESCE(c.price_with_products, c.price, c.tariff_price, 0))
+                (pl.list_monthly_fee - COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0))
                 / pl.list_monthly_fee
                 AS DECIMAL(9,4)
             )
@@ -276,7 +319,7 @@ SELECT
     -- contract_term is only used HERE for valuation; the forecast chart still
     -- ignores it (rolls past it as ongoing) per the file header convention.
     CAST(
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
         * CASE
             WHEN c.start_date IS NULL    THEN 0
             WHEN c.cancellation_date IS NOT NULL
@@ -296,7 +339,7 @@ SELECT
     --   2. contract_term in future → months(today → contract_term)
     --   3. Otherwise (rolling)     → 12 (12-month forward assumption)
     CAST(
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
         * CASE
             WHEN c.cancellation_date IS NOT NULL
                 THEN CASE
@@ -333,7 +376,7 @@ SELECT
     -- price = NULL or 0 in Nexudus (root cause E). Fix: set product price in Nexudus.
     -- Suppressed for negative-fee adjustment contracts (no list price expected).
     CASE
-        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 0
+        WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 0
         WHEN ISNULL(pl.list_monthly_fee, 0) = 0 THEN 1
         ELSE 0
     END                                 AS list_price_missing,
@@ -341,7 +384,7 @@ SELECT
     -- 1 when sold_monthly_fee is negative — discount / credit / refund contract.
     -- These contribute zero capacity and negative revenue to aggregates.
     CASE
-        WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+        WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 1
         ELSE 0
     END                                 AS is_negative_adjustment,
 
@@ -371,6 +414,40 @@ LEFT JOIN silver.nexudus_tariffs t
 LEFT JOIN silver.nexudus_financial_accounts fa
     ON  fa.source_id = t.financial_account_id
     AND fa.is_deleted = 0
+-- Per-type revenue allocation (added 2026-07-16). Computes the resolved sold fee
+-- once, plus the four type weights. Weight basis, in priority order:
+--   1. list_monthly_fee > 0 → each type's list-price share (sums to 1)
+--   2. else capacity > 0    → each type's workstation share (type-4 = 0 desks)
+--   3. else                 → whole fee to the private-office (MMRF) bucket,
+--                             so negative-fee adjustments / unlinked contracts
+--                             are never dropped from the per-type totals.
+CROSS APPLY (
+    SELECT
+        CASE
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
+                THEN COALESCE(c.price, NULLIF(c.price_with_products, 0), c.tariff_price, 0)
+            ELSE COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
+        END AS sold_fee,
+        CASE
+            WHEN ISNULL(pl.list_monthly_fee, 0) > 0 THEN ISNULL(pl.private_office_list_fee, 0) / pl.list_monthly_fee
+            WHEN ISNULL(pl.capacity, 0) > 0 THEN CAST(ISNULL(pl.private_office_capacity, 0) AS FLOAT) / pl.capacity
+            ELSE 1.0
+        END AS w_po,
+        CASE
+            WHEN ISNULL(pl.list_monthly_fee, 0) > 0 THEN ISNULL(pl.dedicated_desk_list_fee, 0) / pl.list_monthly_fee
+            WHEN ISNULL(pl.capacity, 0) > 0 THEN CAST(ISNULL(pl.dedicated_desk_capacity, 0) AS FLOAT) / pl.capacity
+            ELSE 0.0
+        END AS w_dd,
+        CASE
+            WHEN ISNULL(pl.list_monthly_fee, 0) > 0 THEN ISNULL(pl.hot_desk_list_fee, 0) / pl.list_monthly_fee
+            WHEN ISNULL(pl.capacity, 0) > 0 THEN CAST(ISNULL(pl.hot_desk_capacity, 0) AS FLOAT) / pl.capacity
+            ELSE 0.0
+        END AS w_hd,
+        CASE
+            WHEN ISNULL(pl.list_monthly_fee, 0) > 0 THEN ISNULL(pl.additional_list_fee, 0) / pl.list_monthly_fee
+            ELSE 0.0
+        END AS w_add
+) alloc
 WHERE c.is_deleted = 0
 
   -- Status pre-filter: active contracts and notice-period (cancelled but still in
@@ -417,7 +494,7 @@ WHERE c.is_deleted = 0
   -- is also zero or positive.
   AND (
       pl.contract_source_id IS NOT NULL
-      OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+      OR COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
   );
 GO
 
@@ -577,11 +654,13 @@ contract_facts AS (
         -- delta of €20–180 (e.g. EBCONT 1417662289: price=-1149,
         -- price_with_products=-1224). Using `price` matches what Nexudus's
         -- own UI shows. Positive contracts keep using price_with_products
-        -- so add-on fees still count.
+        -- so add-on fees still count — but via NULLIF(...,0) so a spurious
+        -- price_with_products = 0 (Nexudus glitch) falls through to `price`
+        -- instead of zeroing the line.
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
-                THEN COALESCE(c.price, c.price_with_products, c.tariff_price, 0)
-            ELSE COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
+                THEN COALESCE(c.price, NULLIF(c.price_with_products, 0), c.tariff_price, 0)
+            ELSE COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
         END                          AS sold_monthly_fee,
         -- Whether this contract's tariff is a "Membership Fee" financial
         -- account. Used downstream to make sure parking/ancillary discounts
@@ -607,7 +686,7 @@ contract_facts AS (
         ISNULL(pl.private_office_list_fee, 0) AS private_office_list_fee,
         ISNULL(pl.is_pure_private_office, 0)  AS is_pure_private_office,
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 1
             ELSE 0
         END                          AS is_negative_adjustment
     FROM silver.nexudus_contracts c
@@ -646,12 +725,12 @@ contract_facts AS (
       --      They contribute fee to revenue, 0 to capacity.
       AND (
           pl.contract_source_id IS NOT NULL
-          OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+          OR COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0
               AND c.cancelled = 0
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
-              AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+              AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
           )
       )
 ),
@@ -962,7 +1041,7 @@ contract_facts AS (
         )                                 AS member_company_name,
         c.coworker_name,
         c.tariff_name,
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS sold_monthly_fee,
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS sold_monthly_fee,
         ISNULL(pl.list_monthly_fee, 0)    AS list_monthly_fee,
         pl.capacity,
         ISNULL(pl.private_office_capacity, 0) AS private_office_capacity,
@@ -971,7 +1050,7 @@ contract_facts AS (
         CAST(c.cancellation_date AS DATE) AS cancellation_date,
         CAST(DATEADD(HOUR, 4, c.start_date) AS DATE) AS effective_start_date,
         CASE
-            WHEN COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0 THEN 1
+            WHEN COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0 THEN 1
             ELSE 0
         END                               AS is_negative_adjustment
     FROM silver.nexudus_contracts c
@@ -992,12 +1071,12 @@ contract_facts AS (
       -- See that view for the rationale on each branch.
       AND (
           pl.contract_source_id IS NOT NULL
-          OR COALESCE(c.price_with_products, c.price, c.tariff_price, 0) < 0
+          OR COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0
               AND c.cancelled = 0
               AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
-              AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+              AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
           )
       )
 )
@@ -1270,6 +1349,20 @@ WITH base AS (
         SUM(contract_value)                                     AS contract_value,
         SUM(remaining_contract_value)                           AS remaining_contract_value,
 
+        -- ── Per-type revenue split (MMRF / MARV, added 2026-07-16) ───────────
+        -- Allocated by product list-price share upstream in
+        -- vw_landlord_current_contracts, so these are NOT financial-account
+        -- filtered — they reconcile as mmrf + marv = SUM(sold_monthly_fee over
+        -- ALL the company's current contracts, all types).
+        --   MMRF (Monthly Membership Revenues Fee) = types 1+2+3
+        --   MARV (Monthly Additional Revenues Fee) = type 4 (recurring; ad-hoc
+        --         meeting-room/day-pass MARV is invoice-sourced elsewhere)
+        SUM(ISNULL(rev_private_office, 0) + ISNULL(rev_dedicated_desk, 0) + ISNULL(rev_hot_desk, 0)) AS mmrf,
+        SUM(ISNULL(rev_additional, 0))                          AS marv,
+        SUM(ISNULL(dedicated_desk_capacity, 0))                 AS dedicated_desk_capacity,
+        SUM(ISNULL(hot_desk_capacity, 0))                       AS hot_desk_capacity,
+        SUM(ISNULL(additional_unit_count, 0))                   AS additional_unit_count,
+
         -- Notice / term info: take the most conservative (longest) values
         MAX(notice_period_months)                               AS notice_period_months,
         MAX(term_months)                                        AS term_months,
@@ -1328,7 +1421,7 @@ followup_candidates AS (
         c.source_id                                                AS followup_contract_id,
         CAST(c.start_date AS DATE)                                 AS followup_start,
         DATEDIFF(DAY, b.cancellation_date, CAST(c.start_date AS DATE)) AS gap_days,
-        COALESCE(c.price_with_products, c.price, c.tariff_price, 0) AS followup_fee,
+        COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) AS followup_fee,
         CAST(
             CASE
                 WHEN c.cancellation_date IS NOT NULL THEN c.cancellation_date
@@ -1359,7 +1452,7 @@ followup_candidates AS (
         -- contract's value is still tracked in `base.contract_value` — adding
         -- the two at the SELECT below gives the company's committed total.
         CAST(
-            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
             * CASE
                 WHEN c.start_date IS NULL    THEN 0
                 WHEN c.cancellation_date IS NOT NULL
@@ -1379,7 +1472,7 @@ followup_candidates AS (
         --   - contract_term in future → months(today_or_start → contract_term)
         --   - else (rolling)          → 12 (12-month forward horizon)
         CAST(
-            COALESCE(c.price_with_products, c.price, c.tariff_price, 0)
+            COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)
             * CASE
                 WHEN c.cancellation_date IS NOT NULL
                     THEN CASE
@@ -1415,7 +1508,7 @@ followup_candidates AS (
         AND COALESCE(NULLIF(c.coworker_company, N''), c.coworker_billing_name, c.coworker_name)
             = b.member_company_name
         AND c.is_deleted = 0
-        AND COALESCE(c.price_with_products, c.price, c.tariff_price, 0) > 0
+        AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
         AND CAST(c.start_date AS DATE) >= b.cancellation_date
         AND (
             c.active = 1
@@ -1479,6 +1572,18 @@ SELECT
     b.sold_monthly_fee,
     b.list_monthly_fee,
     b.discount_value,
+
+    -- ── Per-type revenue split (MMRF / MARV, added 2026-07-16) ───────────────
+    -- MMRF (Monthly Membership Revenues Fee) = types 1+2+3 (office/dedicated/hot)
+    -- MARV (Monthly Additional Revenues Fee) = type 4 (parking/storeroom, recurring)
+    -- mmrf_per_ws = MMRF ÷ workstations (b.capacity = types 1+2+3 desks).
+    -- Contract Value / Remaining above stay TOTAL across all types (unchanged).
+    ISNULL(b.mmrf, 0)                                          AS mmrf,
+    ISNULL(b.marv, 0)                                          AS marv,
+    CAST(ISNULL(b.mmrf, 0) / NULLIF(b.capacity, 0) AS DECIMAL(18,2)) AS mmrf_per_ws,
+    ISNULL(b.dedicated_desk_capacity, 0)                      AS dedicated_desk_capacity,
+    ISNULL(b.hot_desk_capacity, 0)                            AS hot_desk_capacity,
+    ISNULL(b.additional_unit_count, 0)                        AS additional_unit_count,
 
     -- ── Contract value (FIXED 2026-05-27 to include follow-ups + re-engagements) ──
     -- Historically `contract_value` and `remaining_contract_value` exposed only

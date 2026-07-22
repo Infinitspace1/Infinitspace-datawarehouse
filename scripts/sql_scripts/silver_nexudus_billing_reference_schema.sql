@@ -187,7 +187,7 @@ SELECT
         ELSE                                              'tariff without financial account'
     END                                        AS classification,
     COUNT(*)                                   AS contract_count,
-    SUM(COALESCE(c.price_with_products, c.price, c.tariff_price, 0)) AS monthly_total
+    SUM(COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0)) AS monthly_total
 FROM silver.nexudus_contracts c
 LEFT JOIN silver.nexudus_tariffs t              ON t.source_id  = c.tariff_id
 LEFT JOIN silver.nexudus_financial_accounts fa  ON fa.source_id = t.financial_account_id
