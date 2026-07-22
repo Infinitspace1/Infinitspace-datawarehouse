@@ -149,6 +149,8 @@ def currency_for_country(country: Any) -> str:
     code = str(country or "").strip().upper()
     if code in {"GB", "UK", "GBR", "UNITED KINGDOM", "ENGLAND"}:
         return "GBP"
+    if code in {"CA", "CAN", "CANADA"}:
+        return "CAD"
     return "USD"
 
 

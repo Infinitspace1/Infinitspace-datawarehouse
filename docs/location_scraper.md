@@ -65,7 +65,7 @@ sequenceDiagram
 
 `location_scraper_monthly` runs on `LOCATION_SCRAPER_MONTHLY_SCHEDULE`, default `0 0 1 1 * *` (01:00 UTC on the first day of each month). It starts one Durable orchestration per city with `unlimited_items=true`, so the Apify actor input omits `maxItems` and the dataset fetch reads all returned items.
 
-Scheduled cities: `barcelona`, `madrid`, `milan`, `berlin`, `munich`, `hamburg`, `cologne`, `frankfurt`, `dusseldorf`, `stuttgart`, `warsaw`, `london`, `new york`, `san francisco`, `palo alto`, `los angeles`, `austin`, `seattle`, `redwood city`, `san mateo`, `san bruno`, `cupertino`.
+Scheduled cities: `barcelona`, `madrid`, `milan`, `berlin`, `munich`, `hamburg`, `cologne`, `frankfurt`, `dusseldorf`, `stuttgart`, `warsaw`, `london`, `new york`, `san francisco`, `palo alto`, `los angeles`, `austin`, `seattle`, `redwood city`, `san mateo`, `san bruno`, `cupertino`, `toronto`.
 
 ---
 
@@ -139,12 +139,13 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
 | `san mateo` | US | LoopNet |
 | `san bruno` | US | LoopNet |
 | `cupertino` | US | LoopNet |
+| `toronto` | Canada | LoopNet |
 
-#### LoopNet (UK + US) notes
+#### LoopNet (UK + US + Canada) notes
 
 - Actor: `memo23/loopnet-scraper-ppe` (`0ZCQONxB3BdyOzrbD`), pay-per-event (~$1.50/1k). The
   $31/mo flat-rate twin (`RuOxoBM1bnc5pQ3TJ`) is intentionally **not** used.
-- The same actor serves **US and UK**, but the URL shape differs by country
+- The same actor serves **US, UK and Canada**, but the URL shape differs by country
   (resolved per `COUNTRY_CONFIG` block, same `loopnet` branch in `resolve.py`):
   - **UK** (`uk`): `…/search/office-properties/{city}-england--united-kingdom/for-rent/`.
     City slug must include region + country (`london-england--united-kingdom`) — the
@@ -156,8 +157,12 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
     `san-bruno-ca`, `cupertino-ca`. Multi-word city names
     contain a space (`new york`, `redwood city`) — the weekly timer slugifies them
     (`new-york`, `redwood-city`) for `run_id`/instance ids.
-  - Currency is derived from the country (GB → GBP, otherwise USD) since LoopNet has no
-    currency field.
+  - **Canada** (`canada`): own domain `loopnet.ca`, US-style path + suffix:
+    `https://www.loopnet.ca/search/office-space/{slug}/for-lease/`. City slug needs the
+    province + `--canada` (UK convention): `toronto-on--canada` — the bare `toronto-on`
+    404s. Verified live: `?min-space-size=16146` → 189 Toronto office results.
+  - Currency is derived from the country (GB → GBP, CA → CAD, otherwise USD) since
+    LoopNet has no currency field.
 - Areas are in **square feet** → converted to m² (×0.092903). The **≥1500 m²** floor is
   enforced in code (adapter + globe materialization), not via the actor's URL filter
   (which filters total building size, not available area).

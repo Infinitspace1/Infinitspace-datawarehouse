@@ -81,6 +81,8 @@ SCRAPE_CITIES = (
     "san mateo",
     "san bruno",
     "cupertino",
+    # Canada (LoopNet)
+    "toronto",
 )
 
 # Sources whose listing payload already carries broker name/company/phone/email,

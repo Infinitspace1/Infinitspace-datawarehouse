@@ -136,6 +136,25 @@ COUNTRY_CONFIG: dict[str, dict] = {
             "cupertino": "cupertino-ca",
         },
     },
+    "canada": {
+        # LoopNet Canada lives on its own domain (like the UK). Same actor.
+        "domain": "https://www.loopnet.ca",
+        "language": "en",
+        # Canada uses the US-style `for-lease` suffix, not the UK `for-rent`.
+        "property_path": "office-space",
+        "filter_suffix": "for-lease",
+        "actor": "loopnet",
+        "actor_id": LOOPNET_ACTOR_ID,
+        "country_code": "ca",
+        # Same available-space URL filter as UK/US (verified on loopnet.ca:
+        # Toronto office ?min-space-size=16146 -> 189 results).
+        "min_space_size_sqft": MIN_SPACE_SIZE_SQFT,
+        # City slug MUST include the province + `--canada` (UK convention),
+        # e.g. `toronto-on--canada` — the bare `toronto-on` 404s.
+        "cities": {
+            "toronto": "toronto-on--canada",
+        },
+    },
 }
 
 # Job titles passed to Lusha's contact search (from n8n "Extract Contact" node)

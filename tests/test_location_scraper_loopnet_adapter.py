@@ -91,6 +91,8 @@ def test_currency_by_country():
     assert currency_for_country("GB") == "GBP"
     assert currency_for_country("United Kingdom") == "GBP"
     assert currency_for_country("US") == "USD"
+    assert currency_for_country("CA") == "CAD"
+    assert currency_for_country("Canada") == "CAD"
     assert currency_for_country(None) == "USD"
 
 
@@ -135,6 +137,7 @@ def test_globe_currency_loopnet_by_country():
     from shared.location_scraper.activities.materialize_globe import _pick_currency
     assert _pick_currency({"country": "GB"}, "loopnet") == "GBP"
     assert _pick_currency({"country": "US"}, "loopnet") == "USD"
+    assert _pick_currency({"country": "CA"}, "loopnet") == "CAD"
 
 
 def test_globe_surfaces_broker_email_for_loopnet():

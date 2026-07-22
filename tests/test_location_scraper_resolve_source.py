@@ -135,6 +135,21 @@ class TestResolveSource:
                 "?min-space-size=16146"
             )
 
+    def test_toronto_loopnet_canada(self):
+        cfg = resolve_source("Toronto", None, "run-ca-1")  # case-insensitive
+        assert cfg.city == "toronto"
+        assert cfg.country == "canada"
+        assert cfg.country_code == "ca"
+        assert cfg.actor == "loopnet"
+        assert cfg.actor_id == LOOPNET_ACTOR_ID
+        # Canada lives on loopnet.ca; slug needs the province + `--canada`
+        # (UK convention) and the US-style `for-lease` suffix.
+        assert cfg.start_url == (
+            "https://www.loopnet.ca/search/office-space/"
+            "toronto-on--canada/for-lease/"
+            "?min-space-size=16146"
+        )
+
     def test_us_loopnet_ignores_shape(self):
         """LoopNet US uses URL geocoding — Idealista polygon shape must be ignored."""
         with_shape = resolve_source("austin", "POLYGON", "x")
