@@ -380,14 +380,36 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             },
         )
 
-        # 1b. LoopNet coverage note: we run the memo23 broad search directly on
-        # the space-available-filtered URL with `moreResults` (see
-        # LoopnetAdapter.build_input), which bypasses the old 500-item cap. The
-        # previous enumeration 2-step (ls_enumerate_loopnet_urls -> feed listing
-        # URLs to memo23) was retired on 2026-06-29: the actor's 2026-06-27
-        # rebuild made the listing-URL payload drop broker contact + the
-        # header/spaces surface fields, so the enumerated path produced 0
-        # buildings. The broad-search payload keeps brokerEmail and sizeSf.
+        # 1b. LoopNet: enumerate the space-available-filtered search pages and
+        # scrape exactly those listing-detail URLs.
+        #
+        # History: this 2-step was retired 2026-06-29 because the actor's
+        # 2026-06-27 rebuild stripped broker contact + surface from the
+        # listing-URL payload. The actor dev restored broker extraction on
+        # 2026-07-23, re-validated the same day: enumeration returns 397 London
+        # URLs in 97s, and those URLs come back with brokerName/company/email.
+        # It is re-enabled because the broad search is capped per bounding box —
+        # London plateaus at ~30 items against 383 qualifying buildings on the
+        # site, and the `min-space-size` URL filter is ignored on the non-.com
+        # domains (loopnet.co.uk / .ca), so half of what it returns is below our
+        # surface floor.
+        #
+        # Enumeration returning nothing is NOT fatal: we fall through to the
+        # broad search, which is what every city used until now.
+        if source_config["actor"] == "loopnet":
+            enumerated: dict = yield context.call_activity(
+                "ls_enumerate_loopnet_urls", source_config
+            )
+            listing_urls = (enumerated or {}).get("listing_urls") or []
+            if listing_urls:
+                source_config = {**source_config, "listing_urls": listing_urls}
+            elif not context.is_replaying:
+                logger.warning(
+                    "LoopNet enumeration returned no URLs; falling back to the "
+                    "broad search. city=%s run_id=%s",
+                    city,
+                    run_id,
+                )
 
         # 2. Start Apify actor (async — do NOT block on completion)
         run_info: dict = yield context.call_activity("ls_start_apify_run", source_config)
