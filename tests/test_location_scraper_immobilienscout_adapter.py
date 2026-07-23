@@ -31,9 +31,10 @@ def test_build_input_can_omit_max_items_for_unlimited_monthly_runs():
 def test_start_apify_run_omits_max_items_when_source_config_is_unlimited(monkeypatch):
     captured = {}
 
-    def fake_start_run(actor_id, actor_input):
+    def fake_start_run(actor_id, actor_input, memory_mbytes=None):
         captured["actor_id"] = actor_id
         captured["actor_input"] = actor_input
+        captured["memory_mbytes"] = memory_mbytes
         return {"run_id": "apify-run", "dataset_id": "dataset"}
 
     monkeypatch.setattr(
@@ -46,6 +47,8 @@ def test_start_apify_run_omits_max_items_when_source_config_is_unlimited(monkeyp
 
     assert result["actor"] == "immobilienscout"
     assert "maxItems" not in captured["actor_input"]
+    # Non-LoopNet sources keep the actor's default memory allocation.
+    assert captured["memory_mbytes"] is None
 
 
 def test_normalize_skips_small_surface():

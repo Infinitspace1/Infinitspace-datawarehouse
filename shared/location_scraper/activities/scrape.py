@@ -13,6 +13,7 @@ from shared.gmaps.geocoding import GeocodingCache
 from shared.location_scraper import clients as _c
 from shared.location_scraper.adapters.registry import ADAPTER_REGISTRY
 from shared.location_scraper.clients import apify as apify_client
+from shared.location_scraper.config import get_loopnet_listing_run_memory_mbytes
 from shared.location_scraper.free_geocoding import NominatimGeocodingCache
 from shared.location_scraper.geocoding import geocode_missing_coordinates
 from shared.location_scraper.models import Listing, SourceConfig
@@ -51,16 +52,22 @@ def start_apify_run(config: dict) -> dict:
     """
     src = SourceConfig.from_dict(config)
     adapter = ADAPTER_REGISTRY[src.actor]
+    memory_mbytes: int | None = None
     if src.listing_urls:
         # Enumerated listing-detail URLs (LoopNet): scrape exactly these —
         # the enumeration already bounded the volume, so never cap items.
         actor_input = adapter.build_input(src.listing_urls, max_items=None)
+        # The actor's 512 MB default is OOM-killed (exit 137) on large URL
+        # lists — 460 New York URLs died at exactly 512 MB. Scale the request
+        # with the list size; this actor bills per result, not per compute
+        # unit, so a bigger allocation costs nothing extra.
+        memory_mbytes = get_loopnet_listing_run_memory_mbytes(len(src.listing_urls))
     else:
         actor_input = adapter.build_input(
             src.start_url,
             max_items=None if src.unlimited_items else "default",
         )
-    result = apify_client.start_run(src.actor_id, actor_input)
+    result = apify_client.start_run(src.actor_id, actor_input, memory_mbytes=memory_mbytes)
     result["actor"] = src.actor
     return result
 

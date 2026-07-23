@@ -74,6 +74,46 @@ def test_build_input_explicit_max_items_wins():
     assert payload["maxItems"] == 250
 
 
+def test_listing_run_memory_scales_with_url_count():
+    """The actor's 512 MB default is OOM-killed on large listing-URL lists
+    (460 New York URLs died at exactly 512 MB on 2026-07-23)."""
+    from shared.location_scraper.config import get_loopnet_listing_run_memory_mbytes
+
+    assert get_loopnet_listing_run_memory_mbytes(40) == 1024
+    assert get_loopnet_listing_run_memory_mbytes(150) == 2048
+    assert get_loopnet_listing_run_memory_mbytes(300) == 4096
+    assert get_loopnet_listing_run_memory_mbytes(564) == 8192
+
+
+def test_listing_run_memory_env_override(monkeypatch):
+    from shared.location_scraper.config import get_loopnet_listing_run_memory_mbytes
+
+    monkeypatch.setenv("LOOPNET_LISTING_RUN_MEMORY_MB", "4096")
+    assert get_loopnet_listing_run_memory_mbytes(40) == 4096
+
+
+def test_start_apify_run_requests_memory_for_listing_urls(monkeypatch):
+    from shared.location_scraper.activities.scrape import start_apify_run
+    from shared.location_scraper.activities.resolve import resolve_source
+
+    captured = {}
+
+    def fake_start_run(actor_id, actor_input, memory_mbytes=None):
+        captured["memory_mbytes"] = memory_mbytes
+        captured["actor_input"] = actor_input
+        return {"run_id": "r", "dataset_id": "d"}
+
+    monkeypatch.setattr(
+        "shared.location_scraper.activities.scrape.apify_client.start_run", fake_start_run
+    )
+    cfg = resolve_source("london", None, "run-1", unlimited_items=True)
+    cfg.listing_urls = [f"https://www.loopnet.co.uk/Listing/{i}/" for i in range(300)]
+    start_apify_run(cfg.to_dict())
+
+    assert captured["memory_mbytes"] == 4096
+    assert len(captured["actor_input"]["startUrls"]) == 300
+
+
 def test_build_input_listing_url_list():
     """Enumerated listing-detail URLs are passed through one-to-one."""
     urls = [

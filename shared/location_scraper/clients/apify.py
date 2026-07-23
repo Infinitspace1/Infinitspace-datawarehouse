@@ -41,12 +41,19 @@ def _run_field(run: Any, *names: str) -> Any:
     raise KeyError(f"Apify run is missing any of {names!r} (type={type(run).__name__})")
 
 
-def start_run(actor_id: str, run_input: dict) -> dict:
+def start_run(actor_id: str, run_input: dict, memory_mbytes: int | None = None) -> dict:
     """
     Start an Apify actor run without waiting for it to finish.
     Returns {"run_id": str, "dataset_id": str}.
+
+    `memory_mbytes` overrides the actor's default allocation. The LoopNet
+    actor defaults to 512 MB and is OOM-killed (exit 137) when handed a large
+    listing-URL list — 460 New York URLs died at exactly 512 MB on 2026-07-23.
     """
-    run = _client().actor(actor_id).start(run_input=run_input)
+    kwargs = {"run_input": run_input}
+    if memory_mbytes:
+        kwargs["memory_mbytes"] = memory_mbytes
+    run = _client().actor(actor_id).start(**kwargs)
     run_id = _run_field(run, "id")
     dataset_id = _run_field(run, "defaultDatasetId", "default_dataset_id")
     logger.info("Apify run started: actor=%s run_id=%s", actor_id, run_id)

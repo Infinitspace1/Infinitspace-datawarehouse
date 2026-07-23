@@ -90,6 +90,34 @@ SCRAPE_CITIES = (
 # on the globe directly). LoopNet returns broker contact on every listing.
 LUSHA_SKIP_SOURCES = {"loopnet"}
 
+# LoopNet country codes that use the listing-URL enumeration path instead of
+# the broad search.
+#
+# Measured 2026-07-23, the day the actor dev restored broker extraction:
+#   - loopnet.co.uk / loopnet.ca ignore the `min-space-size` URL filter and cap
+#     the broad search at ~30 items (London: 30 vs 383 qualifying buildings on
+#     the site). Enumeration is the only way to see that market.
+#   - loopnet.com serves the broad search properly since the same fix
+#     (Los Angeles 248, New York 187, Seattle 75 buildings).
+# Enumeration is NOT free: each enumerated URL needs a per-listing detail fetch,
+# and those currently fail ~75% of the time (mobile API 403 -> the actor's paid
+# unblocker erroring). Seattle regressed 75 -> 31 buildings when enumerated, so
+# the path is restricted to the domains where the broad search cannot work.
+# Revisit once the dev ships the faster internal path he announced.
+LOOPNET_ENUMERATION_COUNTRIES = {"gb", "ca"}
+
+
+def _loopnet_uses_enumeration(source_config: dict) -> bool:
+    if source_config.get("actor") != "loopnet":
+        return False
+    raw = (os.getenv("LOOPNET_ENUMERATION_COUNTRIES") or "").strip()
+    countries = (
+        {c.strip().lower() for c in raw.split(",") if c.strip()}
+        if raw
+        else LOOPNET_ENUMERATION_COUNTRIES
+    )
+    return str(source_config.get("country_code") or "").lower() in countries
+
 # Weekly run processes cities in sequential waves of this size so that only a
 # handful of (memory-heavy) Apify datasets are loaded at once — prevents the
 # worker OOM (exit code 137) seen when all cities fan out simultaneously.
@@ -396,7 +424,7 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
         #
         # Enumeration returning nothing is NOT fatal: we fall through to the
         # broad search, which is what every city used until now.
-        if source_config["actor"] == "loopnet":
+        if _loopnet_uses_enumeration(source_config):
             enumerated: dict = yield context.call_activity(
                 "ls_enumerate_loopnet_urls", source_config
             )

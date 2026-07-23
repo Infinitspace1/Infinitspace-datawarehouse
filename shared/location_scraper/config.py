@@ -236,6 +236,34 @@ def get_actor_max_items(*, default: int) -> int:
     return value if value > 0 else default
 
 
+def get_loopnet_listing_run_memory_mbytes(listing_count: int) -> int:
+    """Apify memory to request for a LoopNet listing-URL run.
+
+    The actor's 512 MB default is OOM-killed (exit 137) once the URL list gets
+    large — measured 2026-07-23: 460 New York URLs died at exactly 512 MB while
+    lists of ~40 finished fine. The actor bills per result, not per compute
+    unit, so over-allocating costs nothing.
+
+    Env override: LOOPNET_LISTING_RUN_MEMORY_MB=<int> (fixed value for all runs)
+    """
+    raw = (os.environ.get("LOOPNET_LISTING_RUN_MEMORY_MB") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    # Apify only accepts powers of two.
+    if listing_count > 400:
+        return 8192
+    if listing_count > 200:
+        return 4096
+    if listing_count > 100:
+        return 2048
+    return 1024
+
+
 def get_loopnet_unlimited_max_items() -> int:
     """`maxItems` for uncapped LoopNet runs.
 
