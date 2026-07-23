@@ -16,7 +16,11 @@ from shared.location_scraper.adapters.loopnet import (
     available_surface_sqft_from_payload,
     currency_for_country,
 )
-from shared.location_scraper.config import LOOPNET_ACTOR_ID
+from shared.location_scraper.config import (
+    LOOPNET_ACTOR_ID,
+    LOOPNET_MAX_UNBLOCKER_REQUESTS,
+    LOOPNET_UNLIMITED_MAX_ITEMS,
+)
 
 
 def _uk_listing(subtext="29,270 SF of Office Space Available", country="GB"):
@@ -49,11 +53,25 @@ def test_build_input_shape_and_cap():
     # the full qualifying set (replaces the retired enumeration 2-step).
     assert payload["moreResults"] is True
     assert payload["maxItems"] == 100
+    # The paid-unblocker budget must be raised or dense cities get truncated.
+    assert payload["maxUnblockerRequests"] == LOOPNET_MAX_UNBLOCKER_REQUESTS
     assert adapter.actor_id == LOOPNET_ACTOR_ID
 
 
-def test_build_input_unlimited_omits_max_items():
-    assert "maxItems" not in LoopnetAdapter().build_input("https://x", max_items=None)
+def test_build_input_unlimited_sends_explicit_ceiling():
+    """`maxItems` must be SENT even when uncapped.
+
+    Omitting the key makes the actor stop the search early at a small internal
+    default — measured 2026-07-23 on Los Angeles: 67 items with the key absent
+    vs 147 with an explicit ceiling (same build, same URL).
+    """
+    payload = LoopnetAdapter().build_input("https://x", max_items=None)
+    assert payload["maxItems"] == LOOPNET_UNLIMITED_MAX_ITEMS
+
+
+def test_build_input_explicit_max_items_wins():
+    payload = LoopnetAdapter().build_input("https://x", max_items=250)
+    assert payload["maxItems"] == 250
 
 
 def test_build_input_listing_url_list():
@@ -64,7 +82,7 @@ def test_build_input_listing_url_list():
     ]
     payload = LoopnetAdapter().build_input(urls, max_items=None)
     assert payload["startUrls"] == [{"url": u} for u in urls]
-    assert "maxItems" not in payload
+    assert payload["maxItems"] == LOOPNET_UNLIMITED_MAX_ITEMS
 
 
 def test_sf_to_m2_conversion():

@@ -28,6 +28,18 @@ GOOGLE_SEARCH_ACTOR_ID = "nFJndFXA5zjCTuudP"
 # adapter enforces; 1500 / 0.092903 ≈ 16146).
 MIN_SPACE_SIZE_SQFT = 16146
 
+# Ceiling sent on "unlimited" LoopNet runs. Leaving `maxItems` ABSENT makes the
+# memo23 actor stop a search early at a small internal default (confirmed with
+# the actor dev + measured 2026-07-23: Los Angeles returned 67 items with the
+# key omitted vs 147 with an explicit cap, same build, same URL).
+LOOPNET_UNLIMITED_MAX_ITEMS = 1000
+
+# Per-run budget for the actor's paid unblocker (used when it falls back to
+# scraping the website). A dense city can exhaust the default on its own and
+# get its results truncated. The dev is restoring the faster internal path,
+# which will remove this limit entirely.
+LOOPNET_MAX_UNBLOCKER_REQUESTS = 2000
+
 COUNTRY_CONFIG: dict[str, dict] = {
     "spain": {
         "domain": "https://www.idealista.com",
@@ -222,6 +234,36 @@ def get_actor_max_items(*, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def get_loopnet_unlimited_max_items() -> int:
+    """`maxItems` for uncapped LoopNet runs.
+
+    Env override: LOOPNET_MAX_ITEMS=<int>
+    """
+    raw = (os.environ.get("LOOPNET_MAX_ITEMS") or "").strip()
+    if not raw:
+        return LOOPNET_UNLIMITED_MAX_ITEMS
+    try:
+        value = int(raw)
+    except ValueError:
+        return LOOPNET_UNLIMITED_MAX_ITEMS
+    return value if value > 0 else LOOPNET_UNLIMITED_MAX_ITEMS
+
+
+def get_loopnet_max_unblocker_requests() -> int:
+    """Per-run unblocker budget for LoopNet runs.
+
+    Env override: LOOPNET_MAX_UNBLOCKER_REQUESTS=<int>
+    """
+    raw = (os.environ.get("LOOPNET_MAX_UNBLOCKER_REQUESTS") or "").strip()
+    if not raw:
+        return LOOPNET_MAX_UNBLOCKER_REQUESTS
+    try:
+        value = int(raw)
+    except ValueError:
+        return LOOPNET_MAX_UNBLOCKER_REQUESTS
+    return value if value > 0 else LOOPNET_MAX_UNBLOCKER_REQUESTS
 
 
 def get_country_code_for_city(city: str | None) -> str | None:

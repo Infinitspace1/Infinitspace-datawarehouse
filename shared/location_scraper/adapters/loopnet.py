@@ -19,7 +19,12 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from shared.location_scraper.config import LOOPNET_ACTOR_ID, get_actor_max_items
+from shared.location_scraper.config import (
+    LOOPNET_ACTOR_ID,
+    get_actor_max_items,
+    get_loopnet_max_unblocker_requests,
+    get_loopnet_unlimited_max_items,
+)
 from shared.location_scraper.models import Listing
 
 # 1 square foot = 0.092903 m²
@@ -186,13 +191,20 @@ class LoopnetAdapter:
             # payload carries broker contact + sizeSf, which the enumerated
             # listing-URL payload lost in the actor's 2026-06-27 rebuild.
             "moreResults": True,
+            # Per-run budget for the actor's paid unblocker; a dense city can
+            # exhaust the default alone and have its results truncated.
+            "maxUnblockerRequests": get_loopnet_max_unblocker_requests(),
             "maxConcurrency": 20,
             "minConcurrency": 1,
             "proxy": {"useApifyProxy": True},
         }
         if max_items != "default":
-            if max_items is not None:
-                payload["maxItems"] = max_items
+            # None means "uncapped" — but the key must still be SENT: omitting
+            # it makes the actor stop the search early at a small internal
+            # default (LA: 67 items omitted vs 147 with an explicit ceiling).
+            payload["maxItems"] = (
+                max_items if max_items is not None else get_loopnet_unlimited_max_items()
+            )
             return payload
         payload["maxItems"] = get_actor_max_items(default=100)
         return payload
