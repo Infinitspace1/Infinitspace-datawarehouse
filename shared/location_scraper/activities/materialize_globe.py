@@ -24,6 +24,12 @@ from shared.location_scraper.adapters.loopnet import (
     available_surface_sqft_from_payload,
     currency_for_country,
 )
+from shared.location_scraper.broker_directory import (
+    extract_broker_records,
+    load_broker_directory,
+    resolve_email,
+    upsert_broker_records,
+)
 from shared.location_scraper.config import get_country_code_for_city
 from shared.location_scraper.free_geocoding import NominatimGeocodingCache
 from shared.location_scraper.geocoding import geocode_missing_coordinates
@@ -337,28 +343,64 @@ def _building_key(latitude: Any, longitude: Any, floor: Any) -> tuple[str, str, 
     return (f"{float(latitude):.4f}", f"{float(longitude):.4f}", floor_key)
 
 
-def _loopnet_broker_contacts(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _loopnet_broker_contacts(
+    payload: dict[str, Any],
+    broker_directory: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
     """Build globe contact slots from LoopNet's own broker fields.
 
-    LoopNet returns broker contact (incl. email) on every listing, so we skip
-    Lusha for it — but the globe email slots must still be populated. We take up
-    to 3 broker emails, naming the first with `brokerName`.
+    LoopNet skips Lusha, so the globe email slots come from the payload's
+    broker fields (flat brokerEmail/brokerEmails + the `brokers` co-broker
+    list). When a broker has a NAME but no email — the shape the actor
+    regressed to twice in 2026 — the historical broker directory fills the
+    email in (conservative name match, see broker_directory.resolve_email).
+    Up to 3 contacts.
     """
-    emails: list[str] = []
-    primary = payload.get("brokerEmail")
-    if primary and str(primary).strip():
-        emails.append(str(primary).strip())
-    for email in payload.get("brokerEmails") or []:
-        s = str(email).strip() if email is not None else ""
-        if s and s not in emails:
-            emails.append(s)
+    directory = broker_directory or {}
     name = payload.get("brokerName")
     company = payload.get("brokerCompany")
     title = f"Broker — {company}" if company else "Broker"
-    return [
-        {"email": email, "name": name if i == 0 else None, "title": title, "confidence": None}
-        for i, email in enumerate(emails[:3])
-    ]
+
+    contacts: list[dict[str, Any]] = []
+    seen_emails: set[str] = set()
+
+    def _add(email: Any, contact_name: Any, contact_title: str) -> None:
+        s = str(email).strip() if email is not None else ""
+        if not s or s.lower() in seen_emails:
+            return
+        seen_emails.add(s.lower())
+        contacts.append(
+            {"email": s, "name": contact_name, "title": contact_title, "confidence": None}
+        )
+
+    # 1. Payload-provided emails (primary broker first).
+    _add(payload.get("brokerEmail"), name, title)
+    for email in payload.get("brokerEmails") or []:
+        _add(email, name if not contacts else None, title)
+
+    # 2. Co-brokers from the `brokers` list that carry their own email.
+    for broker in payload.get("brokers") or []:
+        if isinstance(broker, dict):
+            _add(broker.get("email"), broker.get("name"), title)
+
+    # 3. Directory fallback — primary broker named but email-less.
+    if not contacts and name:
+        hit = resolve_email(directory, name, company)
+        if hit:
+            _add(hit["email"], name, f"{title} (directory)")
+
+    # 4. Directory fallback — email-less co-brokers, while slots remain.
+    if len(contacts) < 3:
+        for broker in payload.get("brokers") or []:
+            if len(contacts) >= 3:
+                break
+            if not isinstance(broker, dict) or broker.get("email"):
+                continue
+            hit = resolve_email(directory, broker.get("name"), broker.get("company") or company)
+            if hit:
+                _add(hit["email"], broker.get("name"), f"{title} (directory)")
+
+    return contacts[:3]
 
 
 def _contact_slots(contacts: list[dict[str, Any]]) -> tuple:
@@ -417,6 +459,7 @@ def _map_row(
     contacts_by_key: dict[tuple[str, str, str], list[dict[str, Any]]],
     hubspot_exports_by_item: dict[int, dict[str, Any]],
     geocode_cache: Any = None,
+    broker_directory: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple | None:
     payload = json.loads(row["payload_json"])
     source = row["source"]
@@ -451,8 +494,9 @@ def _map_row(
 
     floor = _pick_floor(payload, source)
     if source == "loopnet":
-        # LoopNet skips Lusha — surface the broker email(s) from the payload.
-        contacts = _loopnet_broker_contacts(payload)
+        # LoopNet skips Lusha — surface the broker email(s) from the payload,
+        # back-filling missing ones from the historical broker directory.
+        contacts = _loopnet_broker_contacts(payload, broker_directory)
     else:
         contacts = (
             contacts_by_key.get(_building_key(latitude, longitude, floor))
@@ -610,9 +654,30 @@ def materialize_globe_run(payload: dict[str, Any]) -> dict[str, int]:
         return {"rows_written": 0}
 
     contacts_by_key = _load_lusha_contacts_by_building(sql, rows[0]["source"])
+
+    # LoopNet: learn every (broker name -> email) pair seen in this run, then
+    # load the full directory so email-less brokers can be back-filled.
+    broker_directory: dict[str, list[dict[str, Any]]] = {}
+    if rows[0]["source"] == "loopnet":
+        observed: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                observed.extend(extract_broker_records(json.loads(r["payload_json"])))
+            except (ValueError, TypeError):
+                continue
+        upserted = upsert_broker_records(sql, observed)
+        broker_directory = load_broker_directory(sql)
+        logger.info(
+            "location_scraper broker directory run_id=%s observed_pairs=%d directory_names=%d",
+            run_id, upserted, len(broker_directory),
+        )
+
     # Google Maps when a key is set, else the free Nominatim geocoder.
     geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else NominatimGeocodingCache()
-    mapped = [_map_row(r, contacts_by_key, hubspot_exports_by_item, geocode_cache) for r in rows]
+    mapped = [
+        _map_row(r, contacts_by_key, hubspot_exports_by_item, geocode_cache, broker_directory)
+        for r in rows
+    ]
     # _map_row returns None for rows that must be dropped (e.g. LoopNet < 1500 m²).
     insert_rows = [r for r in mapped if r is not None]
     if not insert_rows:

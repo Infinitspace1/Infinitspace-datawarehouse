@@ -168,6 +168,16 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
   (which filters total building size, not available area).
 - LoopNet payloads carry **no coordinates** → filled by the geocode fallback. Broker
   name / company / phone / **email** come directly from the payload.
+- **Broker directory (name→email memory)**: `silver.location_scraper_broker_directory`
+  remembers every (broker name → email) pair ever observed (2,447 pairs seeded from the
+  raw archive). During globe materialization, LoopNet listings whose broker has a NAME
+  but no EMAIL — the shape the actor regressed to twice in 2026 — are back-filled from
+  the directory (conservative matching: ambiguous names only resolve on a company
+  tie-break). Every run self-enriches the directory. Module:
+  `shared/location_scraper/broker_directory.py`; seed/backfill:
+  `scripts/python_scripts/backfill_broker_directory.py` (NB: export the prod
+  `GOOGLE_MAPS_API_KEY` before `--rematerialize`, else Nominatim shifts marker
+  clustering).
 - **Lusha is fully skipped for LoopNet** (`LUSHA_SKIP_SOURCES` in
   `functions/location_scraper.py`): the orchestrator bypasses dedupe/enrich/consolidate.
   The broker contact is still persisted to `bronze.n8n_location_scraper_contacts`
