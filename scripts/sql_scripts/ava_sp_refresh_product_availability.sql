@@ -170,6 +170,16 @@ BEGIN
             WHERE p.item_type = 1
               AND p.is_available = 1
               AND p.is_deleted   = 0
+              -- Exclude non-office junk Nexudus mis-types as ItemType=1:
+              -- Parking bays and Meeting Rooms carry ItemType=1 but are not
+              -- sellable private offices (capacity 0, or a Parking / Meeting
+              -- Room name, e.g. "Parking 13", "Meeting Room QH 4-A"). A real
+              -- private office always has a real capacity and is never named
+              -- Parking / Meeting Room. (Price is NOT filtered — a real office
+              -- with a missing price still shows as "Price on request".)
+              AND p.capacity >= 1
+              AND p.name NOT LIKE 'Parking%'
+              AND p.name NOT LIKE '%Meeting Room%'
               AND TRIM(s.value) <> ''
         ),
         linked_contracts AS (
@@ -413,6 +423,12 @@ BEGIN
             WHERE p.item_type = 1
               AND p.is_available = 1
               AND p.is_deleted   = 0
+              -- Exclude non-office junk Nexudus mis-types as ItemType=1
+              -- (Parking bays, Meeting Rooms) — must match the product_contracts
+              -- CTE filter above so contracts and offices stay in sync.
+              AND p.capacity >= 1
+              AND p.name NOT LIKE 'Parking%'
+              AND p.name NOT LIKE '%Meeting Room%'
         )
         INSERT INTO ava.product_availability (
             location_source_id, location_name, city, country_name,
