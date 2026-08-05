@@ -48,6 +48,10 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     from functions.bronze_nexudus import bp as bronze_bp
     from functions.finance_dashboard_refresh import bp as finance_dashboard_bp
     from functions.finance_invoice_worklist_refresh import bp as finance_worklist_refresh_bp
+    # 07:00 UTC refresh of Nexudus payment histories, so the finance worklist's
+    # direct-debit `processing` suppression is fresh for the 08:00/09:00 UTC
+    # automated pre-reminder sends (was 6-7h stale off the 02:00 nightly run).
+    from functions.finance_presend_refresh import bp as finance_presend_refresh_bp
     from functions.nexudus_invoice_pdf_cache import bp as nexudus_pdf_bp
     from functions.nexudus_invoice_reconcile import bp as nexudus_invoice_reconcile_bp
     from functions.nexudus_silver_reconcile import bp as nexudus_silver_reconcile_bp
@@ -74,6 +78,7 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     app.register_functions(bamboohr_bp)
     app.register_functions(finance_dashboard_bp)
     app.register_functions(finance_worklist_refresh_bp)
+    app.register_functions(finance_presend_refresh_bp)
     app.register_functions(replyio_bp)
     app.register_functions(sync_health_report_bp)
     app.register_functions(landlord_freeze_bp)
