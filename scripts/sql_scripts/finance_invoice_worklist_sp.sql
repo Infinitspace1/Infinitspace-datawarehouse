@@ -66,6 +66,42 @@ BEGIN
 END
 GO
 
+-- Source columns for the finance dashboard's "this member's direct debit has
+-- broken" flag. `invoice_status` only says "Payment Failed"; these two say WHY
+-- and WHO. See shared/nexudus/transformers/coworker_invoices.py for the values.
+IF OBJECT_ID('silver.nexudus_coworker_invoices', 'U') IS NOT NULL
+   AND COL_LENGTH('silver.nexudus_coworker_invoices', 'payment_state') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD payment_state NVARCHAR(32) NULL;
+END
+GO
+
+IF OBJECT_ID('silver.nexudus_coworker_invoices', 'U') IS NOT NULL
+   AND COL_LENGTH('silver.nexudus_coworker_invoices', 'invoice_ever_collected') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD invoice_ever_collected BIT NULL;
+END
+GO
+
+IF OBJECT_ID('gold.finance_dashboard_invoice_worklist', 'U') IS NOT NULL
+   AND COL_LENGTH('gold.finance_dashboard_invoice_worklist', 'payment_state') IS NULL
+BEGIN
+    ALTER TABLE gold.finance_dashboard_invoice_worklist
+    ADD payment_state NVARCHAR(32) NULL;
+END
+GO
+
+IF OBJECT_ID('gold.finance_dashboard_invoice_worklist', 'U') IS NOT NULL
+   AND COL_LENGTH('gold.finance_dashboard_invoice_worklist', 'member_auto_collects') IS NULL
+BEGIN
+    ALTER TABLE gold.finance_dashboard_invoice_worklist
+    ADD member_auto_collects BIT NOT NULL
+        CONSTRAINT df_gold_finance_dashboard_invoice_worklist_member_auto_collects DEFAULT 0;
+END
+GO
+
 CREATE OR ALTER PROCEDURE gold.sp_refresh_invoice_worklist
 AS
 BEGIN
@@ -116,6 +152,7 @@ BEGIN
             nci.invoice_status,
             ISNULL(nci.processing, 0) AS processing,
             nci.payment_failure_count,
+            nci.payment_state,
             nci.invoice_from_date,
             nci.due_date,
             CAST((nci.due_date AT TIME ZONE 'UTC' AT TIME ZONE 'Central European Standard Time') AS DATE) AS due_date_local,
@@ -141,6 +178,27 @@ BEGIN
           AND ISNULL(nci.processing, 0) = 0
           AND UPPER(ISNULL(nci.invoice_status, N'')) NOT LIKE N'%PROCESSING%'
           AND nci.due_date   >= '2026-03-01'
+    ),
+    -- Does this MEMBER normally pay by automated collection? Rolled up across
+    -- ALL of the coworker's invoices (not just the unpaid ones), because the
+    -- evidence that they are a direct-debit payer usually sits on invoices that
+    -- have since been paid.
+    --
+    -- The finance dashboard pairs this with `payment_state` to tell a genuinely
+    -- BROKEN direct debit apart from a member who simply never had one. That
+    -- distinction matters: of 194 members whose invoices show
+    -- NotPreAuthFoundException, 190 have never auto-collected anything — they
+    -- are manual payers and "please log in and pay" is the right message for
+    -- them. Only the handful with a collection track record who suddenly stop
+    -- are a broken mandate worth a CM's attention.
+    member_collection_history AS (
+        SELECT
+            nci.coworker_id,
+            MAX(CAST(ISNULL(nci.invoice_ever_collected, 0) AS INT)) AS member_auto_collects
+        FROM silver.nexudus_coworker_invoices nci
+        WHERE nci.coworker_id IS NOT NULL
+          AND nci.is_deleted = 0
+        GROUP BY nci.coworker_id
     ),
     invoice_account_flags AS (
         SELECT
@@ -176,6 +234,8 @@ BEGIN
         invoice_status,
         processing,
         payment_failure_count,
+        payment_state,
+        member_auto_collects,
         invoice_date,
         due_date,
         as_of_date_utc,
@@ -218,6 +278,8 @@ BEGIN
         inv.invoice_status,
         inv.processing,
         inv.payment_failure_count,
+        inv.payment_state,
+        CAST(ISNULL(mch.member_auto_collects, 0) AS BIT)                    AS member_auto_collects,
         COALESCE(
             CAST((inv.invoice_from_date AT TIME ZONE 'UTC' AT TIME ZONE 'Central European Standard Time') AS DATE),
             inv.due_date_local
@@ -254,6 +316,8 @@ BEGIN
     LEFT JOIN meta.finance_dashboard_location_settings ls
         ON ls.location_source_id = inv.location_source_id
     LEFT JOIN invoice_account_flags af
-        ON af.invoice_source_id = inv.source_id;
+        ON af.invoice_source_id = inv.source_id
+    LEFT JOIN member_collection_history mch
+        ON mch.coworker_id = inv.coworker_id;
 END
 GO
