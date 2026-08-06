@@ -30,6 +30,19 @@
 --
 --   Allocation, timezone, invoice-status, and credit-note netting rules are
 --   identical to gold.vw_landlord_revenue_past_monthly — see that view's header.
+--
+-- 2026-08-06 — ONE-OFF CHARGES NOW LAND IN THEIR INVOICE MONTH.
+--   Invoices with no service period (invoice_from_date / invoice_to_date NULL)
+--   are the ad-hoc ones: membership-fee corrections when a recurring invoice was
+--   wrong, one-off ancillary charges, and so on. They used to be dated by
+--   due_date, which is a payment-terms date, not a revenue date — so a
+--   correction invoiced on the 1st with 60-day terms was reported two months
+--   later. They now fall in the month of the invoice date (silver `created_on`
+--   = Nexudus CreatedOn, the "Date" column on the Nexudus invoice list).
+--   Example: QH-INV-2026.07-0923 (Italienische Handelskammer, Berlin-Mitte
+--   Heidestraße 34) — €250 membership-fee correction invoiced 1 Jul 2026, due
+--   31 Aug 2026 — moves from Aug-26 to Jul-26. due_date survives only as a
+--   safety-net branch; created_on is non-NULL on all 15,297 silver invoices.
 -- =============================================================================
 
 IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'gold')
@@ -68,9 +81,17 @@ filtered_lines AS (
             ELSE 'MARV'
         END                                           AS revenue_stream,
         CAST(ISNULL(il.unit_price, 0) * ISNULL(il.quantity, 0) AS DECIMAL(18,4)) AS line_amount,
+        -- Branch 1: recurring invoice — allocate across its service period.
+        -- Branch 2: ONE-OFF charge (no service period, e.g. a membership-fee
+        --   correction) — the whole line lands in the month of the INVOICE DATE.
+        -- Branch 3: safety net if created_on is ever missing.
         CASE
             WHEN i.invoice_from_date IS NOT NULL AND i.invoice_to_date IS NOT NULL
                 THEN CAST(DATEADD(HOUR, 4, i.invoice_from_date) AS DATE)
+            WHEN i.created_on IS NOT NULL
+                THEN DATEFROMPARTS(
+                    YEAR (CAST(DATEADD(HOUR, 4, i.created_on) AS DATE)),
+                    MONTH(CAST(DATEADD(HOUR, 4, i.created_on) AS DATE)), 1)
             WHEN i.due_date IS NOT NULL
                 THEN DATEFROMPARTS(
                     YEAR (CAST(DATEADD(HOUR, 4, i.due_date) AS DATE)),
@@ -79,6 +100,10 @@ filtered_lines AS (
         CASE
             WHEN i.invoice_from_date IS NOT NULL AND i.invoice_to_date IS NOT NULL
                 THEN CAST(DATEADD(HOUR, 4, i.invoice_to_date) AS DATE)
+            WHEN i.created_on IS NOT NULL
+                THEN DATEADD(MONTH, 1, DATEFROMPARTS(
+                    YEAR (CAST(DATEADD(HOUR, 4, i.created_on) AS DATE)),
+                    MONTH(CAST(DATEADD(HOUR, 4, i.created_on) AS DATE)), 1))
             WHEN i.due_date IS NOT NULL
                 THEN DATEADD(MONTH, 1, DATEFROMPARTS(
                     YEAR (CAST(DATEADD(HOUR, 4, i.due_date) AS DATE)),
@@ -96,7 +121,7 @@ filtered_lines AS (
       AND ISNULL(i.draft, 0) = 0
       AND ISNULL(i.void,  0) = 0
       AND i.location_source_id IS NOT NULL
-      AND (i.invoice_from_date IS NOT NULL OR i.due_date IS NOT NULL)
+      AND (i.invoice_from_date IS NOT NULL OR i.created_on IS NOT NULL OR i.due_date IS NOT NULL)
 ),
 line_month_allocation AS (
     SELECT
