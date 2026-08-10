@@ -176,6 +176,30 @@ BEGIN
 END
 GO
 
+-- `invoice_status` collapses every failure into 'Payment Failed', which loses the
+-- distinction between "the member has no stored payment method at all" (a manual
+-- payer — the large majority) and "a real direct-debit mandate died". The finance
+-- dashboard needs that distinction so it can flag a DD payer whose collection has
+-- broken WITHOUT mislabelling the ~98% who never had a mandate. Values:
+--   none | in_flight | no_payment_method | mandate_revoked
+--   | subscription_requested | failed | other
+-- Derived in shared/nexudus/transformers/coworker_invoices.py.
+IF COL_LENGTH('silver.nexudus_coworker_invoices', 'payment_state') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD payment_state NVARCHAR(32) NULL;
+END
+GO
+
+-- True when THIS invoice ever had a genuine collection in flight. The gold
+-- worklist SP rolls it up per coworker into `member_auto_collects`.
+IF COL_LENGTH('silver.nexudus_coworker_invoices', 'invoice_ever_collected') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoices
+    ADD invoice_ever_collected BIT NULL;
+END
+GO
+
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
     WHERE name = 'ix_silver_nexudus_coworker_invoices_processing'

@@ -576,6 +576,7 @@ async def _resync_open_invoices(
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
+    entity_suffix: str = "",
 ) -> None:
     """Re-fetch every open unpaid invoice OBJECT by ID, independent of the 2-day
     UpdatedOn incremental window used by _sync_coworker_invoices.
@@ -602,7 +603,12 @@ async def _resync_open_invoices(
         lookback_months,
     )
 
-    async with RunTracker("nexudus", "coworker_invoices_resync", "bronze", metadata=str(run_id)) as run:
+    # `entity_suffix` keeps an off-cycle caller (the 07:00 pre-send refresh) from
+    # masking the nightly run in the sync-health report, which keeps only the
+    # latest run per (source_name, entity, layer).
+    async with RunTracker(
+        "nexudus", f"coworker_invoices_resync{entity_suffix}", "bronze", metadata=str(run_id)
+    ) as run:
         tasks = [
             client.get_one(f"billing/coworkerinvoices/{invoice_id}")
             for invoice_id in invoice_ids
@@ -687,20 +693,32 @@ async def _sync_coworker_invoice_histories(
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
+    entity_suffix: str = "",
+    lookback_months: int | None = None,
 ) -> None:
-    lookback_months = int(os.getenv("NEXUDUS_INVOICE_HISTORY_LOOKBACK_MONTHS", "1"))
+    if lookback_months is None:
+        lookback_months = int(os.getenv("NEXUDUS_INVOICE_HISTORY_LOOKBACK_MONTHS", "1"))
     invoice_ids = _load_invoice_history_candidate_ids(lookback_months)
     if not invoice_ids:
         logger.info("Coworker invoice histories: no candidate invoices, skipping")
         return
 
+    # NB "direct-debit invoices" is a misnomer inherited from the candidate query:
+    # its `CoworkerRegularPaymentProvider IS NOT NULL` clause is true for
+    # 31,451/31,452 coworkers (it is the location's default gateway, not a member
+    # mandate), so this is effectively every unpaid non-void invoice in the window.
     logger.info(
-        "Coworker invoice histories: fetching histories for %s direct-debit invoices due from last %s month(s)",
+        "Coworker invoice histories: fetching histories for %s unpaid invoices due from last %s month(s)",
         len(invoice_ids),
         lookback_months,
     )
 
-    async with RunTracker("nexudus", "coworker_invoice_histories", "bronze", metadata=str(run_id)) as run:
+    # `entity_suffix` keeps an off-cycle caller (the 07:00 pre-send refresh) from
+    # masking the nightly run in the sync-health report, which keeps only the
+    # latest run per (source_name, entity, layer).
+    async with RunTracker(
+        "nexudus", f"coworker_invoice_histories{entity_suffix}", "bronze", metadata=str(run_id)
+    ) as run:
         all_histories: list[dict] = []
         errors = 0
         tasks = [client.get_coworker_invoice_histories(invoice_id) for invoice_id in invoice_ids]

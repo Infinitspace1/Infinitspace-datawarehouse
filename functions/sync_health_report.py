@@ -45,6 +45,12 @@ _EXPECTED_DAILY: frozenset[tuple[str, str, str]] = frozenset([
     ("ava", "product_availability", "ava"),
     ("bamboohr", "bamboohr_employees", "bronze"),
     ("finance_dashboard", "finance_dashboard", "gold"),
+    # Pre-send direct-debit history refresh — runs 07:00 UTC, must land before
+    # the finance app's 08:00 UTC automated pre-reminders. If it silently stops
+    # firing the `processing` suppression gate goes back to being 6-7 h stale
+    # and customers get chased mid-collection, with no other signal that
+    # anything is wrong.
+    ("finance_dashboard", "presend_refresh", "gold"),
     ("replyio", "sequence_steps", "bronze"),
     # Landlord dashboard materialization — runs 03:00 UTC daily. If it
     # silently stops firing, the dashboard would just go stale without
