@@ -519,8 +519,18 @@ BEGIN
         WHERE p.item_type IN (1, 2, 3)
           AND p.is_available = 1
           AND p.is_deleted = 0
-          -- TODO: remove once floor 2 refurbishment is complete and products are re-enabled in Nexudus
-          AND NOT (loc.name = 'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE '2-%')
+          -- Availability window, current-month semantics (matches the landlord
+          -- monthly views' location_capacity). is_available alone is NOT enough:
+          -- ops retires a floor by setting available_to (e.g. Zuidtoren floor 17,
+          -- available_to = 2026-07-31) and the flag often stays 1.
+          -- available_from gets the same UTC end-of-day (+4h) shift as contract
+          -- effective dates: Nexudus stores "available from D" as D 22:00/23:00
+          -- UTC = midnight LOCAL on D+1, so a desk enabled "from Jul 31"
+          -- belongs to August.
+          AND (p.available_from IS NULL
+               OR CAST(DATEADD(HOUR, 4, p.available_from) AS DATE) <= EOMONTH(GETUTCDATE()))
+          AND (p.available_to IS NULL
+               OR CAST(p.available_to AS DATE) >= DATEFROMPARTS(YEAR(GETUTCDATE()), MONTH(GETUTCDATE()), 1))
         GROUP BY p.location_source_id
     ),
     active_contracts AS (

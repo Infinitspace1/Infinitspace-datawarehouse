@@ -36,9 +36,17 @@
 --
 -- Effective period priority:
 --   1. invoice_from_date AND invoice_to_date both set → use them
---   2. otherwise → fall back to due_date and allocate the whole line to
---                  that calendar month (effective_from = month_start of
---                  due_date, effective_to = month_start of next month)
+--   2. otherwise (a ONE-OFF charge — no service period) → allocate the whole
+--                  line to the calendar month of the INVOICE DATE
+--                  (created_on = Nexudus CreatedOn, the "Date" shown on the
+--                  invoice list), effective_from = that month_start,
+--                  effective_to = month_start of the next month
+--   3. due_date → safety net only, if created_on is ever missing
+--
+--   (2) was due_date until 2026-08-06. due_date is a payment-terms date, not a
+--   revenue date, so one-off membership-fee corrections landed in the wrong
+--   month whenever the terms crossed a month boundary — e.g. a €250 correction
+--   invoiced 1 Jul 2026 with a 31 Aug 2026 due date was reported in August.
 --
 -- Timezone normalisation:
 --   All Nexudus timestamps are shifted +4h before casting to DATE. This
@@ -119,10 +127,19 @@ filtered_lines AS (
                                                       AS line_amount,
         -- Effective period for allocation.
         -- Branch 1: invoice_from + invoice_to both set → use them with +4h shift.
-        -- Branch 2: due_date present → whole line lands in due_date's calendar month.
+        -- Branch 2: no service period — a ONE-OFF charge (e.g. a membership-fee
+        --           correction). Whole line lands in the INVOICE DATE's calendar
+        --           month (created_on = Nexudus CreatedOn = the invoice "Date").
+        -- Branch 3: due_date — safety net only, if created_on is ever missing.
         CASE
             WHEN i.invoice_from_date IS NOT NULL AND i.invoice_to_date IS NOT NULL
                 THEN CAST(DATEADD(HOUR, 4, i.invoice_from_date) AS DATE)
+            WHEN i.created_on IS NOT NULL
+                THEN DATEFROMPARTS(
+                    YEAR (CAST(DATEADD(HOUR, 4, i.created_on) AS DATE)),
+                    MONTH(CAST(DATEADD(HOUR, 4, i.created_on) AS DATE)),
+                    1
+                )
             WHEN i.due_date IS NOT NULL
                 THEN DATEFROMPARTS(
                     YEAR (CAST(DATEADD(HOUR, 4, i.due_date) AS DATE)),
@@ -133,6 +150,12 @@ filtered_lines AS (
         CASE
             WHEN i.invoice_from_date IS NOT NULL AND i.invoice_to_date IS NOT NULL
                 THEN CAST(DATEADD(HOUR, 4, i.invoice_to_date) AS DATE)
+            WHEN i.created_on IS NOT NULL
+                THEN DATEADD(MONTH, 1, DATEFROMPARTS(
+                    YEAR (CAST(DATEADD(HOUR, 4, i.created_on) AS DATE)),
+                    MONTH(CAST(DATEADD(HOUR, 4, i.created_on) AS DATE)),
+                    1
+                ))
             WHEN i.due_date IS NOT NULL
                 THEN DATEADD(MONTH, 1, DATEFROMPARTS(
                     YEAR (CAST(DATEADD(HOUR, 4, i.due_date) AS DATE)),
@@ -150,7 +173,7 @@ filtered_lines AS (
       AND ISNULL(i.void,  0) = 0
       AND i.location_source_id IS NOT NULL
       -- Must have some kind of dating
-      AND (i.invoice_from_date IS NOT NULL OR i.due_date IS NOT NULL)
+      AND (i.invoice_from_date IS NOT NULL OR i.created_on IS NOT NULL OR i.due_date IS NOT NULL)
 ),
 -- Step 2: For each (line, month) where the line's effective period intersects
 -- the month, compute the overlap days. This is the per-line, per-month
@@ -363,10 +386,14 @@ location_capacity AS (
     -- Time-aware capacity per (location, month) — same rules as the contract-book
     -- view's location_capacity. A product counts toward month M iff:
     --   1. is_available = 1, is_deleted = 0, price > 0
-    --   2. available_from <= EOMONTH(M)
+    --   2. effective available_from <= EOMONTH(M)
     --   3. available_to IS NULL OR available_to >= month_start(M)
     -- The price > 0 filter excludes Chair-style €0 placeholders; everything else
     -- (including brand-new just-priced products with no contracts yet) counts.
+    -- available_from gets the same UTC end-of-day (+4h) shift as contract
+    -- effective_start_date: Nexudus stores "available from D" as D 22:00/23:00
+    -- UTC = midnight LOCAL on D+1, so a desk enabled "from Jul 31" belongs to
+    -- August. available_to keeps the raw date (through that day, gone after).
     SELECT
         ms.month_start,
         p.location_source_id,
@@ -383,12 +410,11 @@ location_capacity AS (
         AND p.is_deleted = 0
         AND p.is_available = 1
         AND ISNULL(p.price, 0) > 0
-        AND (p.available_from IS NULL OR CAST(p.available_from AS DATE) <= EOMONTH(ms.month_start))
+        AND (p.available_from IS NULL OR CAST(DATEADD(HOUR, 4, p.available_from) AS DATE) <= EOMONTH(ms.month_start))
         AND (p.available_to   IS NULL OR CAST(p.available_to   AS DATE) >= ms.month_start)
     INNER JOIN silver.nexudus_locations loc
         ON  loc.source_id = p.location_source_id
         AND loc.is_deleted = 0
-    WHERE NOT (loc.name = N'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE N'2-%')
     GROUP BY ms.month_start, p.location_source_id
 ),
 active_by_month AS (
