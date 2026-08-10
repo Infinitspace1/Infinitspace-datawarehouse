@@ -557,7 +557,7 @@ location_capacity AS (
     -- A product counts toward month M's capacity when ALL of:
     --   1. is_available = 1                           (currently bookable in Nexudus)
     --   2. is_deleted = 0
-    --   3. available_from <= EOMONTH(M) AND (available_to IS NULL OR available_to >= month_start(M))
+    --   3. effective available_from <= EOMONTH(M) AND (available_to IS NULL OR available_to >= month_start(M))
     --   4. price > 0                                  (excludes Chair-style €0 placeholders)
     --
     -- Rationale for (4): the "price > 0" filter distinguishes real inventory
@@ -565,6 +565,14 @@ location_capacity AS (
     -- (Chair = €0, test products) without depending on contract existence —
     -- so a brand-new PO created today still counts from day 1, while
     -- never-priced placeholders are excluded forever.
+    --
+    -- available_from gets the same UTC end-of-day shift as contract
+    -- effective_start_date (see contract_facts): Nexudus stores "available
+    -- from D" as D 22:00/23:00 UTC, i.e. midnight LOCAL on D+1. Without the
+    -- shift, a desk made available "from Jul 31" (= Aug 1 local) counts a
+    -- full month early — e.g. Zuidtoren floor 2 (available_from
+    -- 2026-07-31 22:00) belongs to August, not July. available_to keeps the
+    -- raw date: "to Jul 31 22:00" = available through Jul 31, gone in August.
     SELECT
         ms.month_start,
         p.location_source_id,
@@ -581,12 +589,11 @@ location_capacity AS (
         AND p.is_deleted = 0
         AND p.is_available = 1
         AND ISNULL(p.price, 0) > 0
-        AND (p.available_from IS NULL OR CAST(p.available_from AS DATE) <= EOMONTH(ms.month_start))
+        AND (p.available_from IS NULL OR CAST(DATEADD(HOUR, 4, p.available_from) AS DATE) <= EOMONTH(ms.month_start))
         AND (p.available_to   IS NULL OR CAST(p.available_to   AS DATE) >= ms.month_start)
     INNER JOIN silver.nexudus_locations loc
         ON  loc.source_id = p.location_source_id
         AND loc.is_deleted = 0
-    WHERE NOT (loc.name = N'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE N'2-%')
     GROUP BY ms.month_start, p.location_source_id
 ),
 -- Per-contract facts used for the monthly rollup.

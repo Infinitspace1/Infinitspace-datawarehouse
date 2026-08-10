@@ -386,10 +386,14 @@ location_capacity AS (
     -- Time-aware capacity per (location, month) — same rules as the contract-book
     -- view's location_capacity. A product counts toward month M iff:
     --   1. is_available = 1, is_deleted = 0, price > 0
-    --   2. available_from <= EOMONTH(M)
+    --   2. effective available_from <= EOMONTH(M)
     --   3. available_to IS NULL OR available_to >= month_start(M)
     -- The price > 0 filter excludes Chair-style €0 placeholders; everything else
     -- (including brand-new just-priced products with no contracts yet) counts.
+    -- available_from gets the same UTC end-of-day (+4h) shift as contract
+    -- effective_start_date: Nexudus stores "available from D" as D 22:00/23:00
+    -- UTC = midnight LOCAL on D+1, so a desk enabled "from Jul 31" belongs to
+    -- August. available_to keeps the raw date (through that day, gone after).
     SELECT
         ms.month_start,
         p.location_source_id,
@@ -406,12 +410,11 @@ location_capacity AS (
         AND p.is_deleted = 0
         AND p.is_available = 1
         AND ISNULL(p.price, 0) > 0
-        AND (p.available_from IS NULL OR CAST(p.available_from AS DATE) <= EOMONTH(ms.month_start))
+        AND (p.available_from IS NULL OR CAST(DATEADD(HOUR, 4, p.available_from) AS DATE) <= EOMONTH(ms.month_start))
         AND (p.available_to   IS NULL OR CAST(p.available_to   AS DATE) >= ms.month_start)
     INNER JOIN silver.nexudus_locations loc
         ON  loc.source_id = p.location_source_id
         AND loc.is_deleted = 0
-    WHERE NOT (loc.name = N'Amsterdam - Hoofddorp - Taurusavenue 3' AND p.name LIKE N'2-%')
     GROUP BY ms.month_start, p.location_source_id
 ),
 active_by_month AS (

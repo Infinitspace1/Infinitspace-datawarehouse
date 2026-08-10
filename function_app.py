@@ -62,6 +62,9 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     # 15-min cron that materializes the slow gold.vw_landlord_*_monthly views
     # into tables so the dashboard reads stay sub-second on big locations.
     from functions.landlord_materialize_dashboard import bp as landlord_materialize_bp
+    # On-demand HTTP refresh (2026-08-10): bronze+silver+materialize inline for
+    # the contract-shaped entities — backs the dashboard's "Refresh data" button.
+    from functions.nexudus_dashboard_refresh import bp as nexudus_dashboard_refresh_bp
 
     app.register_functions(bronze_bp)
     app.register_functions(silver_bp)
@@ -78,6 +81,7 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     app.register_functions(sync_health_report_bp)
     app.register_functions(landlord_freeze_bp)
     app.register_functions(landlord_materialize_bp)
+    app.register_functions(nexudus_dashboard_refresh_bp)
 
 
 if _env_flag("ENABLE_ADMIN_FUNCTIONS", False):
