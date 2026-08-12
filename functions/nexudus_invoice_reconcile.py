@@ -4,7 +4,9 @@ functions/nexudus_invoice_reconcile.py
 Timer trigger (daily): reconciles silver.nexudus_coworker_invoices against
 the Nexudus API. Invoices deleted at the source are soft-deleted in silver
 (is_deleted = 1, deleted_at = now). Invoice_lines belonging to deleted
-invoices are cascaded.
+invoices are cascaded. A third pass catches individual lines removed from an
+invoice that still exists (_reconcile_orphan_lines) - the cascade cannot see
+those, and they otherwise keep contributing revenue forever.
 
 Why this exists:
   The regular bronze sync uses a 2-day UpdatedOn lookback and therefore
@@ -31,6 +33,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import azure.functions as func
 
@@ -57,6 +60,26 @@ MIN_ACTIVE_IDS = int(os.getenv("NEXUDUS_INVOICE_RECONCILE_MIN_IDS", "100"))
 # DueDate windows keeps every request shallow.
 RECONCILE_WINDOW_DAYS = int(
     os.getenv("NEXUDUS_INVOICE_RECONCILE_WINDOW_DAYS", "30")
+)
+# Orphan-line pass: ceiling on how many invoices may be re-fetched line-by-line
+# in one run. The candidate query normally returns a handful (6 estate-wide when
+# this was written). A sudden jump means the detector itself is wrong — a schema
+# or semantics change, not thousands of real deletions — so abort rather than
+# hammer the API and act on a broken signal.
+ORPHAN_LINE_MAX_CANDIDATES = int(
+    os.getenv("NEXUDUS_ORPHAN_LINE_MAX_CANDIDATES", "250")
+)
+# Deletions are only considered for invoices this far INSIDE the fetched window.
+# The two sides of the comparison do not agree on the boundary: silver's
+# due_date is stored a couple of hours ahead of the UTC DueDate that the API
+# filters on, so an invoice sitting within that skew on its 365th day looks
+# deletable here while never appearing in the fetched active set - and gets
+# wrongly tombstoned. This cost two live invoices (INV-2025.06-0382,
+# INV-2025.07-0389) before it was spotted on 2026-08-12. A one-day margin is
+# far larger than any plausible skew; the only thing given up is catching a
+# deletion in the last day of a year-old window, which nothing reports on.
+RECONCILE_DELETE_MARGIN_DAYS = int(
+    os.getenv("NEXUDUS_INVOICE_RECONCILE_DELETE_MARGIN_DAYS", "1")
 )
 
 
@@ -97,15 +120,22 @@ async def nexudus_invoice_reconcile(timer: func.TimerRequest) -> None:
         deleted_invoices, restored_invoices = _reconcile_invoices(active_ids, cutoff)
         deleted_lines, restored_lines = _reconcile_invoice_lines()
 
-        run.rows_written = deleted_invoices + deleted_lines
+        # Lines deleted from an invoice that itself survives are invisible to
+        # both of the above — see _reconcile_orphan_lines.
+        async with NexudusClient(bearer_token) as client:
+            orphan_lines, orphan_skipped = await _reconcile_orphan_lines(client, cutoff)
+
+        run.rows_written = deleted_invoices + deleted_lines + orphan_lines
         run.rows_skipped = restored_invoices + restored_lines
 
         logger.info(
             "Nexudus invoice reconcile complete: "
             "invoices [deleted=%s, restored=%s], "
-            "invoice_lines [deleted=%s, restored=%s] [run_id=%s]",
+            "invoice_lines [deleted=%s, restored=%s], "
+            "orphan_lines [deleted=%s, skipped=%s] [run_id=%s]",
             deleted_invoices, restored_invoices,
-            deleted_lines, restored_lines, run_id,
+            deleted_lines, restored_lines,
+            orphan_lines, orphan_skipped, run_id,
         )
 
 
@@ -181,8 +211,13 @@ def _reconcile_invoices(active_ids: set[int], cutoff: datetime) -> tuple[int, in
     Soft-delete silver invoices (within window) whose source_id is not in active_ids.
     Restore any previously-deleted invoice whose source_id reappears.
 
+    Deletion uses a window one RECONCILE_DELETE_MARGIN_DAYS narrower than the
+    fetch, so boundary skew between silver's due_date and the API's DueDate
+    cannot delete a live invoice. Restores keep the full window.
+
     Returns (deleted_count, restored_count).
     """
+    delete_cutoff = cutoff + timedelta(days=RECONCILE_DELETE_MARGIN_DAYS)
     sql = get_sql_client()
     with sql.get_connection() as conn:
         cursor = conn.cursor()
@@ -213,7 +248,7 @@ def _reconcile_invoices(active_ids: set[int], cutoff: datetime) -> tuple[int, in
                  OR location_source_id IN (SELECT source_id FROM #excluded_location_ids)
               )
             """,
-            (cutoff,),
+            (delete_cutoff,),
         )
         deleted = cursor.rowcount if cursor.rowcount is not None else 0
 
@@ -256,7 +291,8 @@ def _reconcile_invoice_lines() -> tuple[int, int]:
         cursor.execute(
             """
             UPDATE ncil
-            SET ncil.is_deleted = 1, ncil.deleted_at = GETUTCDATE()
+            SET ncil.is_deleted = 1, ncil.deleted_at = GETUTCDATE(),
+                ncil.deleted_reason = 'cascade'
             FROM silver.nexudus_coworker_invoice_lines ncil
             INNER JOIN silver.nexudus_coworker_invoices nci
                 ON nci.source_id = ncil.invoice_source_id
@@ -272,11 +308,16 @@ def _reconcile_invoice_lines() -> tuple[int, int]:
         cursor.execute(
             """
             UPDATE ncil
-            SET ncil.is_deleted = 0, ncil.deleted_at = NULL
+            SET ncil.is_deleted = 0, ncil.deleted_at = NULL, ncil.deleted_reason = NULL
             FROM silver.nexudus_coworker_invoice_lines ncil
             INNER JOIN silver.nexudus_coworker_invoices nci
                 ON nci.source_id = ncil.invoice_source_id
             WHERE ncil.is_deleted = 1
+              -- Only ever undo OUR OWN deletions. An 'orphan' line was deleted
+              -- in Nexudus while its invoice survived, so a healthy parent is
+              -- no evidence it should come back - without this the cascade
+              -- resurrects every orphan line on the next run.
+              AND (ncil.deleted_reason IS NULL OR ncil.deleted_reason = 'cascade')
               AND nci.is_deleted = 0
               AND (
                     ncil.location_source_id IS NULL
@@ -289,3 +330,172 @@ def _reconcile_invoice_lines() -> tuple[int, int]:
         cursor.execute("DROP TABLE #excluded_location_ids")
         logger.info("Invoice lines: %s soft-deleted, %s restored", deleted, restored)
         return deleted, restored
+
+
+async def _reconcile_orphan_lines(
+    client: NexudusClient,
+    cutoff: datetime,
+) -> tuple[int, int]:
+    """
+    Soft-delete individual lines that were removed from an invoice which itself
+    still exists.
+
+    Neither the bronze sync nor the two reconcile passes above can see this.
+    Bronze fetches lines only for invoices that changed in the run and only
+    writes hash-changed payloads, so a line that simply stops being returned
+    leaves no trace; _reconcile_invoice_lines only cascades a *parent's*
+    deletion. The result is a line that lives in silver forever and keeps
+    contributing revenue.
+
+    Real case (2026-06-24): credit note QH-INV-2026.06-0812 had its -EUR 3,900
+    discount line deleted when the invoice was corrected and reissued. Silver
+    kept the line, so the Cashflow grid showed that member's July as -EUR 1,800
+    instead of EUR 2,100 for two months.
+
+    Rather than re-fetch every invoice's lines (tens of thousands of calls), use
+    the fact that a deleted line leaves a fingerprint: the invoice header's
+    TotalAmount no longer equals the sum of its silver lines. Only those
+    invoices are re-fetched. Blind spot: deleting a zero-value line leaves the
+    total unchanged and so goes unnoticed - harmless, it moves no money.
+
+    Safety: a line is only soft-deleted when removing the missing lines makes
+    the remaining ones add back up to the header total. If the arithmetic does
+    not close, the invoice is left completely alone and logged - that means
+    something other than a plain deletion is going on and a guess could destroy
+    good data.
+
+    Returns (deleted_count, skipped_count).
+    """
+    candidates = _fetch_orphan_line_candidates(cutoff)
+    if not candidates:
+        logger.info("Orphan lines: no candidate invoices, skipping")
+        return 0, 0
+
+    if len(candidates) > ORPHAN_LINE_MAX_CANDIDATES:
+        raise RuntimeError(
+            f"Safety abort: {len(candidates)} invoices have a header/line "
+            f"mismatch (threshold {ORPHAN_LINE_MAX_CANDIDATES}). Refusing to "
+            f"re-fetch and soft-delete - check the detector, not the data."
+        )
+
+    logger.info(
+        "Orphan lines: %s invoice(s) with a header/line mismatch to re-fetch",
+        len(candidates),
+    )
+
+    to_delete: list[int] = []
+    skipped = 0
+
+    for inv in candidates:
+        invoice_id = int(inv["source_id"])
+        try:
+            live = await client.get_coworker_invoice_lines(invoice_id)
+        except Exception as exc:
+            logger.warning(
+                "Orphan lines: line fetch failed for %s (%s) - skipping: %s",
+                inv["invoice_number"], invoice_id, exc,
+            )
+            skipped += 1
+            continue
+
+        live_ids = {int(r["Id"]) for r in live if r.get("Id")}
+        missing = [
+            row for row in _fetch_silver_lines(invoice_id)
+            if int(row["source_id"]) not in live_ids
+        ]
+        if not missing:
+            # Mismatch has some other cause; leave it be.
+            skipped += 1
+            continue
+
+        gap = _decimal(inv["line_gross"]) - sum(_decimal(r["gross"]) for r in missing)
+        if abs(gap - _decimal(inv["total_amount"])) > Decimal("0.01"):
+            logger.warning(
+                "Orphan lines: %s (%s) has %s missing line(s) but removing them "
+                "leaves %s vs header %s - not a clean deletion, skipping",
+                inv["invoice_number"], invoice_id, len(missing),
+                gap, inv["total_amount"],
+            )
+            skipped += 1
+            continue
+
+        to_delete.extend(int(r["source_id"]) for r in missing)
+        logger.info(
+            "Orphan lines: %s (%s) - %s line(s) deleted at source, reconciles to %s",
+            inv["invoice_number"], invoice_id, len(missing), inv["total_amount"],
+        )
+
+    if not to_delete:
+        return 0, skipped
+
+    return _soft_delete_lines(to_delete), skipped
+
+
+def _fetch_orphan_line_candidates(cutoff: datetime) -> list[dict]:
+    """Invoices whose header total no longer matches the sum of their silver lines."""
+    sql = get_sql_client()
+    return sql.execute_query(
+        """
+        WITH line_sums AS (
+            SELECT invoice_source_id,
+                   SUM(ISNULL(sub_total, 0) + ISNULL(tax_amount, 0)) AS line_gross
+            FROM silver.nexudus_coworker_invoice_lines
+            WHERE is_deleted = 0
+            GROUP BY invoice_source_id
+        )
+        SELECT i.source_id, i.invoice_number, i.total_amount, ls.line_gross
+        FROM silver.nexudus_coworker_invoices i
+        INNER JOIN line_sums ls ON ls.invoice_source_id = i.source_id
+        WHERE ISNULL(i.draft, 0) = 0
+          AND ISNULL(i.void,  0) = 0
+          AND ISNULL(i.is_deleted, 0) = 0
+          AND i.due_date >= ?
+          AND ABS(ISNULL(i.total_amount, 0) - ls.line_gross) > 0.01
+        ORDER BY i.source_id
+        """,
+        (cutoff,),
+    )
+
+
+def _fetch_silver_lines(invoice_source_id: int) -> list[dict]:
+    sql = get_sql_client()
+    return sql.execute_query(
+        """
+        SELECT source_id,
+               ISNULL(sub_total, 0) + ISNULL(tax_amount, 0) AS gross
+        FROM silver.nexudus_coworker_invoice_lines
+        WHERE invoice_source_id = ? AND is_deleted = 0
+        """,
+        (invoice_source_id,),
+    )
+
+
+def _soft_delete_lines(line_source_ids: list[int]) -> int:
+    sql = get_sql_client()
+    with sql.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE #orphan_line_ids (source_id BIGINT PRIMARY KEY)")
+        try:
+            cursor.fast_executemany = True
+        except AttributeError:
+            pass
+        cursor.executemany(
+            "INSERT INTO #orphan_line_ids (source_id) VALUES (?)",
+            [(i,) for i in line_source_ids],
+        )
+        cursor.execute(
+            """
+            UPDATE silver.nexudus_coworker_invoice_lines
+            SET is_deleted = 1, deleted_at = GETUTCDATE(), deleted_reason = 'orphan'
+            WHERE is_deleted = 0
+              AND source_id IN (SELECT source_id FROM #orphan_line_ids)
+            """
+        )
+        deleted = cursor.rowcount if cursor.rowcount is not None else 0
+        cursor.execute("DROP TABLE #orphan_line_ids")
+        logger.info("Orphan lines: %s soft-deleted", deleted)
+        return deleted
+
+
+def _decimal(value) -> Decimal:
+    return Decimal(str(value if value is not None else 0))

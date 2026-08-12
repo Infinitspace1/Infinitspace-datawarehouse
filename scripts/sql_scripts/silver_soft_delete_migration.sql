@@ -67,6 +67,24 @@ BEGIN
 END
 GO
 
+-- Added 2026-08-12. Invoice lines are the one table with TWO independent
+-- reasons to be tombstoned, and they must not undo each other:
+--   'cascade' — the parent invoice died (or its location is excluded). The
+--               daily cascade both sets and clears these, so restoring a
+--               parent brings its lines back with it.
+--   'orphan'  — the line itself was deleted in Nexudus while the invoice lives
+--               on (_reconcile_orphan_lines). Its parent is perfectly healthy,
+--               so the cascade's restore half would resurrect it every run.
+-- Without this column the two passes fight, and restoring any invoice silently
+-- un-deletes every orphan line in the table. NULL = pre-existing rows, all of
+-- which were cascade deletions, so the restore treats NULL as 'cascade'.
+IF COL_LENGTH('silver.nexudus_coworker_invoice_lines', 'deleted_reason') IS NULL
+BEGIN
+    ALTER TABLE silver.nexudus_coworker_invoice_lines
+    ADD deleted_reason NVARCHAR(20) NULL;
+END
+GO
+
 
 -- ── silver.nexudus_locations ─────────────────────────────────────
 IF COL_LENGTH('silver.nexudus_locations', 'is_deleted') IS NULL

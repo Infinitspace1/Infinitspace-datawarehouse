@@ -171,6 +171,12 @@ filtered_lines AS (
       -- (they net revenue down via separate negative-amount invoices).
       AND ISNULL(i.draft, 0) = 0
       AND ISNULL(i.void,  0) = 0
+      -- Honour silver's tombstones (added 2026-08-12). Without these the view
+      -- counted rows the reconcile had already marked as gone at source: lines
+      -- deleted off a surviving invoice, and every invoice belonging to an
+      -- excluded location (Kingsbourne House).
+      AND ISNULL(il.is_deleted, 0) = 0
+      AND ISNULL(i.is_deleted,  0) = 0
       AND i.location_source_id IS NOT NULL
       -- Must have some kind of dating
       AND (i.invoice_from_date IS NOT NULL OR i.created_on IS NOT NULL OR i.due_date IS NOT NULL)
