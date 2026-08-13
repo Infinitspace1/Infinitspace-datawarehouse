@@ -24,6 +24,8 @@ _COLUMN_KEYS = (
     ("description", "description"),
     ("resource_type_id", "resource_type_id"),
     ("resource_type_name", "resource_type_name"),
+    ("system_resource_type", "system_resource_type"),
+    ("is_archived", "is_archived"),
     ("group_id", "group_id"),
     ("group_name", "group_name"),
     ("is_visible", "is_visible"),

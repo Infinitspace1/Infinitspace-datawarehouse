@@ -10,7 +10,7 @@ Entities pulled (in order):
   3. contracts              -- GET /billing/coworkercontracts
   4. coworker_invoices      -- GET /billing/coworkerinvoices
   5. coworkers              -- GET /spaces/coworkers
-  6. resources              -- GET /spaces/resources/{id}
+  6. resources              -- GET /spaces/resources (full ID sweep) + /spaces/resources/{id}
   7. extra_services         -- GET /billing/extraservices
   8. coworker_invoice_lines -- GET /billing/coworkerinvoicelines
   9. coworker_invoice_histories -- GET /billing/coworkerinvoicehistories
@@ -135,7 +135,7 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
             writer = BronzeWriter(run_id)
 
             locations = await _sync_locations(client, blob_writer, writer, run_id)
-            products, resource_ids_by_location = await _sync_products(client, blob_writer, writer, run_id, locations)
+            products = await _sync_products(client, blob_writer, writer, run_id, locations)
             await _sync_contracts(client, blob_writer, writer, run_id, products)
             changed_invoices = await _sync_coworker_invoices(client, blob_writer, writer, run_id)
             # Re-fetch every open invoice by ID so a payment/credit that Nexudus
@@ -143,7 +143,7 @@ async def nexudus_to_bronze(timer: func.TimerRequest) -> None:
             # window above) still refreshes its DueAmount downstream.
             await _resync_open_invoices(client, blob_writer, writer, run_id)
             await _sync_coworkers(client, blob_writer, writer, run_id)
-            await _sync_resources(client, blob_writer, writer, run_id, resource_ids_by_location)
+            await _sync_resources(client, blob_writer, writer, run_id)
             await _sync_extra_services(client, blob_writer, writer, run_id)
             await _sync_coworker_invoice_lines(client, blob_writer, writer, run_id, changed_invoices)
             await _sync_coworker_invoice_histories(client, blob_writer, writer, run_id)
@@ -186,7 +186,7 @@ async def _sync_products(
     writer: BronzeWriter,
     run_id: uuid.UUID,
     locations: list[dict],
-) -> tuple[list[dict], dict[int, list[int]]]:
+) -> list[dict]:
     extra_params = _incremental_params("products")
     async with RunTracker("nexudus", "products", "bronze", metadata=str(run_id)) as run:
         records = await client.get_all("sys/floorplandesks", extra_params=extra_params)
@@ -194,24 +194,11 @@ async def _sync_products(
         blob_path = blob_writer.write_snapshot("products", records, run_id)
         changed, run.rows_written = writer.write_products(records)
         run.rows_skipped = len(records) - len(changed)
-
-        # Build resource IDs only from changed products
-        resource_ids_by_location: dict[int, list[int]] = {}
-        for r in changed:
-            resource_id = r.get("ResourceId")
-            location_id = r.get("FloorPlanBusinessId")
-            if resource_id and location_id:
-                resource_ids_by_location.setdefault(location_id, [])
-                if resource_id not in resource_ids_by_location[location_id]:
-                    resource_ids_by_location[location_id].append(resource_id)
-
         logger.info(
-            "Products: %s fetched, %s changed, %s skipped, %s written to bronze. "
-            "ResourceIds from changed: %s [blob=%s]",
-            run.rows_read, len(changed), run.rows_skipped, run.rows_written,
-            sum(len(v) for v in resource_ids_by_location.values()), blob_path,
+            "Products: %s fetched, %s changed, %s skipped, %s written to bronze [blob=%s]",
+            run.rows_read, len(changed), run.rows_skipped, run.rows_written, blob_path,
         )
-        return records, resource_ids_by_location
+        return records
 
 
 async def _sync_contracts(
@@ -239,36 +226,41 @@ async def _sync_resources(
     blob_writer: BlobWriter,
     writer: BronzeWriter,
     run_id: uuid.UUID,
-    resource_ids_by_location: dict[int, list[int]],
 ) -> None:
-    """Resources are fetched per-ID from products — no UpdatedSince support."""
-    all_resource_ids = [
-        (location_id, resource_id)
-        for location_id, ids in resource_ids_by_location.items()
-        for resource_id in ids
-    ]
+    """Full resource sweep every run (~100 records, no UpdatedSince support).
 
-    if not all_resource_ids:
-        logger.info("Resources: no ResourceIds found in changed products, skipping")
-        return
-
+    Previously resources were fetched per-ID only when a referencing floor-plan
+    product changed, so a resource whose own flags changed (e.g. a meeting room
+    hidden by reception) stayed stale in silver indefinitely — the Aug 2026
+    Fox Court incident, where a room hidden in June still showed `is_visible=1`.
+    Now the full ID list comes from GET /spaces/resources and every resource is
+    re-fetched per-ID (the list shape lacks fields the detail shape carries, so
+    bronze keeps storing the detail payload). The location comes from the
+    record's own BusinessId, not from the product that references it.
+    """
     async with RunTracker("nexudus", "resources", "bronze", metadata=str(run_id)) as run:
+        list_records = await client.get_all("spaces/resources")
+        all_resource_ids = [int(r["Id"]) for r in list_records if r.get("Id")]
         run.rows_read = len(all_resource_ids)
+
+        if not all_resource_ids:
+            logger.warning("Resources: list endpoint returned no records, skipping")
+            return
 
         tasks = [
             client.get_one(f"spaces/resources/{resource_id}")
-            for _, resource_id in all_resource_ids
+            for resource_id in all_resource_ids
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         records = []
-        for (location_id, resource_id), result in zip(all_resource_ids, results):
+        for resource_id, result in zip(all_resource_ids, results):
             if isinstance(result, Exception):
                 logger.warning(f"Resource {resource_id} failed: {result}")
                 run.rows_skipped += 1
                 continue
             if result:
-                records.append((result, location_id))
+                records.append((result, result.get("BusinessId")))
 
         blob_records = [
             {"location_id": location_id, "record": record}

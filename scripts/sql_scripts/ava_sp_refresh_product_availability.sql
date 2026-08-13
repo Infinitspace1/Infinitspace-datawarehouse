@@ -7,8 +7,10 @@
 --              1. hot_desk        (silver.nexudus_products item_type = 3)
 --              2. dedicated_desk  (silver.nexudus_products item_type = 2)
 --              3. private_office  (silver.nexudus_products item_type = 1 + contracts)
---              4. meeting_room    (silver.nexudus_extra_services + resources)
---              5. day_pass        (silver.nexudus_extra_services, resource_type_names LIKE 'hot desk%')
+--              4. meeting_room    (silver.nexudus_resources = rooms; extra_services = prices,
+--                                  matched on resource type name — card location ignored)
+--              5. day_pass        (silver.nexudus_extra_services, resource_type_names LIKE 'hot desk%',
+--                                  location corrected via the site tag in the type name)
 --
 -- Called by: functions/ava_refresh.py  (Azure Function, timer 03:00 UTC)
 -- Run time : ~5–30 s depending on data volume
@@ -469,33 +471,81 @@ BEGIN
 
 
         -- ==================================================================
-        -- 4. MEETING ROOMS
-        --    Source  : silver.nexudus_extra_services
-        --              WHERE resource_type_names IS NOT NULL
-        --              AND LOWER(resource_type_names) NOT LIKE 'hot desk%'
-        --    Capacity: silver.nexudus_resources.allocation
-        --              joined ON resource_type_name = resource_type_names (exact match)
-        --              AND same location_source_id.
-        --    Price   : MIN(price) per (location, resource_type_names) — cheapest tier.
-        --    One row per distinct (location_source_id, resource_type_names).
-        --    Always available.
+        -- 4. MEETING ROOMS  (resources-driven — redesigned 2026-08-13)
         --
-        --    NOTE: resource_type_names is treated as a single value (matching test.sql
-        --    pattern). Comma-separated values are an edge case for later if needed.
+        --    Rooms   : silver.nexudus_resources — the rooms that physically
+        --              exist per location. Filter: system_resource_type = 1
+        --              (meeting room), visible, not archived/deleted, and the
+        --              type name mentions meeting/board (drops Boats, Rooftop,
+        --              UNLP and other srt=1 non-rooms). One row per
+        --              (location, resource type) with a room count in the
+        --              notes. A room hidden in Nexudus drops out on the next
+        --              refresh automatically.
+        --    Prices  : silver.nexudus_extra_services rate cards matched on
+        --              the resource TYPE NAME — globally unique because it
+        --              embeds the site tag ("8 person meeting room (FC)").
+        --              The card's OWN BusinessId is deliberately IGNORED:
+        --              several cards are filed under the wrong business in
+        --              Nexudus (all four FC room rates under The Bower, the
+        --              ZT 10P rates under Aldgate — verified against the live
+        --              API 2026-08-13). The old extra-services-driven build
+        --              trusted the card's location, which deleted Fox Court's
+        --              real rooms from this table and left only the hidden
+        --              £185 classroom — the "Claire" misquote incident.
+        --              (The card's ResourceTypes IDs would be the ideal join
+        --              key, but the /billing/extraservices LIST endpoint the
+        --              sync uses does not return them — only the per-ID
+        --              detail call does. The type name is derived from the
+        --              same ID relationship, so it is a faithful stand-in.)
+        --    Tiers   : cards named "…standard rate…" are preferred over
+        --              discounted/special tiers; ties broken by newest
+        --              updated_on, then lowest price. "(non-member…)" in the
+        --              card name marks the external price. The old MIN/MAX
+        --              across ALL tiers blended discounted + standard into
+        --              prices nobody pays (e.g. Aldgate 6P £22/£48).
+        --    No card → price 0 (renderer shows "Price on request") rather
+        --              than hiding a room that exists.
         -- ==================================================================
-        ;WITH meeting_room_prices AS (
+        ;WITH meeting_rooms AS (
             SELECT
-                location_source_id,
-                resource_type_names,
-                MIN(price)         AS member_price,     -- cheapest tier = member rate
-                MAX(price)         AS external_price,   -- most expensive tier = non-member rate
-                MIN(source_id)     AS min_source_id,    -- representative row for traceability
-                MAX(currency_code) AS currency_code     -- consistent within a location
-            FROM silver.nexudus_extra_services
-            WHERE resource_type_names IS NOT NULL
-              AND LOWER(resource_type_names) NOT LIKE 'hot desk%'
-              AND is_deleted = 0
-            GROUP BY location_source_id, resource_type_names
+                r.location_source_id,
+                r.resource_type_name,
+                COUNT(*)          AS room_count,
+                MAX(r.allocation) AS capacity,
+                MIN(r.source_id)  AS representative_resource_id
+            FROM silver.nexudus_resources r
+            WHERE r.is_deleted = 0
+              AND r.is_visible = 1
+              AND ISNULL(r.is_archived, 0) = 0
+              AND r.system_resource_type = 1
+              AND r.location_source_id IS NOT NULL
+              AND r.resource_type_name IS NOT NULL
+              AND (LOWER(r.resource_type_name) LIKE '%meeting%'
+                   OR LOWER(r.resource_type_name) LIKE '%board%')
+            GROUP BY r.location_source_id, r.resource_type_name
+        ),
+        rate_cards AS (
+            SELECT
+                es.source_id,
+                es.resource_type_names,
+                es.price,
+                es.currency_code,
+                CASE WHEN LOWER(es.name) LIKE '%non%member%' THEN 1 ELSE 0 END
+                    AS is_external,
+                ROW_NUMBER() OVER (
+                    PARTITION BY
+                        es.resource_type_names,
+                        CASE WHEN LOWER(es.name) LIKE '%non%member%' THEN 1 ELSE 0 END
+                    ORDER BY
+                        CASE WHEN LOWER(es.name) LIKE '%standard%' THEN 0 ELSE 1 END,
+                        es.updated_on DESC,
+                        es.price
+                ) AS pick_rank
+            FROM silver.nexudus_extra_services es
+            WHERE es.is_deleted = 0
+              AND es.charge_period = 1          -- hourly room rates only
+              AND es.price > 0
+              AND es.resource_type_names IS NOT NULL
         )
         INSERT INTO ava.product_availability (
             location_source_id, location_name, city, country_name,
@@ -509,58 +559,111 @@ BEGIN
             last_refreshed_at
         )
         SELECT
-            mp.location_source_id,
+            mr.location_source_id,
             l.name,
             l.city,
             l.country_name,
             'meeting_room',
-            NULL                    AS product_source_id,
-            r.source_id             AS resource_source_id,  -- NULL if resource join misses
-            mp.min_source_id        AS extra_service_source_id,
-            mp.resource_type_names  AS item_name,
-            r.allocation            AS capacity,            -- NULL if resource join misses
-            mp.member_price         AS price,
-            CASE WHEN mp.external_price <> mp.member_price
-                 THEN mp.external_price
+            NULL                            AS product_source_id,
+            mr.representative_resource_id   AS resource_source_id,
+            m.source_id                     AS extra_service_source_id,
+            mr.resource_type_name           AS item_name,
+            mr.capacity,
+            COALESCE(m.price, e.price, 0)   AS price,   -- 0 → "Price on request"
+            CASE WHEN m.price IS NOT NULL
+                  AND e.price IS NOT NULL
+                  AND e.price <> m.price
+                 THEN e.price
                  ELSE NULL
-            END                     AS external_price,      -- NULL when only one price tier exists
-            mp.currency_code,
-            'per_booking'           AS charge_period,
+            END                             AS external_price,
+            COALESCE(m.currency_code, e.currency_code),
+            'per_booking'                   AS charge_period,
             1,
             NULL,
             NULL,
             NULL,
             NULL,
-            'Always available',
+            'Always available - '
+                + CAST(mr.room_count AS VARCHAR(10))
+                + CASE WHEN mr.room_count = 1 THEN ' room' ELSE ' rooms' END
+                + ' of this type',
             GETUTCDATE()
-        FROM meeting_room_prices mp
+        FROM meeting_rooms mr
         JOIN silver.nexudus_locations l
-            ON mp.location_source_id = l.source_id
-        LEFT JOIN silver.nexudus_resources r
-            ON  r.resource_type_name = mp.resource_type_names  -- exact match
-            AND r.location_source_id = mp.location_source_id   -- scoped to same location
-            AND r.is_visible            = 1;                       -- exclude deactivated resources
+            ON mr.location_source_id = l.source_id
+        LEFT JOIN rate_cards m
+            ON  m.resource_type_names = mr.resource_type_name
+            AND m.is_external = 0
+            AND m.pick_rank   = 1
+        LEFT JOIN rate_cards e
+            ON  e.resource_type_names = mr.resource_type_name
+            AND e.is_external = 1
+            AND e.pick_rank   = 1;
 
 
         -- ==================================================================
         -- 5. DAY PASSES
         --    Source  : silver.nexudus_extra_services
         --              WHERE LOWER(resource_type_names) LIKE 'hot desk%'
+        --              AND charge_period = 2  (per-day services only — keeps
+        --              the £99 monthly "Hot Desk (TB)" bundle out)
+        --              AND price > 0  (partner freebies like the £0 "Free
+        --              BobW Hot Desk Day Pass" are not the public day rate)
+        --    Location: the site tag Nexudus embeds in resource_type_names
+        --              ("Hot desk (FC)") wins over the service's own
+        --              BusinessId. Several day passes are filed under the
+        --              WRONG business in Nexudus (both FC passes under The
+        --              Bower, both C29 passes under Heidestrasse — verified
+        --              against the live API 2026-08-13), which made e.g.
+        --              Heidestrasse's day-pass row a blend of QH + C29
+        --              passes. Unknown/missing tag → keep the service's own
+        --              location (current behaviour).
         --    Capacity: always 1
-        --    Price   : MIN(price) per location (cheapest day pass per location)
+        --    Price   : MIN(price) = member rate, MAX(price) = non-member
+        --              rate (same convention as the meeting-room section;
+        --              external_price NULL when only one tier exists).
         --    One row per location.
         --    Always available.
         -- ==================================================================
-        ;WITH day_pass_min AS (
+        ;WITH day_pass_services AS (
+            SELECT
+                es.source_id,
+                es.name,
+                es.price,
+                es.currency_code,
+                COALESCE(tag.location_source_id, es.location_source_id) AS location_source_id
+            FROM silver.nexudus_extra_services es
+            OUTER APPLY (
+                -- Site tag → Nexudus business id. Add a row when a new
+                -- location opens (tags follow the location's short code).
+                SELECT TOP 1 t.location_source_id
+                FROM (VALUES
+                    ('(AT)',  CAST(1376491118 AS BIGINT)),  -- Aldgate Tower
+                    ('(TB)',  1415499547),                  -- The Bower / Old Street
+                    ('(FC)',  1420976575),                  -- Fox Court
+                    ('(ZT)',  1414964753),                  -- Zuidtoren
+                    ('(REP)', 1415079491),                  -- Republica Campus
+                    ('(GB)',  1420951935),                  -- Gouden Bocht
+                    ('(QH)',  1420962233),                  -- Quartier Heidestrasse
+                    ('(C29)', 1420976475)                   -- Chausseestrasse
+                ) AS t(tag, location_source_id)
+                WHERE es.resource_type_names LIKE '%' + t.tag + '%'
+                ORDER BY t.tag
+            ) tag
+            WHERE LOWER(es.resource_type_names) LIKE 'hot desk%'
+              AND es.is_deleted = 0
+              AND es.charge_period = 2
+              AND es.price > 0
+        ),
+        day_pass_min AS (
             SELECT
                 location_source_id,
                 MIN(price)         AS min_price,
+                MAX(price)         AS max_price,
                 MAX(currency_code) AS currency_code,
                 MIN(source_id)     AS min_source_id,
-                MIN(name)          AS item_name    -- name of the cheapest pass for display
-            FROM silver.nexudus_extra_services
-            WHERE LOWER(resource_type_names) LIKE 'hot desk%'
-              AND is_deleted = 0
+                MIN(name)          AS item_name    -- alphabetically first pass name for display
+            FROM day_pass_services
             GROUP BY location_source_id
         )
         INSERT INTO ava.product_availability (
@@ -586,7 +689,10 @@ BEGIN
             dp.item_name,
             1,
             dp.min_price,
-            NULL,
+            CASE WHEN dp.max_price <> dp.min_price
+                 THEN dp.max_price
+                 ELSE NULL
+            END,                -- non-member rate (NULL when only one tier)
             dp.currency_code,
             'per_day',
             1,
