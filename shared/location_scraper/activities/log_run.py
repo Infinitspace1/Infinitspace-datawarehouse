@@ -15,6 +15,10 @@ from shared.azure_clients.sql_client import get_sql_client
 
 logger = logging.getLogger(__name__)
 
+# A finished run is 'completed' or 'degraded' (upstream returned far less than
+# the city normally yields -- see shared/location_scraper/run_health.py). The
+# distinction matters operationally: ls_cities_needing_run only skips
+# 'completed', so a degraded city is picked up again by the mid-week retry pass.
 _UPDATE_LOG = """
 UPDATE bronze.n8n_location_scraper_logs
 SET
@@ -23,8 +27,23 @@ SET
     buildings_found  = ?,
     buildings_new    = ?,
     buildings_updated= ?,
-    status           = 'completed',
-    error_message    = NULL,
+    status           = ?,
+    error_message    = ?,
+    updated_at       = GETDATE()
+WHERE run_id = ?
+"""
+
+# Same update for databases where the error_message migration has not been
+# applied yet (mirrors the fallback in mark_run_failed).
+_UPDATE_LOG_NO_ERROR_COLUMN = """
+UPDATE bronze.n8n_location_scraper_logs
+SET
+    run_date         = ?,
+    source           = ?,
+    buildings_found  = ?,
+    buildings_new    = ?,
+    buildings_updated= ?,
+    status           = ?,
     updated_at       = GETDATE()
 WHERE run_id = ?
 """
@@ -32,8 +51,18 @@ WHERE run_id = ?
 _INSERT_LOG = """
 INSERT INTO bronze.n8n_location_scraper_logs
     (run_id, city, run_date, source, buildings_found, buildings_new, buildings_updated, status)
-VALUES (?, ?, ?, ?, ?, ?, ?, 'completed')
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 """
+
+# Every city row of one weekly period (run_id = weekly-<city-slug>-<period_key>).
+_PERIOD_RUNS = """
+SELECT run_id, city, source, buildings_found, buildings_new, status, error_message
+FROM bronze.n8n_location_scraper_logs
+WHERE run_id LIKE ?
+ORDER BY city
+"""
+
+FINISHED_STATUSES = ("completed", "degraded")
 
 _MARK_STALE_RUNNING_FAILED = """
 UPDATE bronze.n8n_location_scraper_logs
@@ -112,6 +141,13 @@ def completed_run_ids(run_ids: list[str]) -> set[str]:
         tuple(run_ids),
     )
     return {row["run_id"] for row in (rows or [])}
+
+
+def runs_for_period(period_key: str) -> list[dict]:
+    """Every weekly city row for one ISO week, for the end-of-run health alert."""
+    sql = get_sql_client()
+    rows = sql.execute_query(_PERIOD_RUNS, (f"weekly-%-{period_key}",))
+    return [dict(row) for row in (rows or [])]
 
 
 _DELETE_RUN_QUALITY = "DELETE FROM bronze.location_scraper_run_quality WHERE run_id = ?"
@@ -207,23 +243,36 @@ def write_logs(stats: dict) -> None:
     buildings_found = stats.get("buildings_found", 0)
     buildings_new = stats.get("buildings_new", 0)
     buildings_updated = stats.get("buildings_updated", 0)
+    status = (stats.get("run_status") or "completed").strip().lower()
+    if status not in FINISHED_STATUSES:
+        status = "completed"
+    note = (stats.get("health_note") or "")[:4000] or None
 
     sql = get_sql_client()
-    affected = sql.execute_non_query(
-        _UPDATE_LOG,
-        (today, source, buildings_found, buildings_new, buildings_updated, run_id),
-    )
+    try:
+        affected = sql.execute_non_query(
+            _UPDATE_LOG,
+            (today, source, buildings_found, buildings_new, buildings_updated, status, note, run_id),
+        )
+    except Exception:
+        # error_message column not present yet -- degrade gracefully.
+        affected = sql.execute_non_query(
+            _UPDATE_LOG_NO_ERROR_COLUMN,
+            (today, source, buildings_found, buildings_new, buildings_updated, status, run_id),
+        )
     if affected == 0:
         sql.execute_non_query(
             _INSERT_LOG,
-            (run_id, stats.get("city", ""), today, source, buildings_found, buildings_new, buildings_updated),
+            (run_id, stats.get("city", ""), today, source, buildings_found, buildings_new, buildings_updated, status),
         )
 
-    logger.info(
+    log = logger.warning if status == "degraded" else logger.info
+    log(
         "location_scraper run_id=%s city=%s source=%s "
-        "found=%d new=%d updated=%d",
+        "found=%d new=%d updated=%d status=%s%s",
         run_id, stats.get("city"), source,
-        buildings_found, buildings_new, buildings_updated,
+        buildings_found, buildings_new, buildings_updated, status,
+        f" reason={note!r}" if note else "",
     )
 
     if "raw_item_count" in stats:

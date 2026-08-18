@@ -47,6 +47,7 @@ jobs:
         run: |
           python -m pytest tests/test_location_scraper_resolve_source.py \
                            tests/test_location_scraper_idealista_e2e.py \
+                           tests/test_location_scraper_run_health.py \
                            -v --tb=short
 
   deploy:
