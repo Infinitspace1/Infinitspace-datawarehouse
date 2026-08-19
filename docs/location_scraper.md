@@ -232,6 +232,32 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
   against 11 buildings from the 2026-08-17 production run. New York: 197
   distinct buildings, 98% with an email.
 
+  **The search stage is not infallible, and that shapes the results.** When the
+  mobile SRP answers, the `min-space-size` filter is honoured and the placards
+  are complete. When it 403s (`SRP ...: mobile search 403 (App Check)`) the
+  actor falls back: it re-queries from the geocoded city area **without our size
+  filter**, so the page fills with small spaces, and it recovers individual
+  listings through the paid unblocker — which can be dry. Two consequences seen
+  on the 2026-08-19 re-run of all 12 cities:
+    - where the SRP answered, the gain is large (London 11 -> 260 buildings,
+      New York 24 -> 220, Toronto 24 -> 93, Seattle 19 -> 49);
+    - where it 403'd, small cities came back **worse** than the old detail path,
+      because their placard set is diluted with sub-threshold listings (San
+      Mateo: 50 items but only 12 above 1500 m², against 27/27 before; Palo
+      Alto 9 -> 1; San Bruno 0).
+  So a weak LoopNet city is now a *timing* symptom, not a code one — re-running
+  it later is the remedy, which is what the graded retries and the Wednesday
+  second pass are for.
+
+  **Known grading gap:** `ls_assess_run_health` scores a run on its RAW item
+  count, which is measured before the 1500 m² guardrail. A fallback run can
+  return *more* raw items than the baseline and still yield far fewer buildings
+  (San Mateo 2026-08-19: 50 raw vs a 27 baseline -> graded `completed`, 6
+  buildings). Such a run is not retried and its thinner marker set supersedes the
+  previous good one in gold. Grading on buildings-kept would close this, but the
+  verdict is computed before `ls_normalize`, so it needs the retry loop
+  restructured -- deliberately not done in the same change as the fix itself.
+
   Result pages overlap (London: 550 items for 320 buildings), so `ls_normalize`
   drops repeats by `external_id` within a run.
 
