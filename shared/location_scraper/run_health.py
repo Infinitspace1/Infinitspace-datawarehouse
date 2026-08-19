@@ -171,12 +171,22 @@ def assess_run(
             "the actor's unblocker quota is exhausted (HTTP 401) — retrying will not help"
         )
 
+    # ...and it only makes a retry pointless when the run actually depended on
+    # the unblocker. Since 2026-08-19 LoopNet is scraped through the free
+    # mobile-API search stage (no detail fetch), so the marker can show up in
+    # the log of a run that never needed it -- New York 2026-08-19 returned 272
+    # items with 0 detail attempts and the quota marker present. Treating that
+    # as "do not retry" would silently disarm the retry loop.
+    retry_useless = provider_exhausted and (
+        int(detail.get("attempted") or 0) > 0 or raw_item_count <= 0
+    )
+
     return {
         "ok": not reasons,
         "status": "ok" if not reasons else "degraded",
-        # Nothing a retry can do: the shared upstream budget is spent, so the
-        # caller stops attempting instead of burning actor starts.
-        "retry_useless": provider_exhausted,
+        # Nothing a retry can do: the shared upstream budget is spent AND the
+        # run needed it, so the caller stops instead of burning actor starts.
+        "retry_useless": retry_useless,
         "reason": "; ".join(reasons),
         "raw_item_count": int(raw_item_count),
         "baseline": int(baseline),

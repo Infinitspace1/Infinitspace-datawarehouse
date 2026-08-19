@@ -49,7 +49,7 @@ sequenceDiagram
 | Step | Activity | Description |
 |------|----------|-------------|
 | 1 | `ls_resolve_source` | Maps `City` → country / actor / start URL |
-| 1b | `ls_enumerate_loopnet_urls` | LoopNet gb/ca only: listing-detail URLs from the filtered search pages. Retried `LOCATION_SCRAPER_ENUM_ATTEMPTS` times — an empty result is transient (the residential edge refusing the actor), and falling straight through to the broad search costs ~90% of the city |
+| 1b | `ls_enumerate_loopnet_urls` | **Disabled by default since 2026-08-19** (`LOOPNET_ENUMERATION_COUNTRIES` is empty). It produced bare listing URLs, which force memo23's broken per-listing detail fetch; LoopNet is now scraped through the paginated search instead. Set `LOOPNET_ENUMERATION_COUNTRIES=gb,ca` to restore it |
 | 2 | `ls_start_apify_run` | Fires Apify actor (async, no wait) |
 | 3 | `ls_check_apify_run` | Polls status with timer loop (max ~40 min) |
 | 4 | `ls_fetch_dataset` | Downloads all dataset items |
@@ -75,8 +75,9 @@ rather than fails:
   the 2026-08-17 wave lost 34/48 London listings, 252/329 Los Angeles, 78/89
   Austin. The loss rate is time-of-day dependent: every post-403 daytime sample
   recovers 95–100%, every 01:00 UTC sample 19–29%.
-- **Empty enumeration.** The gb/ca enumeration actor returns 0 URLs when the
-  residential edge refuses it, silently degrading the city to the broad search.
+- **Empty enumeration.** *(Legacy path, off by default since 2026-08-19.)* The
+  gb/ca enumeration actor returns 0 URLs when the residential edge refuses it,
+  silently degrading the city to the broad search.
 - **Exhausted unblocker quota.** That chain is shared by every user of the actor
   and it runs dry (`scrapingbee is quota-throttled (HTTP 401)`). Then even the
   *search* stage fails on loopnet.com — which has no enumeration path to fall
@@ -85,7 +86,14 @@ rather than fails:
   afterwards returned 0. This one is **not** worth retrying, so the verdict
   carries `retry_useless` and the attempt loop stops immediately; the quota is
   only ever a retry signal, never a quality one (a run that delivers its city
-  and drains the budget on the way out is still a good run).
+  and drains the budget on the way out is still a good run). `retry_useless` is
+  raised **only when the run actually needed the unblocker** (it did a detail
+  fetch, or it returned nothing) — the paginated search path never touches it,
+  and a healthy run must not have its retries disarmed by a stray log line.
+
+Since 2026-08-19 the first and third modes no longer apply to a normal LoopNet
+run: the pipeline asks for the search stage only, so there is no detail fetch to
+lose listings on and no unblocker to run dry.
 
 `ls_assess_run_health` reads both signals — the actor's own per-listing markers
 in its run log, and the city's best raw volume over the last
@@ -202,6 +210,37 @@ Poll `statusQueryGetUri` to track progress. When `runtimeStatus` is `"Completed"
 
 #### LoopNet (UK + US + Canada) notes
 
+- **How the search is driven (since 2026-08-19).** The actor has two stages and
+  only one of them works: its SEARCH stage reads LoopNet's *free* mobile API
+  (`_dataSource: free-mobile-api`), while its per-listing DETAIL stage gets a
+  403 (LoopNet put that API behind App Check) and has to recover every listing
+  through a paid unblocker chain that is throttled to one provider. So the
+  pipeline asks for the search stage only (`includeListingDetails: false`) and
+  gets its volume by walking result pages — the actor serves **one page per
+  start URL**, so `LOOPNET_SEARCH_PAGES` (default 15) `?page=N` URLs are sent.
+  The page must be a **query** param: the actor drops the `/N/` path segment and
+  re-serves page 1.
+
+  The search placard already carries everything downstream needs — building
+  address / postcode / city, available square footage (`sizeSf`, labelled
+  "SF Avail" and equal to the detail page's available area), broker
+  name / company / phone / **email**, and **coordinates** (which the detail
+  payload never had, so LoopNet listings no longer need geocoding).
+
+  Measured 2026-08-19, London: **320 distinct buildings, 297 above the 1500 m²
+  floor, 96% with a broker email, 100% with coordinates, 0 detail fetches** —
+  against 11 buildings from the 2026-08-17 production run. New York: 197
+  distinct buildings, 98% with an email.
+
+  Result pages overlap (London: 550 items for 320 buildings), so `ls_normalize`
+  drops repeats by `external_id` within a run.
+
+  Two payload fields must NOT be trusted on the placard: `currency` says "USD"
+  for London, and `country` is absent — both are resolved from the city being
+  scraped instead. Lease prices are quoted as `$X /SF/YR` strings with no
+  numeric field, so `price_monthly` stays NULL on this path (the detail payload
+  used to fill it for ~47% of listings; the unit is ambiguous and the adapter
+  has always refused to coerce it).
 - Actor: `memo23/loopnet-scraper-ppe` (`0ZCQONxB3BdyOzrbD`), pay-per-event (~$1.50/1k). The
   $31/mo flat-rate twin (`RuOxoBM1bnc5pQ3TJ`) is intentionally **not** used.
 - The same actor serves **US, UK and Canada**, but the URL shape differs by country
@@ -376,7 +415,9 @@ For raw JSON field discovery (before building/changing a globe view), run:
 | `LOCATION_SCRAPER_DETAIL_LOSS_THRESHOLD` | No | Share of candidate listings the actor may drop before the run is degraded; default `0.20` (healthy runs sit at 0–7%). |
 | `LOCATION_SCRAPER_BASELINE_RATIO` | No | Share of the city's best recent volume a run must reach; default `0.6`. |
 | `LOCATION_SCRAPER_BASELINE_RUNS` | No | How many previous runs define that baseline; default `8`. |
-| `LOCATION_SCRAPER_ENUM_ATTEMPTS` | No | LoopNet gb/ca enumeration attempts before falling back to the broad search; default `3`. |
+| `LOOPNET_SEARCH_PAGES` | No | Result pages of the filtered LoopNet search fetched per city; default `15`. The actor serves one page per start URL, so this is what sets the volume. |
+| `LOOPNET_ENUMERATION_COUNTRIES` | No | Country codes still using the legacy listing-URL enumeration; **empty by default**. `gb,ca` restores the old path. |
+| `LOCATION_SCRAPER_ENUM_ATTEMPTS` | No | LoopNet enumeration attempts before falling back to the broad search; default `3` (only used when enumeration is re-enabled). |
 | `LOCATION_SCRAPER_ENUM_RETRY_MINUTES` | No | Wait between enumeration attempts; default `5`. |
 | `LOCATION_SCRAPER_ALERT_RECIPIENTS` | No | Comma-separated recipients of the weekly degraded-cities email; falls back to `SYNC_REPORT_RECIPIENTS`. |
 | `GOOGLE_MAPS_API_KEY` | No | Geocoding for listings without coordinates (e.g. LoopNet). If unset, falls back to the **free Nominatim (OpenStreetMap)** geocoder automatically. |

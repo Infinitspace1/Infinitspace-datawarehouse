@@ -42,20 +42,45 @@ def _uk_listing(subtext="29,270 SF of Office Space Available", country="GB"):
     }
 
 
-def test_build_input_shape_and_cap():
+def test_build_input_paginates_the_search_and_skips_the_detail_fetch(monkeypatch):
+    """A search URL is walked page by page, with the detail fetch OFF.
+
+    memo23 serves one result page per start URL from LoopNet's free mobile API.
+    The per-listing detail fetch is the broken stage (403 -> throttled paid
+    unblocker, 20-77% of listings dropped), and the placard already carries the
+    building, the broker email and the available surface, so it is not needed.
+    """
+    monkeypatch.setenv("LOOPNET_SEARCH_PAGES", "4")
+    base = "https://www.loopnet.co.uk/search/office-space/london-england--united-kingdom/for-rent/?min-space-size=16146"
     adapter = LoopnetAdapter()
-    payload = adapter.build_input("https://www.loopnet.com/search/office-properties/london-england--united-kingdom/for-rent/")
+    payload = adapter.build_input(base)
+
     assert payload["startUrls"] == [
-        {"url": "https://www.loopnet.com/search/office-properties/london-england--united-kingdom/for-rent/"}
+        {"url": base},
+        {"url": f"{base}&page=2"},
+        {"url": f"{base}&page=3"},
+        {"url": f"{base}&page=4"},
     ]
-    assert payload["includeListingDetails"] is True
-    # moreResults bypasses memo23's 500-item cap so the filtered search returns
-    # the full qualifying set (replaces the retired enumeration 2-step).
+    assert payload["includeListingDetails"] is False
     assert payload["moreResults"] is True
     assert payload["maxItems"] == 100
-    # The paid-unblocker budget must be raised or dense cities get truncated.
     assert payload["maxUnblockerRequests"] == LOOPNET_MAX_UNBLOCKER_REQUESTS
     assert adapter.actor_id == LOOPNET_ACTOR_ID
+
+
+def test_search_page_urls_uses_query_param_not_path():
+    """The page MUST be a query param: the actor drops the `/N/` path segment
+    and re-serves page 1, so the path form silently collapses the pagination."""
+    from shared.location_scraper.adapters.loopnet import search_page_urls
+
+    assert search_page_urls("https://x/search/?a=1", 3) == [
+        "https://x/search/?a=1",
+        "https://x/search/?a=1&page=2",
+        "https://x/search/?a=1&page=3",
+    ]
+    # no query string yet -> starts one
+    assert search_page_urls("https://x/search/", 2)[1] == "https://x/search/?page=2"
+    assert search_page_urls("https://x/search/", 1) == ["https://x/search/"]
 
 
 def test_build_input_unlimited_sends_explicit_ceiling():
@@ -123,6 +148,9 @@ def test_build_input_listing_url_list():
     payload = LoopnetAdapter().build_input(urls, max_items=None)
     assert payload["startUrls"] == [{"url": u} for u in urls]
     assert payload["maxItems"] == LOOPNET_UNLIMITED_MAX_ITEMS
+    # Bare listing URLs carry no placard, so this mode alone still needs the
+    # (fragile) detail fetch — which is why it is no longer the default path.
+    assert payload["includeListingDetails"] is True
 
 
 def test_sf_to_m2_conversion():
@@ -298,3 +326,92 @@ def test_normalize_listing_web_name_payload_no_broker():
     assert listing is not None
     assert round(listing.surface_m2) == 1882  # 20,255 SF
     assert listing.email == ""  # no broker in this schema
+
+
+# ---------------------------------------------------------------------------
+# Search-placard payload (2026-08-19): the shape the paginated search returns.
+# ---------------------------------------------------------------------------
+
+def _search_placard(**overrides):
+    """One item as memo23's free-mobile-API search stage returns it."""
+    item = {
+        "propertyId": "39413508",
+        "listingName": "Esavian House",
+        "address": "181A High Holborn",
+        "city": "London",
+        "zip": "WC1V 7AP",
+        "sizeSf": "29.3K",
+        "totalSize": 29300,
+        "latitude": 51.517,
+        "longitude": -0.119,
+        "currency": "USD",  # deliberately wrong for London -- must be ignored
+        "price": "$27.07 - $175.98 /SF/YR",
+        "brokerName": "Billie Collins",
+        "brokerCompany": "Esavian House Offices Ltd",
+        "brokerPhone": "07919 112537",
+        "brokerEmail": "billie@esavianhouse.co.uk",
+        "listingUrl": "https://www.loopnet.com/Listing/39413508/",
+        "_dataSource": "free-mobile-api",
+    }
+    item.update(overrides)
+    return item
+
+
+def test_normalize_search_placard_keeps_building_and_broker_email():
+    """The two things the pipeline exists for must survive the search path."""
+    listing = LoopnetAdapter().normalize(_search_placard(), "london")
+    assert listing is not None
+    assert listing.address == "181A High Holborn"
+    assert listing.postal_code == "WC1V 7AP"
+    assert listing.external_id == "39413508"
+    assert listing.email == "billie@esavianhouse.co.uk"
+    assert listing.contact_name == "Billie Collins"
+    assert listing.company_name == "Esavian House Offices Ltd"
+    # 29,300 SF -> ~2722 m², kept natively in sqft for display
+    assert listing.surface_display == 29300.0
+    assert round(listing.surface_m2) == 2722
+
+
+def test_normalize_search_placard_uses_payload_coordinates():
+    """The placard carries coordinates; the detail payload never did, so every
+    LoopNet listing used to be geocoded from its postcode."""
+    listing = LoopnetAdapter().normalize(_search_placard(), "london")
+    assert listing.latitude == 51.517
+    assert listing.longitude == -0.119
+    assert listing.link_to_gmap == "https://www.google.com/maps/search/?api=1&query=51.517,-0.119"
+
+
+def test_normalize_zero_coordinates_fall_back_to_geocoding():
+    listing = LoopnetAdapter().normalize(
+        _search_placard(latitude=0, longitude=0), "london"
+    )
+    assert listing.latitude is None and listing.longitude is None
+    assert listing.link_to_gmap is None
+
+
+def test_normalize_currency_from_city_when_payload_has_no_country():
+    """The placard drops `country` and its `currency` says USD for London, so
+    the currency has to come from the city being scraped."""
+    adapter = LoopnetAdapter()
+    assert adapter.normalize(_search_placard(), "london").currency == "GBP"
+    assert adapter.normalize(_search_placard(), "toronto").currency == "CAD"
+    assert adapter.normalize(_search_placard(), "new york").currency == "USD"
+    # an explicit country on the payload (detail path) still wins
+    assert adapter.normalize(_search_placard(country="GB"), "new york").currency == "GBP"
+
+
+def test_normalize_listings_drops_repeated_listings_within_a_run(monkeypatch):
+    """Result pages overlap -- London returned 550 items for 320 buildings."""
+    from shared.location_scraper.activities import scrape as scrape_act
+
+    monkeypatch.setattr(scrape_act, "GeocodingCache", lambda *a, **k: None)
+    monkeypatch.setattr(scrape_act, "NominatimGeocodingCache", lambda *a, **k: None)
+    monkeypatch.setattr(scrape_act, "_apply_geocode_fallback", lambda *a, **k: False)
+
+    items = [
+        _search_placard(),
+        _search_placard(),  # same propertyId, served again by a later page
+        _search_placard(propertyId="99999999"),
+    ]
+    out = scrape_act.normalize_listings({"actor": "loopnet", "city": "london", "items": items})
+    assert [l["external_id"] for l in out] == ["39413508", "99999999"]

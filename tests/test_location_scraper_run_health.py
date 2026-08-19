@@ -369,7 +369,10 @@ class TestScrapeWithRetries:
         assert raw_count == 0
         assert verdict["ok"] is False
 
-    def test_empty_enumeration_is_retried_before_the_fallback(self):
+    def test_empty_enumeration_is_retried_before_the_fallback(self, monkeypatch):
+        # The enumeration path is off by default since 2026-08-19; it stays
+        # supported behind the env override, so opt in to exercise it.
+        monkeypatch.setenv("LOOPNET_ENUMERATION_COUNTRIES", "gb,ca")
         h = Harness(
             ls_enumerate_loopnet_urls=[
                 {"listing_urls": [], "count": 0},
@@ -389,7 +392,8 @@ class TestScrapeWithRetries:
             "https://loopnet/2",
         ]
 
-    def test_enumeration_that_never_returns_urls_falls_back_and_degrades(self):
+    def test_enumeration_that_never_returns_urls_falls_back_and_degrades(self, monkeypatch):
+        monkeypatch.setenv("LOOPNET_ENUMERATION_COUNTRIES", "gb,ca")
         h = Harness(
             ls_enumerate_loopnet_urls=[{"listing_urls": [], "count": 0}],
             ls_start_apify_run=[{"run_id": "r1", "dataset_id": "d1"}],
@@ -405,6 +409,25 @@ class TestScrapeWithRetries:
         health_payload = h.payloads("ls_assess_run_health")[0]
         assert health_payload["used_enumeration"] is True
         assert health_payload["enumerated_url_count"] == 0
+
+    def test_uk_no_longer_enumerates_by_default(self):
+        """The gb/ca enumeration is off by default (2026-08-19).
+
+        It forced memo23's per-listing detail fetch — the 403-ing stage behind
+        the throttled paid unblocker that left London at 11 buildings — while
+        the paginated search reaches the same market through the free mobile
+        API. See LOOPNET_ENUMERATION_COUNTRIES.
+        """
+        h = Harness(
+            ls_start_apify_run=[{"run_id": "r1", "dataset_id": "d1"}],
+            ls_check_apify_run=[FINISHED],
+            ls_fetch_and_persist_raw=[{"item_count": 320}],
+            ls_assess_run_health=[OK],
+        )
+        h.run(city="london", run_id="weekly-london-2026-W35", source_config=UK_CONFIG)
+        assert "ls_enumerate_loopnet_urls" not in h.names()
+        assert "listing_urls" not in h.payloads("ls_start_apify_run")[0]
+        assert h.payloads("ls_assess_run_health")[0]["used_enumeration"] is False
 
     def test_us_cities_never_enumerate(self):
         h = Harness(

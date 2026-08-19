@@ -105,21 +105,27 @@ SCRAPE_CITIES = (
 # on the globe directly). LoopNet returns broker contact on every listing.
 LUSHA_SKIP_SOURCES = {"loopnet"}
 
-# LoopNet country codes that use the listing-URL enumeration path instead of
-# the broad search.
+# LoopNet country codes that use the listing-URL enumeration path.
 #
-# Measured 2026-07-23, the day the actor dev restored broker extraction:
-#   - loopnet.co.uk / loopnet.ca ignore the `min-space-size` URL filter and cap
-#     the broad search at ~30 items (London: 30 vs 383 qualifying buildings on
-#     the site). Enumeration is the only way to see that market.
-#   - loopnet.com serves the broad search properly since the same fix
-#     (Los Angeles 248, New York 187, Seattle 75 buildings).
-# Enumeration is NOT free: each enumerated URL needs a per-listing detail fetch,
-# and those currently fail ~75% of the time (mobile API 403 -> the actor's paid
-# unblocker erroring). Seattle regressed 75 -> 31 buildings when enumerated, so
-# the path is restricted to the domains where the broad search cannot work.
-# Revisit once the dev ships the faster internal path he announced.
-LOOPNET_ENUMERATION_COUNTRIES = {"gb", "ca"}
+# EMPTY since 2026-08-19: the enumeration existed only to get around the broad
+# search returning ~30 items on loopnet.co.uk/.ca, and it is now strictly worse
+# than paginating the search itself.
+#   - Enumerated URLs are bare listing pages, so they force memo23's per-listing
+#     DETAIL fetch — the stage that gets a 403 (LoopNet's mobile API is behind
+#     App Check) and has to recover each listing through a paid unblocker that
+#     is throttled to a single provider. That dropped 34/48 London listings on
+#     2026-08-17 and left the whole weekly wave at a tenth of its market.
+#   - The enumeration actor itself is unreliable: the residential edge refuses
+#     it outright ("Connection refused" x10 -> 0 URLs), which it did again while
+#     this was being measured on 2026-08-19.
+#   - Paginating the filtered search (`?page=N`) instead walks LoopNet's FREE
+#     mobile API, which is healthy, and the placards already carry building +
+#     broker email + available surface + coordinates. London: 320 distinct
+#     buildings, 97% with an email, zero detail fetches — against 11 buildings
+#     from the 2026-08-17 production run.
+# Kept overridable so the path can be restored if the actor's detail fetch is
+# ever repaired: LOOPNET_ENUMERATION_COUNTRIES=gb,ca
+LOOPNET_ENUMERATION_COUNTRIES: set[str] = set()
 
 
 def _loopnet_uses_enumeration(source_config: dict) -> bool:
