@@ -6,10 +6,24 @@ Input source:
   - Actor id: 0ZCQONxB3BdyOzrbD
   - Works for US and UK (LoopNet UK / ex-Realla). Currently wired for London (UK).
 
+How the search is driven (2026-08-19)
+  memo23 exposes two stages, and only one of them still works:
+    - the SEARCH stage reads LoopNet's free mobile API
+      (`_dataSource: free-mobile-api`) and is healthy;
+    - the per-listing DETAIL stage gets a 403 (LoopNet put its mobile API
+      behind App Check) and has to recover every listing through a paid
+      unblocker chain that is now throttled to one provider, dropping 20-77%
+      of the listings and sometimes running out of quota entirely.
+  So we ask for the search stage ONLY (`includeListingDetails: False`) and get
+  the volume by walking the result pages (`?page=N`), which the actor serves
+  one page per start URL. The search placard already carries everything we
+  need — building address/postcode/city, available square footage, broker
+  name/company/phone/email and coordinates — so the broken stage is never
+  needed. Measured on London: 320 distinct buildings, 97% with a broker email,
+  zero detail-fetch attempts.
+
 Notes vs the other sources:
   - LoopNet quotes areas in **square feet** — we convert to m² (`SF_TO_M2`).
-  - Listings expose no coordinates; lat/lng are filled later by the geocode
-    fallback in `activities/scrape.py` (postcode makes this reliable).
   - Broker name / company / phone / **email** come straight from the payload,
     so unlike idealista/otodom we can populate `email` directly.
   - Hard guardrail: buildings with < 1500 m² of available space are dropped.
@@ -22,7 +36,9 @@ from typing import Any, Optional
 from shared.location_scraper.config import (
     LOOPNET_ACTOR_ID,
     get_actor_max_items,
+    get_country_code_for_city,
     get_loopnet_max_unblocker_requests,
+    get_loopnet_search_pages,
     get_loopnet_unlimited_max_items,
 )
 from shared.location_scraper.models import Listing
@@ -150,13 +166,49 @@ def available_surface_m2_from_payload(payload: dict[str, Any]) -> Optional[float
 
 
 def currency_for_country(country: Any) -> str:
-    """LoopNet has no currency field — derive it from the country code."""
+    """Derive the currency from a country code/name.
+
+    The payload's own `currency` field is NOT usable: the search placard
+    reports "USD" for London listings priced in sterling.
+    """
     code = str(country or "").strip().upper()
     if code in {"GB", "UK", "GBR", "UNITED KINGDOM", "ENGLAND"}:
         return "GBP"
     if code in {"CA", "CAN", "CANADA"}:
         return "CAD"
     return "USD"
+
+
+def search_page_urls(start_url: str, pages: int) -> list[str]:
+    """Expand a filtered LoopNet search URL into one URL per result page.
+
+    memo23 serves exactly ONE page of results per start URL, so pagination has
+    to be expressed as separate start URLs. The page must be a `?page=N` QUERY
+    param, not the `/N/` path segment LoopNet also accepts: the actor rebuilds
+    URLs and drops the path segment (it re-serves page 1), while query params
+    are passed through untouched.
+    """
+    if pages <= 1:
+        return [start_url]
+    sep = "&" if "?" in start_url else "?"
+    return [start_url] + [f"{start_url}{sep}page={n}" for n in range(2, pages + 1)]
+
+
+def coordinates_from_payload(payload: dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    """Latitude/longitude as floats, or (None, None).
+
+    The search placard carries coordinates (549/550 on the London probe); the
+    listing-detail payload never did (0/267), which is why every LoopNet
+    listing used to go through the geocode fallback.
+    """
+    lat, lng = payload.get("latitude"), payload.get("longitude")
+    try:
+        lat_f, lng_f = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None, None
+    if lat_f == 0.0 and lng_f == 0.0:
+        return None, None
+    return lat_f, lng_f
 
 
 def _num(val: Any) -> Optional[float]:
@@ -177,22 +229,36 @@ class LoopnetAdapter:
         self,
         start_url: str | list[str],
         max_items: int | None | str = "default",
+        pages: int | None = None,
     ) -> dict:
-        # A list means individual listing-detail URLs (enumerated from the
-        # filtered search pages) — the actor scrapes exactly those listings.
-        # A single URL is the legacy broad search (geocoded, capped at 500).
-        urls = start_url if isinstance(start_url, list) else [start_url]
+        """Actor input for one LoopNet city.
+
+        Two modes:
+          - a single search URL -> the **paginated search** (default): the
+            actor's free-mobile-API search stage, walked page by page, with the
+            broken per-listing detail fetch switched OFF.
+          - a list of listing-detail URLs -> the legacy enumeration path, which
+            needs `includeListingDetails` and therefore the paid unblocker.
+            Kept so the path can be re-enabled, but it is not the default.
+        """
+        listing_mode = isinstance(start_url, list)
+        if listing_mode:
+            urls = start_url
+        else:
+            urls = search_page_urls(start_url, pages or get_loopnet_search_pages())
+
         payload = {
             "startUrls": [{"url": u} for u in urls],
-            "includeListingDetails": True,
-            # Bypass memo23's default 500-item-per-bounding-box cap so the
-            # space-available-filtered search returns the FULL qualifying set
-            # (the reason the old enumeration 2-step existed). The broad-search
-            # payload carries broker contact + sizeSf, which the enumerated
-            # listing-URL payload lost in the actor's 2026-06-27 rebuild.
+            # The detail fetch is the stage that 403s and burns the throttled
+            # paid unblocker, losing 20-77% of the listings. The search placard
+            # already carries building + broker + surface + coordinates, so we
+            # only pay for it when scraping bare listing URLs, which carry no
+            # placard of their own.
+            "includeListingDetails": listing_mode,
+            # Bypass memo23's default 500-item-per-bounding-box cap.
             "moreResults": True,
-            # Per-run budget for the actor's paid unblocker; a dense city can
-            # exhaust the default alone and have its results truncated.
+            # Per-run budget for the actor's paid unblocker. Unused by the
+            # search path, which never leaves the free mobile API.
             "maxUnblockerRequests": get_loopnet_max_unblocker_requests(),
             "maxConcurrency": 20,
             "minConcurrency": 1,
@@ -219,14 +285,29 @@ class LoopnetAdapter:
         web_link = raw_item.get("listingUrl") or raw_item.get("inferUrl")
         city_value = str(raw_item.get("city") or city).lower().strip()
 
+        # The search placard carries coordinates; the listing-detail payload
+        # does not. When they are present we skip the geocode fallback entirely
+        # (cheaper, and exact rather than postcode-approximated).
+        latitude, longitude = coordinates_from_payload(raw_item)
+        link_to_gmap = (
+            f"https://www.google.com/maps/search/?api=1&query={latitude},{longitude}"
+            if latitude is not None
+            else None  # filled by the geocode fallback in activities/scrape.py
+        )
+
+        # `country` is only on the listing-detail payload; on the search placard
+        # it is absent and `currency` lies (USD for London). Fall back to the
+        # country of the city we are scraping.
+        country = raw_item.get("country") or get_country_code_for_city(city)
+
         return Listing(
             source="loopnet",
             city=city_value,
             external_id=str(raw_item.get("propertyId") or ""),
             web_link=web_link,
-            link_to_gmap=None,  # filled by geocode fallback (no coords in payload)
-            latitude=None,
-            longitude=None,
+            link_to_gmap=link_to_gmap,
+            latitude=latitude,
+            longitude=longitude,
             district=None,
             postal_code=raw_item.get("zip") or None,
             address=raw_item.get("address") or None,
@@ -241,7 +322,7 @@ class LoopnetAdapter:
             has_air_conditioning=None,
             price_monthly=_num(raw_item.get("priceNumeric")),
             price_per_m2=None,
-            currency=currency_for_country(raw_item.get("country")),
+            currency=currency_for_country(country),
             energy_class=None,
             first_listed_date=None,
             last_updated_date=None,

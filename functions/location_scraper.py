@@ -41,6 +41,8 @@ from datetime import datetime, timedelta, timezone
 import azure.durable_functions as df
 import azure.functions as func
 
+from shared.location_scraper import run_health
+from shared.location_scraper.activities import alerts as alerts_act
 from shared.location_scraper.activities import enrich as enrich_act
 from shared.location_scraper.activities import enumerate_loopnet as enumerate_loopnet_act
 from shared.location_scraper.activities import log_run as log_act
@@ -48,6 +50,7 @@ from shared.location_scraper.activities import materialize_globe as materialize_
 from shared.location_scraper.activities import persist as persist_act
 from shared.location_scraper.activities import raw_payload as raw_act
 from shared.location_scraper.activities import resolve as resolve_act
+from shared.location_scraper.activities import run_health as run_health_act
 from shared.location_scraper.activities import scrape as scrape_act
 from shared.location_scraper.run_quality import compute_run_quality_payload
 
@@ -55,8 +58,20 @@ logger = logging.getLogger(__name__)
 
 bp = df.Blueprint()
 
-# Mondays at 01:00 UTC (NCRONTAB: sec min hour day month day-of-week).
-WEEKLY_SCHEDULE = os.getenv("LOCATION_SCRAPER_WEEKLY_SCHEDULE", "0 0 1 * * 1")
+# Mondays at 08:00 UTC (NCRONTAB: sec min hour day month day-of-week).
+#
+# Moved off 01:00 UTC on 2026-08-18. The LoopNet actor's mobile API is 403 on
+# every listing, so each one is recovered through its paid unblocker chain, and
+# that chain is throttled in the small hours: the same London scrape lost 39/48
+# listings at 01:13 UTC and 2/48 at 08:46 UTC on the same day (2026-07-20), and
+# 21/395 at 10:36 UTC on 2026-07-31. Every post-403 daytime sample recovers
+# 95-100%, every night sample 19-29%.
+WEEKLY_SCHEDULE = os.getenv("LOCATION_SCRAPER_WEEKLY_SCHEDULE", "0 0 8 * * 1")
+
+# Wednesdays at 08:00 UTC -- second pass over the cities that did not complete
+# on Monday (failed, degraded, or never started). ls_cities_needing_run skips
+# the ones already completed, so a clean week is a no-op.
+WEEKLY_RETRY_SCHEDULE = os.getenv("LOCATION_SCRAPER_WEEKLY_RETRY_SCHEDULE", "0 0 8 * * 3")
 SCRAPE_CITIES = (
     "barcelona",
     "madrid",
@@ -90,21 +105,27 @@ SCRAPE_CITIES = (
 # on the globe directly). LoopNet returns broker contact on every listing.
 LUSHA_SKIP_SOURCES = {"loopnet"}
 
-# LoopNet country codes that use the listing-URL enumeration path instead of
-# the broad search.
+# LoopNet country codes that use the listing-URL enumeration path.
 #
-# Measured 2026-07-23, the day the actor dev restored broker extraction:
-#   - loopnet.co.uk / loopnet.ca ignore the `min-space-size` URL filter and cap
-#     the broad search at ~30 items (London: 30 vs 383 qualifying buildings on
-#     the site). Enumeration is the only way to see that market.
-#   - loopnet.com serves the broad search properly since the same fix
-#     (Los Angeles 248, New York 187, Seattle 75 buildings).
-# Enumeration is NOT free: each enumerated URL needs a per-listing detail fetch,
-# and those currently fail ~75% of the time (mobile API 403 -> the actor's paid
-# unblocker erroring). Seattle regressed 75 -> 31 buildings when enumerated, so
-# the path is restricted to the domains where the broad search cannot work.
-# Revisit once the dev ships the faster internal path he announced.
-LOOPNET_ENUMERATION_COUNTRIES = {"gb", "ca"}
+# EMPTY since 2026-08-19: the enumeration existed only to get around the broad
+# search returning ~30 items on loopnet.co.uk/.ca, and it is now strictly worse
+# than paginating the search itself.
+#   - Enumerated URLs are bare listing pages, so they force memo23's per-listing
+#     DETAIL fetch — the stage that gets a 403 (LoopNet's mobile API is behind
+#     App Check) and has to recover each listing through a paid unblocker that
+#     is throttled to a single provider. That dropped 34/48 London listings on
+#     2026-08-17 and left the whole weekly wave at a tenth of its market.
+#   - The enumeration actor itself is unreliable: the residential edge refuses
+#     it outright ("Connection refused" x10 -> 0 URLs), which it did again while
+#     this was being measured on 2026-08-19.
+#   - Paginating the filtered search (`?page=N`) instead walks LoopNet's FREE
+#     mobile API, which is healthy, and the placards already carry building +
+#     broker email + available surface + coordinates. London: 320 distinct
+#     buildings, 97% with an email, zero detail fetches — against 11 buildings
+#     from the 2026-08-17 production run.
+# Kept overridable so the path can be restored if the actor's detail fetch is
+# ever repaired: LOOPNET_ENUMERATION_COUNTRIES=gb,ca
+LOOPNET_ENUMERATION_COUNTRIES: set[str] = set()
 
 
 def _loopnet_uses_enumeration(source_config: dict) -> bool:
@@ -117,6 +138,32 @@ def _loopnet_uses_enumeration(source_config: dict) -> bool:
         else LOOPNET_ENUMERATION_COUNTRIES
     )
     return str(source_config.get("country_code") or "").lower() in countries
+
+def _enum_attempts() -> int:
+    """How many times the LoopNet URL enumeration is tried before giving up.
+
+    The enumeration actor returns 0 items when the residential edge refuses it
+    ("Connection refused" x10, then its own stop-after-10-attempts guard). That
+    is transient -- the same input returned the full page 1 minutes later on
+    2026-08-18 -- so a retry is worth far more than the silent fallback to the
+    broad search it used to trigger.
+    """
+    raw = (os.getenv("LOCATION_SCRAPER_ENUM_ATTEMPTS") or "3").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return value if value > 0 else 3
+
+
+def _enum_retry_minutes() -> int:
+    raw = (os.getenv("LOCATION_SCRAPER_ENUM_RETRY_MINUTES") or "5").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 5
+    return value if value > 0 else 5
+
 
 # Weekly run processes cities in sequential waves of this size so that only a
 # handful of (memory-heavy) Apify datasets are loaded at once — prevents the
@@ -250,7 +297,11 @@ async def location_scraper_weekly(timer: func.TimerRequest, client) -> None:
     if timer.past_due:
         logger.warning("Weekly location scraper timer is past due")
 
-    instance_id = f"location-scraper-weekly-{period_key}"
+    await _start_weekly_parent(client, period_key, f"location-scraper-weekly-{period_key}")
+
+
+async def _start_weekly_parent(client, period_key: str, instance_id: str) -> None:
+    """Start (or restart) the weekly parent orchestrator for one ISO week."""
     existing = await client.get_status(instance_id)
     if existing:
         existing_status = str(getattr(existing, "runtime_status", ""))
@@ -300,6 +351,32 @@ async def location_scraper_weekly(timer: func.TimerRequest, client) -> None:
         instance_id,
         period_key,
         _wave_size(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Timer Trigger — mid-week retry of the cities that did not complete
+# ---------------------------------------------------------------------------
+
+@bp.timer_trigger(schedule=WEEKLY_RETRY_SCHEDULE, arg_name="timer", run_on_startup=False)
+@bp.durable_client_input(client_name="client")
+async def location_scraper_weekly_retry(timer: func.TimerRequest, client) -> None:
+    """Second pass over the current ISO week.
+
+    Runs the same parent under its own instance id; ls_cities_needing_run keeps
+    only the cities whose weekly row is not 'completed' — i.e. the ones that
+    failed or came back degraded on Monday. A clean week is a no-op, so this
+    costs nothing when nothing is broken.
+    """
+    now = datetime.now(timezone.utc)
+    period_key = now.strftime("%G-W%V")
+
+    if timer.past_due:
+        logger.warning("Weekly location scraper retry timer is past due")
+
+    logger.info("Weekly location scraper retry pass starting for %s", period_key)
+    await _start_weekly_parent(
+        client, period_key, f"location-scraper-weekly-{period_key}-retry"
     )
 
 
@@ -381,9 +458,225 @@ def location_scraper_weekly_orch(context: df.DurableOrchestrationContext):
                     [e["city"] for e in wave],
                 )
 
+    # Email the cities that did not come back clean (silent on a clean week).
+    alert: dict = yield context.call_activity(
+        "ls_alert_run_health", {"period_key": period_key}
+    )
+    summary["cities_unhealthy"] = int((alert or {}).get("cities_unhealthy") or 0)
+
     if not context.is_replaying:
         logger.info("Weekly location scraper parent complete: %s", json.dumps(summary, sort_keys=True))
     return summary
+
+
+def _scrape_with_retries(context, *, city: str, run_id: str, source_config: dict):
+    """Run the Apify scrape for one city, retrying attempts that come back bad.
+
+    A sub-generator of ``location_scraper_orch``: it yields Durable tasks (the
+    caller delegates with ``yield from``) and returns
+    ``(base_config, raw_item_count, health_verdict)``.
+
+    A LoopNet run can finish SUCCEEDED while carrying a fraction of the city:
+    the actor's mobile API is 403 on every listing and its paid unblocker chain
+    drops whatever it cannot recover (34/48 London listings on 2026-08-17), and
+    the gb/ca enumeration can come back with zero URLs. Both are transient, so
+    every attempt is graded and a bad one is retried after a delay instead of
+    being written to SQL as a normal week.
+    See shared/location_scraper/run_health.py.
+    """
+    attempts = run_health.max_attempts()
+    uses_enumeration = _loopnet_uses_enumeration(source_config)
+    base_config = source_config
+    best: dict | None = None
+    persisted_dataset_id: str | None = None
+    raw_item_count = 0
+
+    for attempt in range(1, attempts + 1):
+        source_config = base_config
+        enumerated_url_count = 0
+
+        # LoopNet (gb/ca): enumerate the space-available-filtered search
+        # pages and scrape exactly those listing-detail URLs. The broad
+        # search is capped per bounding box -- London plateaus at ~30 items
+        # against 383 qualifying buildings on the site, and the
+        # min-space-size URL filter is ignored on the non-.com domains.
+        #
+        # History: this 2-step was retired 2026-06-29 because the actor's
+        # 2026-06-27 rebuild stripped broker contact + surface from the
+        # listing-URL payload. The actor dev restored broker extraction on
+        # 2026-07-23, re-validated the same day: enumeration returns 397
+        # London URLs in 97s, carrying brokerName/company/email.
+        #
+        # Enumeration returning nothing is still not fatal (we fall through
+        # to the broad search), but it is retried first and it marks the run
+        # degraded, because the fallback yields a tenth of the market.
+        if uses_enumeration:
+            listing_urls: list = []
+            enum_attempts = _enum_attempts()
+            for enum_attempt in range(1, enum_attempts + 1):
+                enumerated: dict = yield context.call_activity(
+                    "ls_enumerate_loopnet_urls", base_config
+                )
+                listing_urls = (enumerated or {}).get("listing_urls") or []
+                if listing_urls or enum_attempt >= enum_attempts:
+                    break
+                if not context.is_replaying:
+                    logger.warning(
+                        "LoopNet enumeration returned no URLs (attempt %d/%d); "
+                        "retrying in %d min. city=%s run_id=%s",
+                        enum_attempt,
+                        enum_attempts,
+                        _enum_retry_minutes(),
+                        city,
+                        run_id,
+                    )
+                yield context.create_timer(
+                    context.current_utc_datetime
+                    + timedelta(minutes=_enum_retry_minutes())
+                )
+            enumerated_url_count = len(listing_urls)
+            if listing_urls:
+                source_config = {**base_config, "listing_urls": listing_urls}
+            elif not context.is_replaying:
+                logger.warning(
+                    "LoopNet enumeration returned no URLs after %d attempts; "
+                    "falling back to the broad search. city=%s run_id=%s",
+                    enum_attempts,
+                    city,
+                    run_id,
+                )
+
+        # 2. Start Apify actor (async -- do NOT block on completion)
+        run_info: dict = yield context.call_activity("ls_start_apify_run", source_config)
+
+        # 3. Poll until Apify run finishes (exponential-ish backoff, max 45 min)
+        poll_delays = [30, 60, 90, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120]
+        for delay_seconds in poll_delays:
+            status: dict = yield context.call_activity("ls_check_apify_run", run_info)
+            if status["finished"]:
+                break
+            deadline = context.current_utc_datetime + timedelta(seconds=delay_seconds)
+            yield context.create_timer(deadline)
+        else:
+            raise RuntimeError(f"Apify run did not finish within timeout. run_id={run_info.get('run_id')}")
+
+        if not status.get("succeeded"):
+            # FAILED / ABORTED / TIMED-OUT on the Apify side: no dataset to
+            # grade, but the run log still says WHY. Read it so the failure
+            # reaches SQL in words, and so an exhausted upstream quota stops
+            # the loop instead of buying two more identical failures.
+            failure: dict = yield context.call_activity(
+                "ls_assess_run_health",
+                {
+                    "run_id": run_id,
+                    "city": source_config["city"],
+                    "source": source_config["actor"],
+                    "apify_run_id": run_info["run_id"],
+                    "raw_item_count": 0,
+                    "used_enumeration": uses_enumeration,
+                    "enumerated_url_count": enumerated_url_count,
+                },
+            )
+            if attempt >= attempts or failure.get("retry_useless"):
+                raise RuntimeError(
+                    f"Apify run failed with status={status.get('status')} "
+                    f"run_id={run_info.get('run_id')}: {failure.get('reason') or 'no further detail'}"
+                )
+            if not context.is_replaying:
+                logger.warning(
+                    "Apify run %s ended %s (attempt %d/%d); retrying in %d min. city=%s run_id=%s",
+                    run_info.get("run_id"),
+                    status.get("status"),
+                    attempt,
+                    attempts,
+                    run_health.retry_delay_minutes(),
+                    city,
+                    run_id,
+                )
+            yield context.create_timer(
+                context.current_utc_datetime
+                + timedelta(minutes=run_health.retry_delay_minutes())
+            )
+            continue
+
+        # 4 + 4b. Stream the Apify dataset straight into bronze.location_scraper_raw.
+        # The full dataset is deliberately NOT returned to the orchestrator: doing
+        # so serialised the whole payload into the orchestration history and
+        # re-materialised it on every replay (and again as input to persist +
+        # normalize), which OOM-killed the worker on large cities. Only a row
+        # count comes back here.
+        raw_summary: dict = yield context.call_activity(
+            "ls_fetch_and_persist_raw",
+            {
+                "run_id": run_id,
+                "dataset_id": run_info["dataset_id"],
+                "source": source_config["actor"],
+                "city": source_config["city"],
+            },
+        )
+        raw_item_count = int((raw_summary or {}).get("item_count", 0))
+        persisted_dataset_id = run_info["dataset_id"]
+
+        # 4c. Grade the attempt: the actor's own per-listing detail losses
+        # plus the city's recent volume.
+        health: dict = yield context.call_activity(
+            "ls_assess_run_health",
+            {
+                "run_id": run_id,
+                "city": source_config["city"],
+                "source": source_config["actor"],
+                "apify_run_id": run_info["run_id"],
+                "raw_item_count": raw_item_count,
+                "used_enumeration": uses_enumeration,
+                "enumerated_url_count": enumerated_url_count,
+            },
+        )
+        if best is None or raw_item_count > int(best["raw_item_count"]):
+            best = {
+                "dataset_id": run_info["dataset_id"],
+                "raw_item_count": raw_item_count,
+                "health": health,
+            }
+
+        # retry_useless: the actor's shared unblocker budget is spent, so the
+        # next two attempts would fail identically and still bill actor starts.
+        if health.get("ok") or health.get("retry_useless") or attempt >= attempts:
+            break
+
+        if not context.is_replaying:
+            logger.warning(
+                "Degraded scrape (attempt %d/%d): %s. Retrying in %d min. city=%s run_id=%s",
+                attempt,
+                attempts,
+                health.get("reason"),
+                run_health.retry_delay_minutes(),
+                city,
+                run_id,
+            )
+        yield context.create_timer(
+            context.current_utc_datetime
+            + timedelta(minutes=run_health.retry_delay_minutes())
+        )
+
+    if best is None:
+        raise RuntimeError(f"No Apify attempt produced a dataset. run_id={run_id}")
+
+    # Keep the best attempt: fetch_and_persist_raw replaces the run's bronze
+    # rows, so a later, weaker retry would otherwise be the one persisted.
+    if best["dataset_id"] != persisted_dataset_id:
+        raw_summary = yield context.call_activity(
+            "ls_fetch_and_persist_raw",
+            {
+                "run_id": run_id,
+                "dataset_id": best["dataset_id"],
+                "source": base_config["actor"],
+                "city": base_config["city"],
+            },
+        )
+        raw_item_count = int((raw_summary or {}).get("item_count", 0))
+    else:
+        raw_item_count = int(best["raw_item_count"])
+    return base_config, raw_item_count, best["health"]
 
 
 # ---------------------------------------------------------------------------
@@ -408,72 +701,14 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             },
         )
 
-        # 1b. LoopNet: enumerate the space-available-filtered search pages and
-        # scrape exactly those listing-detail URLs.
-        #
-        # History: this 2-step was retired 2026-06-29 because the actor's
-        # 2026-06-27 rebuild stripped broker contact + surface from the
-        # listing-URL payload. The actor dev restored broker extraction on
-        # 2026-07-23, re-validated the same day: enumeration returns 397 London
-        # URLs in 97s, and those URLs come back with brokerName/company/email.
-        # It is re-enabled because the broad search is capped per bounding box —
-        # London plateaus at ~30 items against 383 qualifying buildings on the
-        # site, and the `min-space-size` URL filter is ignored on the non-.com
-        # domains (loopnet.co.uk / .ca), so half of what it returns is below our
-        # surface floor.
-        #
-        # Enumeration returning nothing is NOT fatal: we fall through to the
-        # broad search, which is what every city used until now.
-        if _loopnet_uses_enumeration(source_config):
-            enumerated: dict = yield context.call_activity(
-                "ls_enumerate_loopnet_urls", source_config
-            )
-            listing_urls = (enumerated or {}).get("listing_urls") or []
-            if listing_urls:
-                source_config = {**source_config, "listing_urls": listing_urls}
-            elif not context.is_replaying:
-                logger.warning(
-                    "LoopNet enumeration returned no URLs; falling back to the "
-                    "broad search. city=%s run_id=%s",
-                    city,
-                    run_id,
-                )
-
-        # 2. Start Apify actor (async — do NOT block on completion)
-        run_info: dict = yield context.call_activity("ls_start_apify_run", source_config)
-
-        # 3. Poll until Apify run finishes (exponential-ish backoff, max 45 min)
-        poll_delays = [30, 60, 90, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120, 120]
-        for delay_seconds in poll_delays:
-            status: dict = yield context.call_activity("ls_check_apify_run", run_info)
-            if status["finished"]:
-                break
-            deadline = context.current_utc_datetime + timedelta(seconds=delay_seconds)
-            yield context.create_timer(deadline)
-        else:
-            raise RuntimeError(f"Apify run did not finish within timeout. run_id={run_info.get('run_id')}")
-
-        if not status.get("succeeded"):
-            raise RuntimeError(
-                f"Apify run failed with status={status.get('status')} run_id={run_info.get('run_id')}"
-            )
-
-        # 4 + 4b. Stream the Apify dataset straight into bronze.location_scraper_raw.
-        # The full dataset is deliberately NOT returned to the orchestrator: doing
-        # so serialised the whole payload into the orchestration history and
-        # re-materialised it on every replay (and again as input to persist +
-        # normalize), which OOM-killed the worker on large cities. Only a row
-        # count comes back here.
-        raw_summary: dict = yield context.call_activity(
-            "ls_fetch_and_persist_raw",
-            {
-                "run_id": run_id,
-                "dataset_id": run_info["dataset_id"],
-                "source": source_config["actor"],
-                "city": source_config["city"],
-            },
+        # 1b -> 4. Scrape the city (with graded retries).
+        base_config, raw_item_count, run_health_verdict = yield from _scrape_with_retries(
+            context,
+            city=city,
+            run_id=run_id,
+            source_config=source_config,
         )
-        raw_item_count: int = int((raw_summary or {}).get("item_count", 0))
+        source_config = base_config
 
         # 5. Normalize via source adapter — reads raw payloads back from SQL by
         # run_id (paged), so the dataset never transits the orchestrator.
@@ -551,6 +786,12 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             {"listings": listings, "bundles": bundles, "run_id": run_id, "city": source_config["city"]},
         )
         stats["enrichment_diagnostics"] = enrichment_diag
+        # A degraded run keeps its buildings (they are real) but is NOT marked
+        # completed: ls_cities_needing_run then picks the city up again in the
+        # mid-week pass, and the weekly alert names it.
+        stats["run_status"] = "completed" if run_health_verdict.get("ok") else "degraded"
+        stats["health_note"] = run_health_verdict.get("reason") or ""
+        stats["health"] = run_health_verdict
         stats.update(
             compute_run_quality_payload(
                 raw_item_count=raw_item_count,
@@ -593,6 +834,32 @@ def ls_resolve_source(payload: dict) -> dict:
 def ls_enumerate_loopnet_urls(config: dict) -> dict:
     urls = enumerate_loopnet_act.enumerate_listing_urls(config["start_url"])
     return {"listing_urls": urls, "count": len(urls)}
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_assess_run_health(payload: dict) -> dict:
+    """Grade a finished Apify run (never fatal -- a missing verdict means ok)."""
+    try:
+        return run_health_act.assess_run_health(payload)
+    except Exception:
+        logger.exception(
+            "Run health assessment failed; treating the run as healthy. run_id=%s",
+            payload.get("run_id"),
+        )
+        return {"ok": True, "status": "ok", "reason": "", "raw_item_count": int(payload.get("raw_item_count") or 0)}
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_alert_run_health(payload: dict) -> dict:
+    """Email the weekly city results when at least one did not complete."""
+    try:
+        return alerts_act.alert_run_health(payload)
+    except Exception:
+        logger.exception(
+            "Could not send the weekly location scraper alert. period_key=%s",
+            payload.get("period_key"),
+        )
+        return {"sent": False, "reason": "alert failed"}
 
 
 @bp.activity_trigger(input_name="config")

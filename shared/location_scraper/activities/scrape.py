@@ -110,22 +110,37 @@ def normalize_listings(payload: dict) -> list[dict]:
     geocode_cache = GeocodingCache() if os.getenv("GOOGLE_MAPS_API_KEY") else NominatimGeocodingCache()
     geocoded_count = 0
     seen = 0
+    duplicates = 0
+    seen_ids: set[str] = set()
     for raw in items:
         seen += 1
         try:
             listing = adapter.normalize(raw, city)
-            if listing is not None:
-                if _apply_geocode_fallback(listing, city, geocode_cache):
-                    geocoded_count += 1
-                results.append(listing.to_dict())
+            if listing is None:
+                continue
+            # A listing can legitimately appear more than once in one run:
+            # LoopNet is scraped one result page per start URL, and pages past
+            # the end of a search re-serve earlier ones (London: 550 items for
+            # 320 distinct buildings). Drop the repeats before they reach the
+            # geocoder and the persist layer.
+            external_id = (listing.external_id or "").strip()
+            if external_id:
+                if external_id in seen_ids:
+                    duplicates += 1
+                    continue
+                seen_ids.add(external_id)
+            if _apply_geocode_fallback(listing, city, geocode_cache):
+                geocoded_count += 1
+            results.append(listing.to_dict())
         except Exception:
             logger.exception("normalize error for item %s", raw.get("id") or raw.get("adid"))
     logger.info(
-        "Normalized %d/%d items for actor=%s city=%s geocoded_missing_coords=%d",
+        "Normalized %d/%d items for actor=%s city=%s geocoded_missing_coords=%d duplicates_dropped=%d",
         len(results),
         seen,
         actor,
         city,
         geocoded_count,
+        duplicates,
     )
     return results

@@ -34,11 +34,25 @@ MIN_SPACE_SIZE_SQFT = 16146
 # key omitted vs 147 with an explicit cap, same build, same URL).
 LOOPNET_UNLIMITED_MAX_ITEMS = 1000
 
-# Per-run budget for the actor's paid unblocker (used when it falls back to
-# scraping the website). A dense city can exhaust the default on its own and
-# get its results truncated. The dev is restoring the faster internal path,
-# which will remove this limit entirely.
+# Per-run budget for the actor's paid unblocker. Only the (legacy) listing-URL
+# detail path uses it — the paginated search path never touches the unblocker.
 LOOPNET_MAX_UNBLOCKER_REQUESTS = 2000
+
+# How many result pages of the space-available-filtered LoopNet search are
+# fetched per city.
+#
+# The memo23 actor serves ONE search page per start URL from LoopNet's free
+# mobile API (`_dataSource: free-mobile-api`) — the stage that still works,
+# unlike the per-listing detail fetch that 403s and depends on a throttled paid
+# unblocker. Passing `?page=N` URLs walks the whole result set through that free
+# stage: London went from 48 items (single page URL) to 320 distinct buildings
+# over 12 pages, measured 2026-08-19.
+#
+# LoopNet serves ~25 placards per page and re-serves earlier pages past the end
+# of a search, so overshooting only costs duplicate results (deduped on
+# propertyId downstream) — the actor bills per result, so keep this close to the
+# real depth of the densest city.
+LOOPNET_SEARCH_PAGES = 15
 
 COUNTRY_CONFIG: dict[str, dict] = {
     "spain": {
@@ -292,6 +306,21 @@ def get_loopnet_max_unblocker_requests() -> int:
     except ValueError:
         return LOOPNET_MAX_UNBLOCKER_REQUESTS
     return value if value > 0 else LOOPNET_MAX_UNBLOCKER_REQUESTS
+
+
+def get_loopnet_search_pages() -> int:
+    """How many filtered-search result pages to fetch per LoopNet city.
+
+    Env override: LOOPNET_SEARCH_PAGES=<int>
+    """
+    raw = (os.environ.get("LOOPNET_SEARCH_PAGES") or "").strip()
+    if not raw:
+        return LOOPNET_SEARCH_PAGES
+    try:
+        value = int(raw)
+    except ValueError:
+        return LOOPNET_SEARCH_PAGES
+    return value if value > 0 else LOOPNET_SEARCH_PAGES
 
 
 def get_country_code_for_city(city: str | None) -> str | None:

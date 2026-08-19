@@ -81,6 +81,21 @@ def get_run_status(run_id: str) -> dict:
     }
 
 
+def get_run_log(run_id: str) -> str:
+    """Return an actor run's log text, or "" when it cannot be read.
+
+    Used to grade a finished LoopNet run: the memo23 actor reports per-listing
+    detail-fetch losses only in its log, and a run that dropped most of its
+    listings still ends as SUCCEEDED. Never raises -- a missing log must not
+    fail the scrape, it just leaves the health check without that signal.
+    """
+    try:
+        return _client().run(run_id).log().get() or ""
+    except Exception:
+        logger.warning("Could not read Apify run log for run_id=%s", run_id, exc_info=True)
+        return ""
+
+
 def fetch_dataset(dataset_id: str, limit: int | None = None) -> list[dict[str, Any]]:
     """Download all items from an Apify dataset."""
     dataset = _client().dataset(dataset_id)
