@@ -70,6 +70,10 @@ def _expected_daily() -> frozenset[tuple[str, str, str]]:
     """Expected-daily set, augmented with optional surfaces only when they are
     enabled — so a disabled feature is never flagged as 'never started'."""
     expected = set(_EXPECTED_DAILY)
+    # Help desk (2026-08-20) runs every 15 minutes, so its silver step is
+    # always expected within the daily window. Messages are the representative
+    # "the pipeline completed" signal; comments/departments ride the same run.
+    expected.add(("nexudus", "helpdesk_messages", "silver"))
     if _env_flag("ENABLE_COMPETENCE_FUNCTIONS", False):
         # competence runs every day (incremental competence_sync Mon-Sat +
         # competence_full_reconcile Sun); the silver step is the representative

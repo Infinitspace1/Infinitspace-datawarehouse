@@ -16,6 +16,9 @@ Entities covered here:
   - silver.nexudus_calendar_events (content/calendarevents)
   - silver.nexudus_event_attendees (content/eventattendees)
   - silver.nexudus_event_products  (content/eventproducts)
+  - silver.nexudus_helpdesk_messages    (support/helpdeskmessages)
+  - silver.nexudus_helpdesk_comments    (support/helpdeskcomments)
+  - silver.nexudus_helpdesk_departments (support/helpdeskdepartments)
 
 Not covered here (handled elsewhere):
   - silver.nexudus_coworker_invoices       -> nexudus_invoice_reconcile (daily)
@@ -72,6 +75,11 @@ ENTITIES: tuple[EntityConfig, ...] = (
     EntityConfig("calendar_events", "silver.nexudus_calendar_events", "content/calendarevents",  min_ids=10),
     EntityConfig("event_attendees", "silver.nexudus_event_attendees", "content/eventattendees",  min_ids=10),
     EntityConfig("event_products",  "silver.nexudus_event_products",  "content/eventproducts",   min_ids=5),
+    # Help desk (2026-08-20) — customer requests. Floors mirror
+    # shared/nexudus/helpdesk.py::ENTITIES[...].min_ids.
+    EntityConfig("helpdesk_messages",    "silver.nexudus_helpdesk_messages",    "support/helpdeskmessages",    min_ids=100),
+    EntityConfig("helpdesk_comments",    "silver.nexudus_helpdesk_comments",    "support/helpdeskcomments",    min_ids=100),
+    EntityConfig("helpdesk_departments", "silver.nexudus_helpdesk_departments", "support/helpdeskdepartments", min_ids=5),
 )
 
 
