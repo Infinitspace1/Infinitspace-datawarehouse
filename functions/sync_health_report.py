@@ -52,6 +52,11 @@ _EXPECTED_DAILY: frozenset[tuple[str, str, str]] = frozenset([
     # anything is wrong.
     ("finance_dashboard", "presend_refresh", "gold"),
     ("replyio", "sequence_steps", "bronze"),
+    # CPI national indices - runs 05:40 UTC. Monthly data on a daily job, so
+    # rows_written = 0 is the NORMAL case and the only useful signal is "did it
+    # run at all". Without this tuple a timer that silently stopped firing would
+    # leave the anniversaries CPI column frozen at a stale figure with no alert.
+    ("cpi", "series", "silver"),
     # Landlord dashboard materialization — runs 03:00 UTC daily. If it
     # silently stops firing, the dashboard would just go stale without
     # anyone noticing; this guards against that.
