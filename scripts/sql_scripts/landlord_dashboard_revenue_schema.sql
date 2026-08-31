@@ -344,6 +344,12 @@ contract_facts AS (
         CAST(c.start_date        AS DATE) AS start_date,
         CAST(c.cancellation_date AS DATE) AS cancellation_date,
         CAST(DATEADD(HOUR, 4, c.start_date) AS DATE) AS effective_start_date,
+        -- Day-weighted occupancy convention (2026-08-31, matches the Budget
+        -- Tracker's facts_repo._aggregate_month): the +4h-shifted cancellation
+        -- date is EXCLUSIVE — the first day NOT occupied. A cancellation stored
+        -- as "D 22:00 UTC" shifts to D+1, so the desk counts as occupied
+        -- through D itself.
+        CAST(DATEADD(HOUR, 4, c.cancellation_date) AS DATE) AS effective_cancel_excl,
         pl.capacity,
         pl.list_monthly_fee,
         CASE
@@ -452,6 +458,45 @@ monthly_agg AS (
         SUM(CASE WHEN is_negative_adjustment = 1 THEN sold_monthly_fee ELSE 0 END) AS adjustment_monthly_value
     FROM active_by_month
     GROUP BY month_start, location_source_id
+),
+-- ── Day-weighted occupancy (2026-08-31) ─────────────────────────────────────
+-- occupancy_pct changed basis: it is now occupied DESK-DAYS over
+-- (capacity × days in month) — the hotel "room-nights" convention, matching
+-- the Budget Tracker's formula. A contract starting the 28th contributes
+-- 4/31 of its desks; a mid-month leaver gets credit for its actual days
+-- (under the old month-end rule it counted zero). Everything else in this
+-- view (revenue, occupied_workstations = end-of-month position, contract
+-- counts) keeps the original month-end rule on purpose — only the
+-- percentage is day-weighted.
+-- Window per contract in month M: [max(eff_start, M.start), min(eff_cancel
+-- EXCLUSIVE − 1 day, M.end)]. Contracts overlapping M at all are included —
+-- including ones that both start and end inside M (the Budget Tracker's
+-- known blind spot, deliberately fixed here).
+desk_days_by_month AS (
+    SELECT
+        ms.month_start,
+        cf.location_source_id,
+        SUM(
+            ISNULL(cf.capacity, 0) * (
+                DATEDIFF(
+                    DAY,
+                    CASE WHEN cf.effective_start_date > ms.month_start
+                         THEN cf.effective_start_date ELSE ms.month_start END,
+                    CASE WHEN cf.effective_cancel_excl IS NULL
+                              OR DATEADD(DAY, -1, cf.effective_cancel_excl) > EOMONTH(ms.month_start)
+                         THEN EOMONTH(ms.month_start)
+                         ELSE DATEADD(DAY, -1, cf.effective_cancel_excl) END
+                ) + 1
+            )
+        ) AS occupied_desk_days
+    FROM month_spine ms
+    INNER JOIN contract_facts cf
+        ON  cf.effective_start_date <= EOMONTH(ms.month_start)
+        AND (cf.effective_cancel_excl IS NULL
+             OR cf.effective_cancel_excl > ms.month_start)
+        AND (cf.effective_cancel_excl IS NULL
+             OR cf.effective_start_date < cf.effective_cancel_excl)
+    GROUP BY ms.month_start, cf.location_source_id
 )
 SELECT
     FORMAT(ms.month_start, 'yyyy-MM')           AS period,
@@ -468,9 +513,12 @@ SELECT
         WHEN ISNULL(lc.total_workstation_capacity, 0) - ISNULL(ma.occupied_workstations, 0) < 0 THEN 0
         ELSE ISNULL(lc.total_workstation_capacity, 0) - ISNULL(ma.occupied_workstations, 0)
     END                                         AS vacant_workstations,
+    -- DAY-WEIGHTED basis (2026-08-31): desk-days ÷ (capacity × days in month).
+    -- See desk_days_by_month above. The old month-end-position percentage is
+    -- kept as occupancy_pct_eom for reconciliation.
     CAST(
-        100.0 * ISNULL(ma.occupied_workstations, 0)
-        / NULLIF(ISNULL(lc.total_workstation_capacity, 0), 0)
+        100.0 * ISNULL(dd.occupied_desk_days, 0)
+        / NULLIF(ISNULL(lc.total_workstation_capacity, 0) * DAY(EOMONTH(ms.month_start)), 0)
         AS DECIMAL(9,4)
     )                                           AS occupancy_pct,
     ISNULL(ma.sold_monthly_revenue, 0)          AS sold_monthly_revenue,
@@ -485,7 +533,19 @@ SELECT
     )                                           AS avg_list_price_per_ws,
     ISNULL(ma.adjustment_contract_count, 0)     AS adjustment_contract_count,
     CAST(ISNULL(ma.adjustment_monthly_value, 0) AS DECIMAL(18,2)) AS adjustment_monthly_value,
-    N'membership_book'                          AS calculation_basis
+    N'membership_book'                          AS calculation_basis,
+    -- Day-weighted occupancy detail (2026-08-31)
+    ISNULL(dd.occupied_desk_days, 0)            AS occupied_desk_days,
+    DAY(EOMONTH(ms.month_start))                AS days_in_month,
+    CAST(
+        1.0 * ISNULL(dd.occupied_desk_days, 0) / DAY(EOMONTH(ms.month_start))
+        AS DECIMAL(9,2)
+    )                                           AS occupied_ws_avg,
+    CAST(
+        100.0 * ISNULL(ma.occupied_workstations, 0)
+        / NULLIF(ISNULL(lc.total_workstation_capacity, 0), 0)
+        AS DECIMAL(9,4)
+    )                                           AS occupancy_pct_eom
 FROM month_spine ms
 CROSS JOIN location_list ll
 LEFT JOIN location_capacity lc
@@ -493,7 +553,10 @@ LEFT JOIN location_capacity lc
     AND lc.month_start        = ms.month_start
 LEFT JOIN monthly_agg ma
     ON  ma.month_start        = ms.month_start
-    AND ma.location_source_id = ll.location_source_id;
+    AND ma.location_source_id = ll.location_source_id
+LEFT JOIN desk_days_by_month dd
+    ON  dd.month_start        = ms.month_start
+    AND dd.location_source_id = ll.location_source_id;
 GO
 
 

@@ -597,6 +597,16 @@ BEGIN
             SUM(cf.monthly_fee) AS contracted_monthly_revenue
         FROM contract_facts cf
         GROUP BY cf.location_source_id
+    ),
+    current_month_occupancy AS (
+        -- Day-weighted occupancy (2026-08-31): read the current month's pct
+        -- from the contract-book view so the desk-days rule has exactly ONE
+        -- implementation (see landlord_dashboard_schema.sql,
+        -- desk_days_by_month). occupied_workstations / vacant_workstations in
+        -- this snapshot stay as-of-today position counts.
+        SELECT location_source_id, occupancy_pct
+        FROM gold.vw_landlord_contract_book_monthly
+        WHERE period = FORMAT(GETUTCDATE(), 'yyyy-MM')
     )
     INSERT INTO gold.finance_dashboard_revenue_occupancy (
         as_of_date_utc,
@@ -631,10 +641,16 @@ BEGIN
                 THEN 0
             ELSE ISNULL(pp.total_workstation_capacity, 0) - ISNULL(lf.occupied_workstations, 0)
         END AS vacant_workstations,
-        CAST(
-            100.0 * ISNULL(lf.occupied_workstations, 0)
-            / NULLIF(ISNULL(pp.total_workstation_capacity, 0), 0)
-            AS DECIMAL(9,4)
+        -- Day-weighted (2026-08-31): current month desk-days ÷ (capacity ×
+        -- days in month), from the contract-book view. Falls back to the
+        -- as-of-today position ratio only if the view has no row.
+        ISNULL(
+            cmo.occupancy_pct,
+            CAST(
+                100.0 * ISNULL(lf.occupied_workstations, 0)
+                / NULLIF(ISNULL(pp.total_workstation_capacity, 0), 0)
+                AS DECIMAL(9,4)
+            )
         ) AS occupancy_pct,
         ISNULL(lf.contracted_monthly_revenue, 0) AS contracted_monthly_revenue,
         CAST(
@@ -648,6 +664,8 @@ BEGIN
         ON lf.location_source_id = loc.source_id
     LEFT JOIN physical_products pp
         ON pp.location_source_id = loc.source_id
+    LEFT JOIN current_month_occupancy cmo
+        ON cmo.location_source_id = loc.source_id
     WHERE loc.is_deleted = 0;
 END
 GO

@@ -75,12 +75,18 @@ async def landlord_freeze_monthly_occupancy(timer: func.TimerRequest) -> None:
 
         # Pull last month's occupancy per location from the membership view.
         # Only locations with at least one membership-fee contract appear.
+        # occupied_workstations = end-of-month position (integer, original
+        # basis); occupied_ws_avg = day-weighted average occupied desks
+        # (desk-days / days in month, Phase 4 2026-08-31). Both are frozen so
+        # the dashboard's day-weighted pct and any position display stay
+        # stable for closed months.
         source_rows = sql.execute_query("""
             SELECT
                 location_source_id,
                 location_name,
                 period,
-                occupied_workstations
+                occupied_workstations,
+                occupied_ws_avg
             FROM gold.vw_landlord_membership_book_monthly
             WHERE period = ?
               AND location_source_id IS NOT NULL
@@ -104,8 +110,9 @@ async def landlord_freeze_monthly_occupancy(timer: func.TimerRequest) -> None:
             try:
                 affected = sql.execute_non_query("""
                     INSERT INTO silver.landlord_frozen_monthly_occupancy
-                        (location_source_id, period, occupied_workstations, source, notes)
-                    SELECT ?, ?, ?, 'cron', ?
+                        (location_source_id, period, occupied_workstations,
+                         occupied_ws_avg, source, notes)
+                    SELECT ?, ?, ?, ?, 'cron', ?
                     WHERE NOT EXISTS (
                         SELECT 1
                         FROM silver.landlord_frozen_monthly_occupancy
@@ -116,6 +123,7 @@ async def landlord_freeze_monthly_occupancy(timer: func.TimerRequest) -> None:
                     r["location_source_id"],
                     r["period"],
                     int(r["occupied_workstations"] or 0),
+                    float(r["occupied_ws_avg"]) if r["occupied_ws_avg"] is not None else None,
                     f"Frozen by cron at {today.isoformat()} run_id={run_id}",
                     r["location_source_id"],
                     r["period"],

@@ -66,6 +66,19 @@ BEGIN
 END
 GO
 
+-- Phase 4 (2026-08-31): day-weighted occupancy. The frozen table gains
+-- occupied_ws_avg = occupied desk-days ÷ days in month (fractional average
+-- occupied desks, the hotel room-nights basis). occupied_workstations keeps
+-- its original meaning (end-of-month position, integer). Rows frozen before
+-- this change (Daniel's backfill) have occupied_ws_avg = NULL and readers
+-- fall back to occupied_workstations.
+IF COL_LENGTH('silver.landlord_frozen_monthly_occupancy', 'occupied_ws_avg') IS NULL
+BEGIN
+    ALTER TABLE silver.landlord_frozen_monthly_occupancy
+    ADD occupied_ws_avg DECIMAL(9,2) NULL;
+END
+GO
+
 
 -- =============================================================================
 -- 2. Backfill from Daniel's sheet (Jun-25 → May-26, 8 locations)
@@ -247,6 +260,10 @@ SELECT
     f.location_source_id,
     loc.name                            AS location_name,
     f.occupied_workstations,
+    -- Day-weighted average occupied desks (desk-days ÷ days in month).
+    -- NULL on rows frozen before 2026-08-31 (Daniel's backfill) — readers
+    -- fall back to occupied_workstations (end-of-month position).
+    f.occupied_ws_avg,
     f.source                            AS data_source        -- 'daniel_backfill' / 'cron' / 'manual_override'
 FROM silver.landlord_frozen_monthly_occupancy f
 LEFT JOIN silver.nexudus_locations loc
@@ -257,6 +274,7 @@ SELECT
     mb.location_source_id,
     mb.location_name,
     mb.occupied_workstations,
+    mb.occupied_ws_avg,
     N'computed'                         AS data_source
 FROM gold.vw_landlord_membership_book_monthly mb
 WHERE NOT EXISTS (
