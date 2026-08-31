@@ -11,7 +11,9 @@ Ports these n8n nodes:
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import unicodedata
 from typing import Any
@@ -779,3 +781,154 @@ def consolidate_contacts(agencies: list[dict]) -> list[dict]:
         results.append(bundle.to_dict())
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# LoopNet broker email tail-enrichment (Lusha person-search -> broker directory)
+# ---------------------------------------------------------------------------
+
+_READ_RUN_RAW = """
+SELECT payload_json
+FROM bronze.location_scraper_raw
+WHERE run_id = ?
+ORDER BY item_index
+"""
+
+
+def _loopnet_lookup_cap() -> int:
+    """Per-run ceiling on Lusha person lookups (cost guard)."""
+    raw = (os.environ.get("LOOPNET_LUSHA_MAX_LOOKUPS") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 150
+    return value if value > 0 else 150
+
+
+def enrich_loopnet_brokers(payload: dict) -> dict:
+    """Fill missing LoopNet broker emails via Lusha, into the broker directory.
+
+    Since LoopNet locked its mobile API behind App Check, the memo23 actor often
+    falls back to a search-results payload (`srp-ldjson`) that carries the
+    broker's person name and company but NO email. The historical broker
+    directory resolves ~75% of them for free; this closes the tail by looking
+    each still-unresolved (name, company) up in Lusha's person search and
+    writing any hit into ``silver.location_scraper_broker_directory``. The globe
+    materialization then surfaces it THIS run (it reloads the directory), and
+    every future run gets that broker for free — the pool of LoopNet brokers is
+    finite, so this compounds toward full coverage.
+
+    Cost is bounded: a broker already resolvable from the directory is never
+    looked up, and ``LOOPNET_LUSHA_MAX_LOOKUPS`` caps the rest per run. No-op
+    when ``LUSHA_API_KEY`` is unset (graceful, like the deploy-before-apply
+    convention elsewhere).
+
+    payload = {"run_id": str, "source": str, "city": str}
+    """
+    from shared.azure_clients.sql_client import get_sql_client
+    from shared.location_scraper.broker_directory import (
+        load_broker_directory,
+        normalize_broker_name,
+        resolve_email,
+        upsert_broker_records,
+    )
+
+    run_id = payload["run_id"]
+    diag = {
+        "candidates": 0,
+        "looked_up": 0,
+        "found": 0,
+        "written": 0,
+        "skipped_no_key": False,
+    }
+
+    if not os.environ.get("LUSHA_API_KEY"):
+        diag["skipped_no_key"] = True
+        logger.info("LoopNet broker enrichment skipped (no LUSHA_API_KEY). run_id=%s", run_id)
+        return diag
+
+    sql = get_sql_client()
+    try:
+        rows = sql.execute_query(_READ_RUN_RAW, (run_id,))
+    except Exception:
+        logger.exception("LoopNet broker enrichment: could not read raw for run_id=%s", run_id)
+        return diag
+
+    directory = load_broker_directory(sql)
+
+    # Distinct email-less brokers (primary + co-brokers), keyed by normalized name.
+    candidates: dict[str, dict] = {}
+    for row in rows or []:
+        try:
+            item = json.loads(row["payload_json"])
+        except (ValueError, TypeError):
+            continue
+        brokers = [
+            {
+                "name": item.get("brokerName"),
+                "email": item.get("brokerEmail"),
+                "company": item.get("brokerCompany"),
+            }
+        ]
+        for co in item.get("brokers") or []:
+            if isinstance(co, dict):
+                brokers.append(
+                    {"name": co.get("name"), "email": co.get("email"), "company": co.get("company")}
+                )
+        for broker in brokers:
+            if broker.get("email"):
+                continue  # payload already has the email
+            name_norm = normalize_broker_name(broker.get("name"))
+            if not name_norm:
+                continue
+            candidates.setdefault(
+                name_norm,
+                {"name": broker.get("name"), "company": (broker.get("company") or "").strip()},
+            )
+
+    diag["candidates"] = len(candidates)
+    cap = _loopnet_lookup_cap()
+    found_records: list[dict] = []
+
+    for name_norm, info in candidates.items():
+        if diag["looked_up"] >= cap:
+            logger.info(
+                "LoopNet broker enrichment hit the per-run cap (%d). run_id=%s", cap, run_id
+            )
+            break
+        # Already known from history -> no Lusha spend.
+        if resolve_email(directory, info["name"], info["company"]):
+            continue
+        first, last = _split_contact_name(info["name"])
+        if not first or not last:
+            continue  # generic desk ("Sales Enquiries"), not a person
+        company = info["company"]
+        if not company:
+            continue  # Lusha person-search needs the company
+        diag["looked_up"] += 1
+        try:
+            person = lusha_client.search_individual(first, last, company)
+            if not person:
+                continue
+            email, _confidence = lusha_client.extract_best_email(person)
+        except Exception:
+            logger.exception("Lusha individual search failed for %s / %s", info["name"], company)
+            continue
+        if not email or "@" not in email:
+            continue
+        diag["found"] += 1
+        found_records.append(
+            {
+                "name_normalized": name_norm,
+                "name_display": " ".join(str(info["name"]).split()),
+                "email": email.strip().lower(),
+                "company": company or None,
+                "phone": None,
+                "source": "lusha",
+            }
+        )
+
+    if found_records:
+        diag["written"] = upsert_broker_records(sql, found_records)
+    logger.info("LoopNet broker enrichment run_id=%s %s", run_id, json.dumps(diag, sort_keys=True))
+    return diag

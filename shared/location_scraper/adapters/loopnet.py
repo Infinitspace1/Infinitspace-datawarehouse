@@ -121,13 +121,20 @@ def available_surface_sqft_from_payload(payload: dict[str, Any]) -> Optional[flo
     This is LoopNet's native unit — the exact figure a UK/US broker recognises,
     so we keep it verbatim for `surface_display`.
 
-    memo23 returns three different payload shapes depending on the actor version
-    and the input mode, so we try each available-area signal in turn:
+    memo23 returns several payload shapes depending on the actor version, the
+    input mode and — since LoopNet locked its mobile API behind App Check —
+    which stage answered, so we try each available-area signal in turn:
       1. header.subtext ("33,889 SF of Office Space Available") — old detail page.
       2. sum of spaces[].size — old detail page fallback.
       3. name / listingName ("... - 103,916 SF of ... Available") — the
          post-2026-06-27 listing-detail ("listingWeb") payload.
-      4. sizeSf ("36.8K") — the broad-search / search-results payload.
+      4. sizeSf ("36.8K") — the free-mobile-API search-results payload.
+      5. description ("27,568 sq ft Office Property Offered in ...") — the
+         `srp-ldjson` search-results fallback the actor serves when the mobile
+         API 403s. It carries neither sizeSf nor a "... Available" name, so the
+         surface only lives in the description sentence. This is the LAST resort
+         (only reached when every other signal is absent), so it never overrides
+         a mobile-API sizeSf on the healthy path.
     """
     header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
     sf = _first_sf(header.get("subtext"))
@@ -149,6 +156,10 @@ def available_surface_sqft_from_payload(payload: dict[str, Any]) -> Optional[flo
 
     if sf is None:
         sf = _parse_abbrev_sf(payload.get("sizeSf"))
+
+    if sf is None:
+        # srp-ldjson: the leading number of the description IS the offered area.
+        sf = _first_sf(payload.get("description"))
 
     return sf
 
@@ -285,6 +296,11 @@ class LoopnetAdapter:
         web_link = raw_item.get("listingUrl") or raw_item.get("inferUrl")
         city_value = str(raw_item.get("city") or city).lower().strip()
 
+        # The srp-ldjson fallback payload has no `address` field — the building
+        # address lives in `listingName` ("450 Bath Rd, West Drayton UB7 0EB"),
+        # which is what the geocode fallback needs.
+        address = raw_item.get("address") or raw_item.get("listingName") or None
+
         # The search placard carries coordinates; the listing-detail payload
         # does not. When they are present we skip the geocode fallback entirely
         # (cheaper, and exact rather than postcode-approximated).
@@ -310,7 +326,7 @@ class LoopnetAdapter:
             longitude=longitude,
             district=None,
             postal_code=raw_item.get("zip") or None,
-            address=raw_item.get("address") or None,
+            address=address,
             surface_m2=surface,
             # LoopNet is UK/US — show the native square footage, not m².
             surface_display=round(surface_sqft, 2) if surface_sqft is not None else None,

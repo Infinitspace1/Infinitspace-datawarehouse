@@ -721,16 +721,31 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             },
         )
 
-        # Steps 6-9 (Lusha enrichment) are skipped for sources that already
-        # carry broker contact + email in the listing payload (e.g. LoopNet):
-        # the broker email is persisted by ls_upsert_sql and surfaced on the
-        # globe directly from the raw payload, so Lusha would be redundant cost.
+        # LoopNet skips the agency-based Lusha fan-out (steps 6-9): its broker
+        # contact is per-LISTING, not per-agency, and is surfaced on the globe
+        # from the payload + the broker directory. But since LoopNet locked its
+        # mobile API, the actor often serves a search-results payload
+        # (`srp-ldjson`) with the broker NAME but no email — so we still run a
+        # person-based tail enrichment: any (name, company) the directory can't
+        # resolve is looked up in Lusha and written back into the directory,
+        # which the globe then reads. Directory hits cost nothing; only the
+        # unknown tail spends a Lusha reveal. See run_health / broker_directory.
         if source_config["actor"] in LUSHA_SKIP_SOURCES:
-            logger.info(
-                "Skipping Lusha enrichment for source=%s city=%s (broker contact comes from the listing)",
-                source_config["actor"],
-                source_config["city"],
+            broker_enrich_diag: dict = yield context.call_activity(
+                "ls_enrich_loopnet_brokers",
+                {
+                    "run_id": run_id,
+                    "source": source_config["actor"],
+                    "city": source_config["city"],
+                },
             )
+            if not context.is_replaying:
+                logger.info(
+                    "LoopNet broker tail-enrichment source=%s city=%s %s",
+                    source_config["actor"],
+                    source_config["city"],
+                    json.dumps(broker_enrich_diag or {}, sort_keys=True),
+                )
             enriched_agencies = []
             enrichment_diag = _summarize_enrichment_diagnostics([])
             bundles = []
@@ -786,6 +801,26 @@ def location_scraper_orch(context: df.DurableOrchestrationContext):
             {"listings": listings, "bundles": bundles, "run_id": run_id, "city": source_config["city"]},
         )
         stats["enrichment_diagnostics"] = enrichment_diag
+        # Safety net for an again-changed payload shape: the raw scrape can grade
+        # healthy by VOLUME (ls_assess_run_health counts raw items) yet normalize
+        # keep nothing — e.g. 2026-08-31, when the actor served 609 srp-ldjson
+        # items London but the adapter read a surface out of none of them, so the
+        # week was written as `completed` with 0 buildings and never retried.
+        # Grade on buildings kept too: raw items in, zero qualifying buildings
+        # out -> degraded, so ls_cities_needing_run retries the city mid-week and
+        # the weekly alert names it, instead of banking an empty green week.
+        buildings_kept = len(listings or [])
+        if run_health_verdict.get("ok") and raw_item_count > 0 and buildings_kept == 0:
+            zero_kept_reason = (
+                f"{raw_item_count} raw items scraped but 0 qualifying buildings survived "
+                f"normalization (the actor may have changed its payload shape)"
+            )
+            run_health_verdict = {
+                **run_health_verdict,
+                "ok": False,
+                "status": "degraded",
+                "reason": run_health_verdict.get("reason") or zero_kept_reason,
+            }
         # A degraded run keeps its buildings (they are real) but is NOT marked
         # completed: ls_cities_needing_run then picks the city up again in the
         # mid-week pass, and the weekly alert names it.
@@ -921,6 +956,20 @@ def ls_filter_new_agencies(agencies: list) -> list:
 @bp.activity_trigger(input_name="payload")
 def ls_enrich_agency(payload: dict) -> dict:
     return enrich_act.enrich_agency(payload)
+
+
+@bp.activity_trigger(input_name="payload")
+def ls_enrich_loopnet_brokers(payload: dict) -> dict:
+    """Fill missing LoopNet broker emails via Lusha into the broker directory
+    (never fatal — enrichment is best-effort)."""
+    try:
+        return enrich_act.enrich_loopnet_brokers(payload)
+    except Exception:
+        logger.exception(
+            "LoopNet broker tail-enrichment failed (non-fatal). run_id=%s",
+            payload.get("run_id"),
+        )
+        return {"candidates": 0, "looked_up": 0, "found": 0, "written": 0, "error": True}
 
 
 @bp.activity_trigger(input_name="agencies")

@@ -217,6 +217,60 @@ def test_normalize_drops_when_no_surface():
     assert LoopnetAdapter().normalize(payload, "london") is None
 
 
+# --- srp-ldjson fallback (mobile API 403 -> search-results LD+JSON) -----------
+# Since LoopNet locked its mobile API behind App Check, the actor often serves a
+# `srp-ldjson` payload: broker name + company, surface only in `description`,
+# address only in `listingName`, no `sizeSf`/`spaces`/coordinates/email.
+# Observed live 2026-08-31 (London W36: 609 such items -> 0 buildings before this).
+
+def _srp_ldjson_listing(
+    description="27,568 sq ft Office Property Offered in West Drayton UB7 0EB",
+    listing_name="450 Bath Rd, West Drayton UB7 0EB",
+):
+    return {
+        "propertyId": "40510241",
+        "listingUrl": "https://www.loopnet.co.uk/listing/450-bath-rd-west-drayton/40510241/",
+        "listingName": listing_name,
+        "description": description,
+        "listingType": "For Lease",
+        "brokerName": "John Hicks",
+        "brokerCompany": "IW Group Services (UK) Ltd",
+        "position": 18,
+        "_dataSource": "srp-ldjson",
+    }
+
+
+def test_surface_from_srp_ldjson_description():
+    # 27,568 sq ft -> ~2561 m², above the 1500 m² floor.
+    payload = _srp_ldjson_listing()
+    assert available_surface_sqft_from_payload(payload) == 27568.0
+    assert available_surface_m2_from_payload(payload) > 1500
+
+
+def test_normalize_srp_ldjson_keeps_building_with_address_and_broker():
+    listing = LoopnetAdapter().normalize(_srp_ldjson_listing(), "london")
+    assert listing is not None
+    # address falls back to listingName so the geocode step has something to work with
+    assert listing.address == "450 Bath Rd, West Drayton UB7 0EB"
+    assert listing.contact_name == "John Hicks"
+    assert listing.company_name == "IW Group Services (UK) Ltd"
+    assert listing.currency == "GBP"  # derived from the city, not the absent country
+    assert listing.email == ""  # no payload email — filled by directory/Lusha downstream
+
+
+def test_normalize_srp_ldjson_drops_below_floor():
+    small = _srp_ldjson_listing(description="9,228 sq ft Office Property Offered in New Malden")
+    assert LoopnetAdapter().normalize(small, "london") is None
+
+
+def test_description_surface_never_overrides_a_healthy_sizesf_payload():
+    # A free-mobile-API payload carries sizeSf AND a description; the description
+    # must never win over the real available-surface field.
+    payload = {"propertyId": "9", "city": "London", "sizeSf": "36.8K",
+               "description": "1,000 sq ft tiny mention"}
+    assert available_surface_sqft_from_payload(payload) == 36800.0
+
+
 # --- globe materialization: broker contacts + currency (Lusha skipped) ---
 
 def test_globe_currency_loopnet_by_country():
