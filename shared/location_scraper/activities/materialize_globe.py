@@ -469,7 +469,7 @@ def _map_row(
     longitude = _pick_float(payload, "basicInfo.address.lon", "sections[3].location.lng", "ubication.longitude", "longitude", "geo_wgs84Lon", "normalized.address.longitude")
     external_id = _pick_str(payload, "normalized.listingId", "header.id", "basicInfo.id", "adid", "id", "propertyId")
     listing_url = _pick_str(payload, "normalized.url", "detailWebLink", "propertyUrl", "basicInfo.url", "url", "listingUrl", "inferUrl")
-    address = _pick_str(payload, "basicInfo.address.line", "normalized.address.formatted", "ubication.title", "street", "location", "basicInfo.address", "address")
+    address = _pick_str(payload, "basicInfo.address.line", "normalized.address.formatted", "ubication.title", "street", "location", "basicInfo.address", "address", "listingName")
     postal_code = _pick_str(payload, "contactInfo.address.postalCode", "normalized.address.zip", "adTargetingParameters.obj_zipCode", "zip")
     district = _pick_str(payload, "district", "basicInfo.district", "geo_ot", "adTargetingParameters.obj_regio4", "subdistrict", "basicInfo.neighborhood", "ubication.administrativeAreaLevel3")
     city = _pick_str(payload, "basicInfo.municipality", "normalized.address.region", "normalized.address.city", "city", "ubication.administrativeAreaLevel2") or row["city"]
