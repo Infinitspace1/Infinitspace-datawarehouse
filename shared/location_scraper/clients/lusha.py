@@ -6,9 +6,10 @@ Endpoints used:
       Search contacts by company domain and job titles.
       Docs: https://lusha.readme.io/reference/contacts-search
 
-  - POST https://api.lusha.com/v2/person/search
-      Search an individual by first name, last name, and company.
-      Docs: https://lusha.readme.io/reference/person-search
+  - GET https://api.lusha.com/v2/person
+      Reveal an individual by first name, last name, and company (query params).
+      (Replaces the retired POST /v2/person/search, which now 404s.)
+      Docs: https://lusha.readme.io/reference/person
 
   - POST https://api.lusha.com/v2/person/enrich
       Enrich a person record from a search result to obtain email addresses.
@@ -57,9 +58,15 @@ def _retry_decorator():
 
 
 def _get(path: str, params: dict | None = None) -> dict:
+    # Auth is the `api_key` HEADER, not a query param: Lusha returns 401 when the
+    # key is passed as `?api_key=` on the GET endpoints (verified on /v2/person).
     url = f"{_BASE_URL}{path}"
-    p = {"api_key": _API_KEY, **(params or {})}
-    resp = requests.get(url, params=p, timeout=30)
+    resp = requests.get(
+        url,
+        params=params or {},
+        headers={"api_key": _API_KEY},
+        timeout=30,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -322,25 +329,35 @@ def search_individual(
     company_name: str,
 ) -> Optional[dict[str, Any]]:
     """
-    Search for an individual person by name and company.
-    Maps to n8n "Lusha Search Individuals" node.
-    Returns the enriched person record or None if not found.
+    Reveal one person's contact by name + company via `GET /v2/person`.
+
+    Lusha retired `POST /v2/person/search` — it now returns 404
+    ("Cannot POST /v2/person/search"), which silently turned every individual
+    lookup (this + the EU `_enrich_individual` path) into a no-op. The person
+    endpoint is `GET /v2/person` with the name/company as query params; it
+    returns `{"contact": {"data": {person}, "isCreditCharged": bool,
+    "error": ...}}` where `data` carries `emailAddresses` +
+    `fullName`/`jobTitle`. Returns that `data` dict, or None on no match.
+    Charges a Lusha credit only when a contact is revealed.
     """
-    body = {
-        "firstName": first_name,
-        "lastName": last_name,
-        "companyName": company_name,
-    }
     try:
-        data = _post("/v2/person/search", body)
-        person = data.get("data")
-        if isinstance(person, list):
-            return person[0] if person else None
-        return person
+        payload = _get(
+            "/v2/person",
+            {
+                "firstName": first_name,
+                "lastName": last_name,
+                "companyName": company_name,
+            },
+        )
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code in (404, 422):
             return None
         raise
+    contact = (payload or {}).get("contact") or {}
+    if contact.get("error"):
+        return None
+    data = contact.get("data")
+    return data if isinstance(data, dict) and data else None
 
 
 def extract_best_email(person: dict[str, Any]) -> tuple[str, str]:
