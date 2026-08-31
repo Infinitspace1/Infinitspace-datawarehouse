@@ -52,6 +52,11 @@ _EXPECTED_DAILY: frozenset[tuple[str, str, str]] = frozenset([
     # anything is wrong.
     ("finance_dashboard", "presend_refresh", "gold"),
     ("replyio", "sequence_steps", "bronze"),
+    # CPI national indices - runs 05:40 UTC. Monthly data on a daily job, so
+    # rows_written = 0 is the NORMAL case and the only useful signal is "did it
+    # run at all". Without this tuple a timer that silently stopped firing would
+    # leave the anniversaries CPI column frozen at a stale figure with no alert.
+    ("cpi", "series", "silver"),
     # Landlord dashboard materialization — runs 03:00 UTC daily. If it
     # silently stops firing, the dashboard would just go stale without
     # anyone noticing; this guards against that.
@@ -70,6 +75,10 @@ def _expected_daily() -> frozenset[tuple[str, str, str]]:
     """Expected-daily set, augmented with optional surfaces only when they are
     enabled — so a disabled feature is never flagged as 'never started'."""
     expected = set(_EXPECTED_DAILY)
+    # Help desk (2026-08-20) runs every 15 minutes, so its silver step is
+    # always expected within the daily window. Messages are the representative
+    # "the pipeline completed" signal; comments/departments ride the same run.
+    expected.add(("nexudus", "helpdesk_messages", "silver"))
     if _env_flag("ENABLE_COMPETENCE_FUNCTIONS", False):
         # competence runs every day (incremental competence_sync Mon-Sat +
         # competence_full_reconcile Sun); the silver step is the representative

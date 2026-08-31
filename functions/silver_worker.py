@@ -48,6 +48,9 @@ from shared.azure_clients.silver_writer_financial_accounts import SilverFinancia
 from shared.azure_clients.silver_writer_calendar_events import SilverCalendarEventsWriter
 from shared.azure_clients.silver_writer_event_attendees import SilverEventAttendeesWriter
 from shared.azure_clients.silver_writer_event_products import SilverEventProductsWriter
+from shared.azure_clients.silver_writer_helpdesk_messages import SilverHelpdeskMessagesWriter
+from shared.azure_clients.silver_writer_helpdesk_comments import SilverHelpdeskCommentsWriter
+from shared.azure_clients.silver_writer_helpdesk_departments import SilverHelpdeskDepartmentsWriter
 from shared.azure_clients.run_tracker import RunTracker
 
 logger = logging.getLogger(__name__)
@@ -112,6 +115,22 @@ _ENTITY_MAP = {
     "event_products": (
         SilverEventProductsWriter,
         lambda r: r.get("event_products", 0),
+    ),
+    # Help desk (2026-08-20) — customer requests. Normally promoted inline by
+    # nexudus_helpdesk_sync / the webhook, which is where freshness comes from;
+    # registered here so the nightly fanout also covers them and so a task can
+    # be replayed onto the queue by hand.
+    "helpdesk_messages": (
+        SilverHelpdeskMessagesWriter,
+        lambda r: r.get("helpdesk_messages", 0),
+    ),
+    "helpdesk_comments": (
+        SilverHelpdeskCommentsWriter,
+        lambda r: r.get("helpdesk_comments", 0),
+    ),
+    "helpdesk_departments": (
+        SilverHelpdeskDepartmentsWriter,
+        lambda r: r.get("helpdesk_departments", 0),
     ),
 }
 

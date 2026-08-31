@@ -565,3 +565,107 @@ class BronzeWriter:
             rows,
         )
         return changed, written
+
+    # ── Help desk (2026-08-20) ───────────────────────────────
+    # Customer requests. Written by both the 15-minute reconciling poll
+    # (functions/nexudus_helpdesk_sync.py) and the Nexudus webhook
+    # (functions/nexudus_helpdesk_webhook.py). The webhook re-fetches the
+    # canonical record by ID before calling these, so both paths store the
+    # identical payload shape and the SHA-256 hash check stays meaningful.
+
+    def write_helpdesk_messages(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_helpdesk_messages"""
+        table = "bronze.nexudus_helpdesk_messages"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                r.get("BusinessId"),
+                r.get("CoworkerId"),
+                r.get("HelpDeskDepartmentId"),
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "coworker_id", "department_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "coworker_id", "department_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written
+
+    def write_helpdesk_comments(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_helpdesk_comments
+
+        HelpDeskComment payloads carry no BusinessId — location is resolved
+        from the parent message by the silver writer.
+        """
+        table = "bronze.nexudus_helpdesk_comments"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                r.get("HelpDeskMessageId"),
+                r.get("CoworkerId"),
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "helpdesk_message_id", "coworker_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "helpdesk_message_id", "coworker_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written
+
+    def write_helpdesk_departments(self, records: list[dict]) -> tuple[list[dict], int]:
+        """bronze.nexudus_helpdesk_departments"""
+        table = "bronze.nexudus_helpdesk_departments"
+        source_ids = [int(r["Id"]) for r in records if r.get("Id")]
+        existing = self._load_existing_hashes(table, source_ids)
+
+        changed = []
+        rows = []
+        for r in records:
+            raw = self._to_json(r)
+            h = self._compute_hash(raw)
+            sid = r.get("Id")
+            if sid and existing.get(int(sid)) == h:
+                continue
+            changed.append(r)
+            rows.append((
+                self.sync_run_id,
+                sid,
+                r.get("BusinessId"),
+                raw,
+                h,
+            ))
+        written = self._batch_upsert(
+            table,
+            ["sync_run_id", "source_id", "location_id", "raw_json", "payload_hash"],
+            ["sync_run_id", "location_id", "raw_json", "payload_hash"],
+            rows,
+        )
+        return changed, written

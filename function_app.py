@@ -52,6 +52,15 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     # direct-debit `processing` suppression is fresh for the 08:00/09:00 UTC
     # automated pre-reminder sends (was 6-7h stale off the 02:00 nightly run).
     from functions.finance_presend_refresh import bp as finance_presend_refresh_bp
+    # CPI (2026-08-20): daily national consumer price indices for UK/NL/DE,
+    # read by the Budget Tracking Tool's anniversaries tab. Public APIs, no
+    # secret - so it lives here rather than behind its own flag, which would
+    # default OFF and never run.
+    from functions.cpi_sync import bp as cpi_bp
+    # Help desk (2026-08-20): hybrid ingestion for customer requests —
+    # a 15-minute reconciling poll plus a Nexudus-triggered webhook.
+    from functions.nexudus_helpdesk_sync import bp as nexudus_helpdesk_sync_bp
+    from functions.nexudus_helpdesk_webhook import bp as nexudus_helpdesk_webhook_bp
     from functions.nexudus_invoice_pdf_cache import bp as nexudus_pdf_bp
     from functions.nexudus_invoice_reconcile import bp as nexudus_invoice_reconcile_bp
     from functions.nexudus_silver_reconcile import bp as nexudus_silver_reconcile_bp
@@ -74,6 +83,9 @@ if _env_flag("ENABLE_ETL_FUNCTIONS", True):
     app.register_functions(silver_bp)
     app.register_functions(silver_worker_bp)
     app.register_functions(ava_bp)
+    app.register_functions(nexudus_helpdesk_sync_bp)
+    app.register_functions(nexudus_helpdesk_webhook_bp)
+    app.register_functions(cpi_bp)
     app.register_functions(nexudus_pdf_bp)
     app.register_functions(nexudus_invoice_reconcile_bp)
     app.register_functions(nexudus_silver_reconcile_bp)

@@ -52,6 +52,14 @@ ENTITIES = [
     "calendar_events",
     "event_attendees",
     "event_products",
+    # Help desk (2026-08-20) — belt-and-braces only. These are kept current by
+    # nexudus_helpdesk_sync every 15 minutes and by the webhook; including them
+    # in the nightly fanout costs nothing (the silver watermark makes an
+    # already-current entity a no-op) and covers the case where both live
+    # paths have been failing.
+    "helpdesk_messages",
+    "helpdesk_comments",
+    "helpdesk_departments",
 ]
 
 
