@@ -87,6 +87,10 @@ contract_facts AS (
         CAST(c.start_date        AS DATE)            AS start_date,
         CAST(c.cancellation_date AS DATE)            AS cancellation_date,
         CAST(DATEADD(HOUR, 4, c.start_date) AS DATE) AS effective_start_date,
+        -- +4h-shifted cancellation, EXCLUSIVE (first day NOT occupied) — the
+        -- same convention the contract-book view uses for desk-days. Needed by
+        -- the day-weighted revenue columns added 2026-09-01.
+        CAST(DATEADD(HOUR, 4, c.cancellation_date) AS DATE) AS effective_cancel_excl,
         -- Per-type allocated revenue (list-price share; capacity-share fallback;
         -- MMRF residual for unlinked adjustments).
         CAST(alloc.sold_fee * alloc.w_po  AS DECIMAL(18,2)) AS rev_po,
@@ -130,10 +134,15 @@ contract_facts AS (
     WHERE c.is_deleted = 0
       AND c.start_date IS NOT NULL
       -- Same status filter as the contract book: active, in-notice, or future-signed.
+      -- The future-signed test uses the +4h-SHIFTED start date with >=, matching
+      -- every other date test in the landlord views. This was applied straight to
+      -- prod and never committed; recovered here 2026-09-01 by diffing
+      -- sys.sql_modules against the repo, so re-applying this file no longer
+      -- silently reverts it (it moved 139 company-months when dry-run).
       AND (
           c.active = 1
           OR (c.cancelled = 1 AND c.cancellation_date IS NOT NULL)
-          OR (c.active = 0 AND c.cancelled = 0 AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE))
+          OR (c.active = 0 AND c.cancelled = 0 AND CAST(DATEADD(HOUR, 4, c.start_date) AS DATE) >= CAST(GETUTCDATE() AS DATE))
       )
       -- Same product-link filter: resolved products, OR negative adjustment,
       -- OR future-signed positive contract without a desk link yet.
@@ -142,22 +151,70 @@ contract_facts AS (
           OR COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) < 0
           OR (
               c.active = 0 AND c.cancelled = 0
-              AND CAST(c.start_date AS DATE) > CAST(GETUTCDATE() AS DATE)
+              AND CAST(DATEADD(HOUR, 4, c.start_date) AS DATE) >= CAST(GETUTCDATE() AS DATE)
               AND COALESCE(NULLIF(c.price_with_products, 0), c.price, c.tariff_price, 0) > 0
           )
       )
 ),
+-- The join now admits every contract that OVERLAPS the month, not just the ones
+-- alive on its last day, because the day-weighted columns (2026-09-01) need
+-- mid-month leavers present to contribute their days. The month-end columns are
+-- unchanged: is_at_month_end zeroes exactly the rows the old predicate excluded,
+-- so rev_po/ws_po/… still reconcile to gold.vw_landlord_contract_book_monthly.
 active_by_month AS (
     SELECT
         ms.month_start,
         cf.location_source_id,
         cf.member_company_name,
-        cf.rev_po, cf.rev_dd, cf.rev_hd, cf.rev_add,
-        cf.ws_po,  cf.ws_dd,  cf.ws_hd,  cf.ws_add
+        -- MONTH-END basis (unchanged)
+        CASE WHEN me.is_at_month_end = 1 THEN cf.rev_po  ELSE 0 END AS rev_po,
+        CASE WHEN me.is_at_month_end = 1 THEN cf.rev_dd  ELSE 0 END AS rev_dd,
+        CASE WHEN me.is_at_month_end = 1 THEN cf.rev_hd  ELSE 0 END AS rev_hd,
+        CASE WHEN me.is_at_month_end = 1 THEN cf.rev_add ELSE 0 END AS rev_add,
+        CASE WHEN me.is_at_month_end = 1 THEN cf.ws_po   ELSE 0 END AS ws_po,
+        CASE WHEN me.is_at_month_end = 1 THEN cf.ws_dd   ELSE 0 END AS ws_dd,
+        CASE WHEN me.is_at_month_end = 1 THEN cf.ws_hd   ELSE 0 END AS ws_hd,
+        CASE WHEN me.is_at_month_end = 1 THEN cf.ws_add  ELSE 0 END AS ws_add,
+        -- DAY-WEIGHTED basis (2026-09-01): each type's allocated fee scaled by
+        -- the share of the month the contract was live. Same window as the
+        -- contract-book view's desk-days, so the two bases reconcile.
+        cf.rev_po  * w.day_fraction AS rev_po_dw,
+        cf.rev_dd  * w.day_fraction AS rev_dd_dw,
+        cf.rev_hd  * w.day_fraction AS rev_hd_dw,
+        cf.rev_add * w.day_fraction AS rev_add_dw
     FROM month_spine ms
     INNER JOIN contract_facts cf
         ON  cf.effective_start_date <= EOMONTH(ms.month_start)
-        AND (cf.cancellation_date IS NULL OR cf.cancellation_date >= EOMONTH(ms.month_start))
+        AND (
+            cf.effective_cancel_excl IS NULL
+            OR cf.effective_cancel_excl > ms.month_start
+            -- Never lose a row the ORIGINAL month-end universe had.
+            OR cf.cancellation_date >= EOMONTH(ms.month_start)
+        )
+    CROSS APPLY (
+        SELECT
+            CASE WHEN cf.effective_start_date > ms.month_start
+                 THEN cf.effective_start_date ELSE ms.month_start END AS win_start,
+            CASE WHEN cf.effective_cancel_excl IS NULL
+                      OR DATEADD(DAY, -1, cf.effective_cancel_excl) > EOMONTH(ms.month_start)
+                 THEN EOMONTH(ms.month_start)
+                 ELSE DATEADD(DAY, -1, cf.effective_cancel_excl) END   AS win_end
+    ) win
+    CROSS APPLY (
+        -- Clamped at zero: a contract that starts and cancels on the same day
+        -- would otherwise produce a negative span.
+        SELECT CAST(
+            CASE WHEN win.win_end >= win.win_start
+                 THEN DATEDIFF(DAY, win.win_start, win.win_end) + 1
+                 ELSE 0 END AS DECIMAL(18,6)
+        ) / DAY(EOMONTH(ms.month_start)) AS day_fraction
+    ) w
+    CROSS APPLY (
+        SELECT CASE
+            WHEN cf.cancellation_date IS NULL
+              OR cf.cancellation_date >= EOMONTH(ms.month_start) THEN 1 ELSE 0
+        END AS is_at_month_end
+    ) me
 )
 SELECT
     FORMAT(abm.month_start, 'yyyy-MM')                          AS period,
@@ -174,6 +231,18 @@ SELECT
     CAST(SUM(abm.rev_po + abm.rev_dd + abm.rev_hd) AS DECIMAL(18,2)) AS mmrf,
     CAST(SUM(abm.rev_add) AS DECIMAL(18,2))                    AS marv,
     CAST(SUM(abm.rev_po + abm.rev_dd + abm.rev_hd + abm.rev_add) AS DECIMAL(18,2)) AS total_monthly_fee,
+
+    -- Day-weighted twins (2026-09-01). Same allocation, scaled by the share of
+    -- the month each contract was live, so the stacked forecast bars can be
+    -- drawn on the basis the invoices actually bill.
+    CAST(SUM(abm.rev_po_dw)  AS DECIMAL(18,2))                 AS rev_private_office_day_weighted,
+    CAST(SUM(abm.rev_dd_dw)  AS DECIMAL(18,2))                 AS rev_dedicated_desk_day_weighted,
+    CAST(SUM(abm.rev_hd_dw)  AS DECIMAL(18,2))                 AS rev_hot_desk_day_weighted,
+    CAST(SUM(abm.rev_add_dw) AS DECIMAL(18,2))                 AS rev_additional_day_weighted,
+    CAST(SUM(abm.rev_po_dw + abm.rev_dd_dw + abm.rev_hd_dw) AS DECIMAL(18,2)) AS mmrf_day_weighted,
+    CAST(SUM(abm.rev_add_dw) AS DECIMAL(18,2))                 AS marv_day_weighted,
+    CAST(SUM(abm.rev_po_dw + abm.rev_dd_dw + abm.rev_hd_dw + abm.rev_add_dw) AS DECIMAL(18,2))
+                                                               AS total_monthly_fee_day_weighted,
 
     SUM(abm.ws_po)                                             AS ws_private_office,
     SUM(abm.ws_dd)                                             AS ws_dedicated_desk,

@@ -464,31 +464,32 @@ monthly_agg AS (
 -- (capacity × days in month) — the hotel "room-nights" convention, matching
 -- the Budget Tracker's formula. A contract starting the 28th contributes
 -- 4/31 of its desks; a mid-month leaver gets credit for its actual days
--- (under the old month-end rule it counted zero). Everything else in this
--- view (revenue, occupied_workstations = end-of-month position, contract
--- counts) keeps the original month-end rule on purpose — only the
--- percentage is day-weighted.
+-- (under the old month-end rule it counted zero). occupied_workstations
+-- (end-of-month position) and the contract counts keep the original month-end
+-- rule on purpose.
 -- Window per contract in month M: [max(eff_start, M.start), min(eff_cancel
 -- EXCLUSIVE − 1 day, M.end)]. Contracts overlapping M at all are included —
 -- including ones that both start and end inside M (the Budget Tracker's
 -- known blind spot, deliberately fixed here).
+--
+-- ── Day-weighted REVENUE (2026-09-01) ───────────────────────────────────────
+-- sold_revenue_day_weighted scales each contract's fee by the share of the
+-- month it was live, over the SAME window as the desk-days. The month-end
+-- sold_monthly_revenue stays beside it so nothing moves until it opts in.
+-- This is the forecast-side twin of the change in the contract-book view; see
+-- that file for the beyond The Bower Aug-2026 worked example.
+--
+-- Contract universe is the desk-days one, NOT active_by_month's: a mid-month
+-- leaver has to be present to contribute its days.
 desk_days_by_month AS (
     SELECT
         ms.month_start,
         cf.location_source_id,
+        SUM(ISNULL(cf.capacity, 0) * w.days_occupied)   AS occupied_desk_days,
         SUM(
-            ISNULL(cf.capacity, 0) * (
-                DATEDIFF(
-                    DAY,
-                    CASE WHEN cf.effective_start_date > ms.month_start
-                         THEN cf.effective_start_date ELSE ms.month_start END,
-                    CASE WHEN cf.effective_cancel_excl IS NULL
-                              OR DATEADD(DAY, -1, cf.effective_cancel_excl) > EOMONTH(ms.month_start)
-                         THEN EOMONTH(ms.month_start)
-                         ELSE DATEADD(DAY, -1, cf.effective_cancel_excl) END
-                ) + 1
-            )
-        ) AS occupied_desk_days
+            CAST(cf.sold_monthly_fee AS DECIMAL(18,6)) * w.days_occupied
+            / DAY(EOMONTH(ms.month_start))
+        )                                               AS sold_revenue_day_weighted
     FROM month_spine ms
     INNER JOIN contract_facts cf
         ON  cf.effective_start_date <= EOMONTH(ms.month_start)
@@ -496,6 +497,19 @@ desk_days_by_month AS (
              OR cf.effective_cancel_excl > ms.month_start)
         AND (cf.effective_cancel_excl IS NULL
              OR cf.effective_start_date < cf.effective_cancel_excl)
+    -- The occupied-day count is lifted into its own APPLY so desks and revenue
+    -- are weighted by ONE expression rather than two copies that could drift.
+    CROSS APPLY (
+        SELECT DATEDIFF(
+            DAY,
+            CASE WHEN cf.effective_start_date > ms.month_start
+                 THEN cf.effective_start_date ELSE ms.month_start END,
+            CASE WHEN cf.effective_cancel_excl IS NULL
+                      OR DATEADD(DAY, -1, cf.effective_cancel_excl) > EOMONTH(ms.month_start)
+                 THEN EOMONTH(ms.month_start)
+                 ELSE DATEADD(DAY, -1, cf.effective_cancel_excl) END
+        ) + 1 AS days_occupied
+    ) w
     GROUP BY ms.month_start, cf.location_source_id
 )
 SELECT
@@ -521,8 +535,14 @@ SELECT
         / NULLIF(ISNULL(lc.total_workstation_capacity, 0) * DAY(EOMONTH(ms.month_start)), 0)
         AS DECIMAL(9,4)
     )                                           AS occupancy_pct,
+    -- MONTH-END basis: alive on the last day bills a full month, cancelled
+    -- mid-month bills nothing. See sold_revenue_day_weighted below.
     ISNULL(ma.sold_monthly_revenue, 0)          AS sold_monthly_revenue,
     ISNULL(ma.list_monthly_revenue, 0)          AS list_monthly_revenue,
+    -- DAY-WEIGHTED basis (2026-09-01): fee × days live ÷ days in month, on the
+    -- same window as occupancy_pct. This is what the invoices actually bill.
+    CAST(ISNULL(dd.sold_revenue_day_weighted, 0) AS DECIMAL(18,2))
+                                                AS sold_revenue_day_weighted,
     CAST(
         ISNULL(ma.sold_monthly_revenue, 0) / NULLIF(ISNULL(ma.occupied_workstations, 0), 0)
         AS DECIMAL(18,2)
