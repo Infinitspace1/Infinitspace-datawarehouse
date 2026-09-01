@@ -2,7 +2,7 @@
 -- landlord_company_type_book_schema.sql        (added 2026-07-16)
 --
 -- gold.vw_landlord_company_type_book_monthly
---   One row per (location, month, company) over -12..+24 months (37 total),
+--   One row per (location, month, company) over -24..+24 months (49 total),
 --   carrying per-Nexudus-item_type ALLOCATED sold revenue + workstation counts.
 --
 --   Powers the Strategic Partnership dashboard's new features:
@@ -42,8 +42,12 @@ GO
 CREATE OR ALTER VIEW gold.vw_landlord_company_type_book_monthly
 AS
 WITH month_offsets AS (
-    -- -12 .. +24 (37 rows, well within MAXRECURSION 100)
-    SELECT -12 AS n
+    -- Window widened to -24 (2026-09-01): the period selector offers 13 months
+    -- back, and each of those must still be able to show a full 12 months of
+    -- history BEFORE it. At -12 the spine rolled with today, so on 1 Sep 2026
+    -- Aug-2025 dropped out and the Past-12 chart for Aug-2026 lost a bar.
+    -- -24 .. +24 (49 rows, well within MAXRECURSION 100)
+    SELECT -24 AS n
     UNION ALL
     SELECT n + 1 FROM month_offsets WHERE n < 24
 ),

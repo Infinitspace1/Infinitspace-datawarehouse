@@ -69,10 +69,12 @@
 --   directly for a per-member drill-down.
 --
 -- Window:
---   25 months (-12 to +12 from current month) so the same view can be
---   reused by future drill-downs that want to look at paid-in-advance
---   billings landing in upcoming months. The dashboard's PAST-12-MONTH
---   chart only consumes the -11..0 slice.
+--   37 months (-24 to +12 from current month). The back edge is -24, not
+--   -12, because the period selector offers 13 months of history and each
+--   of those must still resolve a full 12 months BEFORE it; at -12 the
+--   window rolled with today and the oldest bar fell off (widened
+--   2026-09-01). The forward half serves drill-downs into paid-in-advance
+--   billings landing in upcoming months.
 -- =============================================================================
 
 IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'gold')
@@ -83,8 +85,12 @@ GO
 CREATE OR ALTER VIEW gold.vw_landlord_revenue_past_monthly
 AS
 WITH month_offsets AS (
-    -- 25 months: -12 .. +12 from the current UTC month.
-    SELECT -12 AS n
+    -- Window widened to -24 (2026-09-01): the period selector offers 13 months
+    -- back, and each of those must still be able to show a full 12 months of
+    -- history BEFORE it. At -12 the spine rolled with today, so on 1 Sep 2026
+    -- Aug-2025 dropped out and the Past-12 chart for Aug-2026 lost a bar.
+    -- 37 months: -24 .. +12 from the current UTC month.
+    SELECT -24 AS n
     UNION ALL
     SELECT n + 1 FROM month_offsets WHERE n < 12
 ),
@@ -288,8 +294,12 @@ GO
 CREATE OR ALTER VIEW gold.vw_landlord_membership_book_monthly
 AS
 WITH month_offsets AS (
-    -- 25 months: -12 to +12 from the current UTC month.
-    SELECT -12 AS n
+    -- Window widened to -24 (2026-09-01): the period selector offers 13 months
+    -- back, and each of those must still be able to show a full 12 months of
+    -- history BEFORE it. At -12 the spine rolled with today, so on 1 Sep 2026
+    -- Aug-2025 dropped out and the Past-12 chart for Aug-2026 lost a bar.
+    -- 37 months: -24 to +12 from the current UTC month.
+    SELECT -24 AS n
     UNION ALL
     SELECT n + 1 FROM month_offsets WHERE n < 12
 ),
