@@ -1131,7 +1131,17 @@ contract_product_link AS (
     CROSS APPLY STRING_SPLIT(ISNULL(c.floor_plan_desk_ids, N''), N',') s
     INNER JOIN silver.nexudus_products p
         ON  p.source_id = TRY_CONVERT(BIGINT, TRIM(s.value))
-        AND p.item_type IN (1, 2, 3)
+        -- item_type 4 (Other: storeroom / parking) MUST be here, exactly as in
+        -- vw_landlord_contract_book_monthly's link (2026-09-01). A contract
+        -- whose ONLY products are type 4 resolved no link at all and was then
+        -- dropped by the `pl.contract_source_id IS NOT NULL` gate - so this
+        -- view, which the bar drill-down modal lists contracts from, did not
+        -- add up to the month total the modal shows beside them. The gap was a
+        -- fixed per-building offset in EVERY month: Zuidtoren -2,000,
+        -- Papaverhof -2,590, Chausseestrasse -1,000, Fox Court -20.
+        -- The capacity CASE above already scores type 4 as 0 desks, which is
+        -- the contract book's treatment too: it carries fee, not workstations.
+        AND p.item_type IN (1, 2, 3, 4)
         AND p.is_deleted = 0
     WHERE TRIM(s.value) <> N''
       AND c.is_deleted = 0
